@@ -167,12 +167,16 @@ export WAYLAND_DISPLAY
 export RUST_LOG=clip_sync=debug
 "$root/clip-sync-bundle" daemon >"$root/daemon.log" 2>&1 &
 local_pid=$!
-for _ in $(seq 1 120); do
+for _ in $(seq 1 600); do
   [[ -S "$root/runtime/clip-sync/daemon.sock" ]] && break
   kill -0 "$local_pid" 2>/dev/null || { cat "$root/daemon.log" >&2; exit 1; }
   sleep .1
 done
-[[ -S "$root/runtime/clip-sync/daemon.sock" ]] || { echo "local daemon did not start" >&2; exit 1; }
+[[ -S "$root/runtime/clip-sync/daemon.sock" ]] || {
+  echo "local daemon did not start" >&2
+  sed -n '1,160p' "$root/daemon.log" >&2 || true
+  exit 1
+}
 
 copy_local() {
   local value=$1

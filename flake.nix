@@ -15,11 +15,20 @@
         system: withUi:
         let
           pkgs = nixpkgs.legacyPackages.${system};
+          rustSource = pkgs.lib.fileset.toSource {
+            root = ./.;
+            fileset = pkgs.lib.fileset.unions [
+              ./Cargo.lock
+              ./Cargo.toml
+              ./src
+              ./tests
+            ];
+          };
         in
         pkgs.rustPlatform.buildRustPackage {
           pname = "clip-sync";
           version = "0.1.0";
-          src = ./.;
+          src = rustSource;
           cargoLock.lockFile = ./Cargo.lock;
           cargoBuildFeatures = pkgs.lib.optionals withUi [ "ui" ];
           RUST_MIN_STACK = "16777216";
