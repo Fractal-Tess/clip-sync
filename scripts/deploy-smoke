@@ -1,0 +1,237 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: scripts/deploy-smoke [--keep] HOST
+
+Build a self-contained daemon/CLI bundle, SCP it to HOST, and run a disposable
+bidirectional NetBird replication and offline-reconciliation test. A live
+Wayland session and passwordless SSH are required. Production state and secrets
+are never used.
+EOF
+}
+
+keep=0
+if [[ "${1:-}" == "--keep" ]]; then
+  keep=1
+  shift
+fi
+host=${1:-}
+if [[ -z "$host" || "$host" == "--help" || "$host" == "-h" ]]; then
+  usage
+  [[ -n "$host" ]] && exit 0 || exit 2
+fi
+for command in nix scp ssh wl-copy wl-paste python3; do
+  command -v "$command" >/dev/null || {
+    echo "missing required command: $command" >&2
+    exit 2
+  }
+done
+if [[ -z "${XDG_RUNTIME_DIR:-}" || -z "${WAYLAND_DISPLAY:-}" ]]; then
+  echo "XDG_RUNTIME_DIR and WAYLAND_DISPLAY must identify the local Wayland session" >&2
+  exit 2
+fi
+local_wayland=$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY
+[[ -S "$local_wayland" ]] || {
+  echo "local Wayland socket does not exist: $local_wayland" >&2
+  exit 2
+}
+
+stamp="${USER:-user}-$$"
+root=$(mktemp -d -t clip-sync-smoke.XXXXXX)
+remote_root="/tmp/clip-sync-smoke-$stamp"
+port=$((25000 + ($$ % 10000)))
+local_pid=
+remote_started=0
+local_source_pid=
+local_original=$root/local-original.txt
+local_had_text=0
+if timeout 3 wl-paste --no-newline --type text/plain >"$local_original" 2>/dev/null; then
+  local_had_text=1
+fi
+
+remote() { ssh -o BatchMode=yes "$host" "$@"; }
+
+cleanup() {
+  set +e
+  if [[ -n "$local_source_pid" ]]; then
+    kill "$local_source_pid" 2>/dev/null
+    wait "$local_source_pid" 2>/dev/null
+  fi
+  if [[ -n "$local_pid" ]]; then
+    kill "$local_pid" 2>/dev/null
+    wait "$local_pid" 2>/dev/null
+  fi
+  if [[ $local_had_text -eq 1 ]]; then
+    XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR_ORIGINAL:-$XDG_RUNTIME_DIR} wl-copy --type text/plain <"$local_original"
+  else
+    XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR_ORIGINAL:-$XDG_RUNTIME_DIR} wl-copy --clear 2>/dev/null
+  fi
+  if [[ $remote_started -eq 1 ]]; then
+    remote "if test -f '$remote_root/pid'; then kill \$(cat '$remote_root/pid') 2>/dev/null || true; fi; \
+      if test -s '$remote_root/original.txt'; then XDG_RUNTIME_DIR='$remote_root/runtime' wl-copy --type text/plain <'$remote_root/original.txt' || true; fi"
+  fi
+  if [[ $keep -eq 0 ]]; then
+    remote "rm -rf '$remote_root'" 2>/dev/null
+    rm -rf "$root"
+  else
+    echo "kept local artifacts at $root" >&2
+    echo "kept remote artifacts at $host:$remote_root" >&2
+  fi
+}
+trap cleanup EXIT INT TERM
+
+original_runtime=$XDG_RUNTIME_DIR
+export XDG_RUNTIME_DIR_ORIGINAL=$original_runtime
+mkdir -p "$root/config/clip-sync" "$root/state" "$root/runtime"
+ln -s "$local_wayland" "$root/runtime/$WAYLAND_DISPLAY"
+head -c 32 /dev/urandom >"$root/key"
+chmod 0600 "$root/key"
+
+cat >"$root/config/clip-sync/config.toml" <<EOF
+[shared]
+mesh_quota_bytes = 1073741824
+capture_threshold_bytes = 20971520
+
+[local]
+mesh_key_file = "$root/key"
+listen_port = $port
+discovery_interval_seconds = 1
+reconcile_interval_seconds = 1
+reconnect_min_seconds = 1
+reconnect_max_seconds = 4
+netbird_command = "netbird"
+EOF
+
+remote_wayland=$(remote 'for socket in /run/user/$(id -u)/wayland-*; do test -S "$socket" && { basename "$socket"; break; }; done')
+[[ -n "$remote_wayland" ]] || {
+  echo "no remote Wayland socket found on $host" >&2
+  exit 1
+}
+remote_runtime=$(remote 'printf /run/user/%s "$(id -u)"')
+
+cat >"$root/remote-config.toml" <<EOF
+[shared]
+mesh_quota_bytes = 1073741824
+capture_threshold_bytes = 20971520
+
+[local]
+mesh_key_file = "$remote_root/key"
+listen_port = $port
+discovery_interval_seconds = 1
+reconcile_interval_seconds = 1
+reconnect_min_seconds = 1
+reconnect_max_seconds = 4
+netbird_command = "netbird"
+EOF
+
+rm -f "$root/clip-sync-bundle"
+echo "building portable bundle..."
+nix bundle --bundler github:NixOS/bundlers#toArx .#daemon -o "$root/clip-sync-bundle"
+chmod +x "$root/clip-sync-bundle"
+
+remote "rm -rf '$remote_root'; mkdir -p '$remote_root/config/clip-sync' '$remote_root/state' '$remote_root/runtime'; \
+  ln -s '$remote_runtime/$remote_wayland' '$remote_root/runtime/$remote_wayland'"
+scp -q "$root/clip-sync-bundle" "$host:$remote_root/clip-sync"
+scp -q "$root/key" "$host:$remote_root/key"
+scp -q "$root/remote-config.toml" "$host:$remote_root/config/clip-sync/config.toml"
+remote "chmod 0700 '$remote_root/clip-sync'; chmod 0600 '$remote_root/key'; \
+  XDG_RUNTIME_DIR='$remote_root/runtime' WAYLAND_DISPLAY='$remote_wayland' timeout 3 wl-paste --no-newline --type text/plain >'$remote_root/original.txt' 2>/dev/null || true"
+remote_started=1
+
+start_remote() {
+  remote "nohup env XDG_RUNTIME_DIR='$remote_root/runtime' XDG_STATE_HOME='$remote_root/state' XDG_CONFIG_HOME='$remote_root/config' WAYLAND_DISPLAY='$remote_wayland' RUST_LOG=clip_sync=debug '$remote_root/clip-sync' daemon >'$remote_root/daemon.log' 2>&1 </dev/null & echo \$! >'$remote_root/pid'"
+}
+stop_remote() {
+  remote "kill \$(cat '$remote_root/pid') 2>/dev/null || true; for i in \$(seq 1 50); do kill -0 \$(cat '$remote_root/pid') 2>/dev/null || exit 0; sleep .1; done; exit 1"
+}
+remote_cli() {
+  remote "env XDG_RUNTIME_DIR='$remote_root/runtime' XDG_STATE_HOME='$remote_root/state' XDG_CONFIG_HOME='$remote_root/config' WAYLAND_DISPLAY='$remote_wayland' '$remote_root/clip-sync' $*"
+}
+
+start_remote
+export XDG_RUNTIME_DIR=$root/runtime
+export XDG_STATE_HOME=$root/state
+export XDG_CONFIG_HOME=$root/config
+export WAYLAND_DISPLAY
+export RUST_LOG=clip_sync=debug
+"$root/clip-sync-bundle" daemon >"$root/daemon.log" 2>&1 &
+local_pid=$!
+for _ in $(seq 1 120); do
+  [[ -S "$root/runtime/clip-sync/daemon.sock" ]] && break
+  kill -0 "$local_pid" 2>/dev/null || { cat "$root/daemon.log" >&2; exit 1; }
+  sleep .1
+done
+[[ -S "$root/runtime/clip-sync/daemon.sock" ]] || { echo "local daemon did not start" >&2; exit 1; }
+
+copy_local() {
+  local value=$1
+  printf %s "$value" | wl-copy --foreground --type text/plain &
+  local_source_pid=$!
+}
+wait_remote_history() {
+  local query=$1
+  for _ in $(seq 1 90); do
+    if remote_cli "history list '$query' --json" 2>/dev/null | python3 -c 'import json,sys; raise SystemExit(not bool(json.load(sys.stdin)))' 2>/dev/null; then
+      return 0
+    fi
+    sleep 1
+  done
+  echo "remote history did not receive marker: $query" >&2
+  remote "tail -100 '$remote_root/daemon.log'" >&2
+  return 1
+}
+wait_local_history() {
+  local query=$1
+  for _ in $(seq 1 90); do
+    if "$root/clip-sync-bundle" history list "$query" --json 2>/dev/null | python3 -c 'import json,sys; raise SystemExit(not bool(json.load(sys.stdin)))' 2>/dev/null; then
+      return 0
+    fi
+    sleep 1
+  done
+  echo "local history did not receive marker: $query" >&2
+  return 1
+}
+
+first="clip-sync-vd-to-kiwi-$(date +%s%N)"
+copy_local "$first"
+wait_remote_history "$first"
+remote "XDG_RUNTIME_DIR='$remote_root/runtime' WAYLAND_DISPLAY='$remote_wayland' timeout 3 wl-paste --no-newline --type text/plain >'$remote_root/after-network.txt' 2>/dev/null || true; cmp -s '$remote_root/original.txt' '$remote_root/after-network.txt'" || {
+  echo "remote arrival changed the active remote clipboard" >&2
+  exit 1
+}
+
+stop_remote
+second="clip-sync-offline-reconcile-$(date +%s%N)"
+kill "$local_source_pid" 2>/dev/null || true
+wait "$local_source_pid" 2>/dev/null || true
+local_source_pid=
+copy_local "$second"
+for _ in $(seq 1 100); do
+  "$root/clip-sync-bundle" history list "$second" --json 2>/dev/null | python3 -c 'import json,sys; raise SystemExit(not bool(json.load(sys.stdin)))' 2>/dev/null && break
+  sleep .1
+done
+start_remote
+wait_remote_history "$second"
+
+local_before_remote=$root/local-before-remote.txt
+timeout 3 wl-paste --no-newline --type text/plain >"$local_before_remote"
+third="clip-sync-kiwi-to-vd-$(date +%s%N)"
+remote "printf %s '$third' | XDG_RUNTIME_DIR='$remote_root/runtime' WAYLAND_DISPLAY='$remote_wayland' wl-copy --type text/plain"
+wait_local_history "$third"
+timeout 3 wl-paste --no-newline --type text/plain >"$root/local-after-remote.txt"
+cmp -s "$local_before_remote" "$root/local-after-remote.txt" || {
+  echo "remote arrival changed the active local clipboard" >&2
+  exit 1
+}
+
+local_db=$root/state/clip-sync/history.db
+[[ $(stat -c %a "$local_db") == 600 ]]
+! grep -aFq "$first" "$local_db"
+! grep -aFq "$second" "$local_db"
+remote "test \$(stat -c %a '$remote_root/state/clip-sync/history.db') = 600; \
+  ! grep -aFq '$first' '$remote_root/state/clip-sync/history.db'; \
+  ! grep -aFq '$third' '$remote_root/state/clip-sync/history.db'"
+
+printf 'two-node smoke passed: live bidirectional sync, history-only remote arrivals, offline reconciliation, encrypted mode-0600 stores\n'
