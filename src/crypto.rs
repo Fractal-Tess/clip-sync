@@ -1,4 +1,4 @@
-use std::{fmt, fs, path::Path};
+use std::{fmt, io::Read, path::Path};
 
 use hkdf::Hkdf;
 use sha2::Sha256;
@@ -28,16 +28,7 @@ impl MeshSecret {
     /// Returns an error for unsafe permissions, excessive size, malformed
     /// encoding, or file I/O failure.
     pub fn load(path: &Path) -> Result<Self, SecretError> {
-        enforce_private_permissions(path)?;
-        let metadata = fs::metadata(path)?;
-        if !metadata.is_file() {
-            return Err(SecretError::NotRegularFile);
-        }
-        if metadata.len() > 256 {
-            return Err(SecretError::TooLarge);
-        }
-
-        let mut source = Zeroizing::new(fs::read(path)?);
+        let mut source = read_secret_file(path)?;
         if source.last() == Some(&b'\n') {
             source.pop();
             if source.last() == Some(&b'\r') {
@@ -129,15 +120,52 @@ impl fmt::Debug for MeshSecret {
 }
 
 #[cfg(unix)]
-fn enforce_private_permissions(path: &Path) -> Result<(), SecretError> {
-    use std::os::unix::fs::PermissionsExt;
+fn read_secret_file(path: &Path) -> Result<Zeroizing<Vec<u8>>, SecretError> {
+    use rustix::fs::{FileType, Mode, OFlags, fstat, open};
 
-    let metadata = fs::metadata(path)?;
-    let mode = metadata.permissions().mode() & 0o777;
+    let fd = open(
+        path,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::empty(),
+    )
+    .map_err(std::io::Error::from)?;
+    let stat = fstat(&fd).map_err(std::io::Error::from)?;
+    if !FileType::from_raw_mode(stat.st_mode).is_file() {
+        return Err(SecretError::NotRegularFile);
+    }
+    let current_uid = rustix::process::getuid().as_raw();
+    if stat.st_uid != current_uid {
+        return Err(SecretError::UnsafeOwner {
+            actual: stat.st_uid,
+            expected: current_uid,
+        });
+    }
+    let mode = stat.st_mode & 0o777;
     if mode & 0o077 != 0 {
         return Err(SecretError::UnsafePermissions(mode));
     }
-    Ok(())
+    if stat.st_size > 256 {
+        return Err(SecretError::TooLarge);
+    }
+
+    let mut source = Zeroizing::new(Vec::new());
+    std::fs::File::from(fd).take(257).read_to_end(&mut source)?;
+    if source.len() > 256 {
+        return Err(SecretError::TooLarge);
+    }
+    Ok(source)
+}
+
+#[cfg(not(unix))]
+fn read_secret_file(path: &Path) -> Result<Zeroizing<Vec<u8>>, SecretError> {
+    let metadata = std::fs::metadata(path)?;
+    if !metadata.is_file() {
+        return Err(SecretError::NotRegularFile);
+    }
+    if metadata.len() > 256 {
+        return Err(SecretError::TooLarge);
+    }
+    Ok(Zeroizing::new(std::fs::read(path)?))
 }
 
 #[derive(Debug, Error)]
@@ -146,6 +174,8 @@ pub enum SecretError {
     NotRegularFile,
     #[error("mesh secret file is unexpectedly large")]
     TooLarge,
+    #[error("mesh secret owner {actual} does not match current user {expected}")]
+    UnsafeOwner { actual: u32, expected: u32 },
     #[error("mesh secret must contain exactly 32 raw bytes or 64 hexadecimal characters")]
     InvalidEncoding,
     #[error("mesh secret permissions {0:o} expose it to group or other users")]
@@ -159,6 +189,7 @@ pub enum SecretError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use std::io::Write;
 
     #[test]
@@ -208,5 +239,20 @@ mod tests {
             MeshSecret::load(&path),
             Err(SecretError::UnsafePermissions(0o640))
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_secret_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let target = directory.path().join("target.key");
+        let link = directory.path().join("mesh.key");
+        fs::write(&target, [3; 32]).expect("write key");
+        set_private_permissions(&target);
+        symlink(&target, &link).expect("create symlink");
+
+        assert!(MeshSecret::load(&link).is_err());
     }
 }

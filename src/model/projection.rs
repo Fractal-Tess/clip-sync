@@ -11,6 +11,9 @@ use super::{
     SeenOps, SettingValue, SharedSetting, StampedOperation,
 };
 
+const MAX_SETTING_KEY_BYTES: usize = 128;
+const MAX_SETTING_TEXT_BYTES: usize = 4096;
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct Register<T> {
     event: EventKey,
@@ -200,13 +203,7 @@ pub struct Projection {
 }
 
 impl Projection {
-    /// Applies one immutable operation or identifies an exact replay.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ProjectionError::PayloadContentIdMismatch`] when an `Add`
-    /// operation names a different ID than its payload descriptor.
-    pub fn apply(&mut self, stamped: &StampedOperation) -> Result<ApplyOutcome, ProjectionError> {
+    pub(crate) fn validate_operation(stamped: &StampedOperation) -> Result<(), ProjectionError> {
         match stamped.operation() {
             Operation::Add {
                 content_id,
@@ -215,15 +212,29 @@ impl Projection {
             | Operation::AddQuotaExempt {
                 content_id,
                 payload,
-            } if *content_id != payload.descriptor().content_id() => {
-                return Err(ProjectionError::PayloadContentIdMismatch {
-                    operation: *content_id,
-                    payload: payload.descriptor().content_id(),
-                });
+            } => {
+                payload.validate_structure()?;
+                if *content_id != payload.descriptor().content_id() {
+                    return Err(ProjectionError::PayloadContentIdMismatch {
+                        operation: *content_id,
+                        payload: payload.descriptor().content_id(),
+                    });
+                }
             }
             Operation::SetSetting { key, value } => validate_setting(key, value)?,
             _ => {}
         }
+        Ok(())
+    }
+
+    /// Applies one immutable operation or identifies an exact replay.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectionError::PayloadContentIdMismatch`] when an `Add`
+    /// operation names a different ID than its payload descriptor.
+    pub fn apply(&mut self, stamped: &StampedOperation) -> Result<ApplyOutcome, ProjectionError> {
+        Self::validate_operation(stamped)?;
 
         if !self.seen.record(stamped.id()) {
             return Ok(ApplyOutcome::Duplicate);
@@ -561,6 +572,8 @@ impl fmt::Debug for Projection {
 
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum ProjectionError {
+    #[error("payload structure is invalid: {0}")]
+    InvalidPayload(#[from] super::ContentError),
     #[error("Add operation content ID {operation} does not match payload ID {payload}")]
     PayloadContentIdMismatch {
         operation: ContentId,
@@ -568,6 +581,10 @@ pub enum ProjectionError {
     },
     #[error("shared setting key must not be empty")]
     EmptySettingKey,
+    #[error("shared setting key is malformed or exceeds 128 bytes")]
+    InvalidSettingKey,
+    #[error("shared setting text exceeds 4096 bytes")]
+    SettingTextTooLong,
     #[error("shared setting {key:?} requires a positive unsigned integer")]
     InvalidKnownSetting { key: String },
 }
@@ -575,6 +592,16 @@ pub enum ProjectionError {
 fn validate_setting(key: &str, value: &SettingValue) -> Result<(), ProjectionError> {
     if key.is_empty() {
         return Err(ProjectionError::EmptySettingKey);
+    }
+    if key.len() > MAX_SETTING_KEY_BYTES
+        || !key
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+    {
+        return Err(ProjectionError::InvalidSettingKey);
+    }
+    if matches!(value, SettingValue::Text(text) if text.len() > MAX_SETTING_TEXT_BYTES) {
+        return Err(ProjectionError::SettingTextTooLong);
     }
     if SharedSetting::from_key(key).is_some()
         && !matches!(value, SettingValue::Unsigned(value) if *value > 0)

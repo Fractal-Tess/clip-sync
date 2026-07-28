@@ -12,6 +12,8 @@ use crate::model::{OpId, SeenOps, StampedOperation};
 use super::codec::{Codec, CodecError};
 use super::op_log::{OpLog, OpLogError};
 
+const MAX_MISSING_LOCALLY: usize = 65_536;
+
 /// Resource limits for a single anti-entropy batch.
 #[derive(Clone, Copy, Debug)]
 pub struct BatchLimits {
@@ -211,8 +213,9 @@ impl AntiEntropyState {
         OpBatch { entries, has_more }
     }
 
-    /// Returns the set of [`OpId`]s that `remote` advertises but we do
-    /// not have locally. Useful for requesting specific operations.
+    /// Returns a bounded prefix of [`OpId`]s that `remote` advertises but we do
+    /// not have locally. Useful for requesting specific operations without
+    /// allowing a hostile frontier to trigger an unbounded range expansion.
     #[must_use]
     pub fn missing_locally(&self, remote: &SeenOps) -> Vec<OpId> {
         let mut missing = Vec::new();
@@ -221,12 +224,17 @@ impl AntiEntropyState {
             let local_frontier = self.seen.frontier(node);
 
             // Contiguous range the remote has but we don't.
-            for counter in (local_frontier + 1)..=remote_frontier {
-                let Ok(id) = OpId::new(node, counter) else {
-                    continue;
-                };
-                if !self.seen.contains(id) {
-                    missing.push(id);
+            if let Some(first_missing) = local_frontier.checked_add(1) {
+                for counter in first_missing..=remote_frontier {
+                    let Ok(id) = OpId::new(node, counter) else {
+                        continue;
+                    };
+                    if !self.seen.contains(id) {
+                        missing.push(id);
+                        if missing.len() == MAX_MISSING_LOCALLY {
+                            return missing;
+                        }
+                    }
                 }
             }
 
@@ -237,6 +245,9 @@ impl AntiEntropyState {
                 };
                 if !self.seen.contains(id) {
                     missing.push(id);
+                    if missing.len() == MAX_MISSING_LOCALLY {
+                        return missing;
+                    }
                 }
             }
         }
@@ -482,5 +493,23 @@ mod tests {
         let batch = state.compute_batch(&SeenOps::default(), &limits);
         // First entry is always included to guarantee progress
         assert_eq!(batch.len(), 1);
+    }
+
+    #[test]
+    fn hostile_remote_frontier_expansion_is_bounded() {
+        let n = node(1);
+        let remote: SeenOps = serde_json::from_str(&format!(
+            r#"{{"nodes":{{"{n}":{{"frontier":{},"gaps":[]}}}}}}"#,
+            u64::MAX
+        ))
+        .unwrap();
+
+        let missing = AntiEntropyState::new().missing_locally(&remote);
+        assert_eq!(missing.len(), MAX_MISSING_LOCALLY);
+        assert_eq!(missing.first().unwrap().counter(), 1);
+        assert_eq!(
+            missing.last().unwrap().counter(),
+            u64::try_from(MAX_MISSING_LOCALLY).unwrap()
+        );
     }
 }

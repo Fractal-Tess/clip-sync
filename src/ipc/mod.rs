@@ -1,5 +1,7 @@
 pub mod protocol;
 
+#[cfg(target_os = "linux")]
+use std::os::fd::AsFd;
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
@@ -13,7 +15,8 @@ use serde::Serialize;
 use thiserror::Error;
 use tokio::{
     net::{UnixListener, UnixStream},
-    sync::{RwLock, mpsc, oneshot},
+    sync::{RwLock, Semaphore, mpsc, oneshot},
+    task::JoinSet,
 };
 use tokio_util::{
     codec::{Framed, LengthDelimitedCodec},
@@ -31,6 +34,7 @@ use crate::{
 };
 
 const MAX_IPC_FRAME_BYTES: usize = 1024 * 1024;
+const MAX_IPC_CONNECTIONS: usize = 32;
 
 #[derive(Clone)]
 pub struct DaemonState {
@@ -465,21 +469,38 @@ pub async fn serve(
     prepare_socket(socket).await?;
     let listener = UnixListener::bind(socket)?;
     set_socket_permissions(socket)?;
+    let connections = Arc::new(Semaphore::new(MAX_IPC_CONNECTIONS));
+    let mut tasks = JoinSet::new();
 
     loop {
         tokio::select! {
             () = shutdown.cancelled() => break,
             accepted = listener.accept() => {
                 let (stream, _) = accepted?;
+                if !peer_is_current_user(&stream)? {
+                    continue;
+                }
+                let Ok(permit) = connections.clone().try_acquire_owned() else {
+                    continue;
+                };
                 let state = state.clone();
-                tokio::spawn(async move {
+                tasks.spawn(async move {
+                    let _permit = permit;
                     if let Err(error) = serve_connection(stream, state).await {
                         tracing::debug!(%error, "local IPC connection ended");
                     }
                 });
             }
+            completed = tasks.join_next(), if !tasks.is_empty() => {
+                if let Some(Err(error)) = completed {
+                    tracing::debug!(%error, "local IPC connection task failed");
+                }
+            }
         }
     }
+
+    tasks.abort_all();
+    while tasks.join_next().await.is_some() {}
 
     match tokio::fs::remove_file(socket).await {
         Ok(()) => Ok(()),
@@ -509,6 +530,17 @@ async fn serve_connection(stream: UnixStream, state: DaemonState) -> Result<(), 
     while let Some(frame) = framed.next().await {
         let request = Request::decode(frame?.freeze())?;
         let response = state.handle(request).await;
+        if response.encoded_len() > MAX_IPC_FRAME_BYTES {
+            let response = error_response(
+                response.request_id,
+                "response_too_large",
+                "response exceeds the local IPC frame limit",
+            );
+            let mut encoded = Vec::with_capacity(response.encoded_len());
+            response.encode(&mut encoded)?;
+            framed.send(Bytes::from(encoded)).await?;
+            continue;
+        }
         let mut encoded = Vec::with_capacity(response.encoded_len());
         response.encode(&mut encoded)?;
         framed.send(Bytes::from(encoded)).await?;
@@ -525,7 +557,13 @@ fn codec() -> LengthDelimitedCodec {
 async fn prepare_socket(socket: &Path) -> Result<(), IpcError> {
     let parent = socket.parent().ok_or(IpcError::MissingSocketParent)?;
     tokio::fs::create_dir_all(parent).await?;
-    set_directory_permissions(parent)?;
+    make_socket_parent_private(parent)?;
+    match std::fs::symlink_metadata(socket) {
+        Ok(_) if !is_socket_path(socket)? => return Err(IpcError::UnsafeSocketPath),
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
 
     match UnixStream::connect(socket).await {
         Ok(_) => Err(IpcError::AlreadyRunning),
@@ -536,6 +574,9 @@ async fn prepare_socket(socket: &Path) -> Result<(), IpcError> {
             ) =>
         {
             if error.kind() == std::io::ErrorKind::ConnectionRefused {
+                if !is_socket_path(socket)? {
+                    return Err(IpcError::UnsafeSocketPath);
+                }
                 tokio::fs::remove_file(socket).await?;
             }
             Ok(())
@@ -545,18 +586,59 @@ async fn prepare_socket(socket: &Path) -> Result<(), IpcError> {
 }
 
 #[cfg(unix)]
+fn is_socket_path(path: &Path) -> Result<bool, IpcError> {
+    use std::os::unix::fs::FileTypeExt;
+
+    Ok(std::fs::symlink_metadata(path)?.file_type().is_socket())
+}
+
+#[cfg(not(unix))]
+fn is_socket_path(_path: &Path) -> Result<bool, IpcError> {
+    Ok(true)
+}
+
+#[cfg(unix)]
+fn make_socket_parent_private(parent: &Path) -> Result<(), IpcError> {
+    use rustix::fs::{FileType, Mode, OFlags, fchmod, fstat, open};
+
+    let fd = open(
+        parent,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::empty(),
+    )
+    .map_err(std::io::Error::from)?;
+    let stat = fstat(&fd).map_err(std::io::Error::from)?;
+    if !FileType::from_raw_mode(stat.st_mode).is_dir()
+        || stat.st_uid != rustix::process::getuid().as_raw()
+    {
+        return Err(IpcError::UnsafeSocketParent);
+    }
+    fchmod(&fd, Mode::RUSR | Mode::WUSR | Mode::XUSR).map_err(std::io::Error::from)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn make_socket_parent_private(_parent: &Path) -> Result<(), IpcError> {
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn peer_is_current_user(stream: &UnixStream) -> Result<bool, IpcError> {
+    let credentials =
+        rustix::net::sockopt::socket_peercred(stream.as_fd()).map_err(std::io::Error::from)?;
+    Ok(credentials.uid == rustix::process::getuid())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn peer_is_current_user(_stream: &UnixStream) -> Result<bool, IpcError> {
+    Ok(true)
+}
+
+#[cfg(unix)]
 fn set_socket_permissions(socket: &Path) -> Result<(), IpcError> {
     use std::os::unix::fs::PermissionsExt;
 
     std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o600))?;
-    Ok(())
-}
-
-#[cfg(unix)]
-fn set_directory_permissions(directory: &Path) -> Result<(), IpcError> {
-    use std::os::unix::fs::PermissionsExt;
-
-    std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))?;
     Ok(())
 }
 
@@ -581,6 +663,10 @@ pub enum IpcError {
     AlreadyRunning,
     #[error("IPC socket path has no parent")]
     MissingSocketParent,
+    #[error("IPC socket parent is not an owned private directory")]
+    UnsafeSocketParent,
+    #[error("refusing to replace a non-socket IPC path")]
+    UnsafeSocketPath,
     #[error("daemon closed the IPC connection without responding")]
     ConnectionClosed,
     #[error("IPC I/O failed: {0}")]
@@ -624,6 +710,23 @@ mod tests {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(temporary.path())
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+            assert_eq!(
+                std::fs::metadata(&socket).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
         }
 
         let response = request(
@@ -785,5 +888,25 @@ mod tests {
         };
         assert_eq!(error.code, "unsupported");
         assert!(error.message.contains("current offer"));
+    }
+
+    #[tokio::test]
+    async fn refuses_to_delete_non_socket_stale_path() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let socket = temporary.path().join("daemon.sock");
+        std::fs::write(&socket, b"preserve me").unwrap();
+        let (commands, _) = mpsc::unbounded_channel();
+        let state = DaemonState::new(
+            "test-node".to_owned(),
+            temporary.path().join("config.toml"),
+            Config::default(),
+            commands,
+        );
+
+        assert!(matches!(
+            serve(&socket, state, CancellationToken::new()).await,
+            Err(IpcError::UnsafeSocketPath)
+        ));
+        assert_eq!(std::fs::read(&socket).unwrap(), b"preserve me");
     }
 }

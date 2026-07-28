@@ -30,6 +30,8 @@ use crate::{
 pub async fn run(paths: AppPaths, config: Config) -> anyhow::Result<()> {
     fs::create_dir_all(&paths.state_dir).context("create state directory")?;
     fs::create_dir_all(&paths.runtime_dir).context("create runtime directory")?;
+    make_private_directory(&paths.state_dir).context("secure state directory")?;
+    make_private_directory(&paths.runtime_dir).context("secure runtime directory")?;
 
     let mesh_secret = MeshSecret::load(&config.local.mesh_key_file)
         .context("load mesh secret from configured file")?;
@@ -509,4 +511,33 @@ async fn shutdown_signal() -> std::io::Result<()> {
 
     #[cfg(not(unix))]
     tokio::signal::ctrl_c().await
+}
+
+#[cfg(unix)]
+fn make_private_directory(path: &std::path::Path) -> anyhow::Result<()> {
+    use rustix::fs::{FileType, Mode, OFlags, fchmod, fstat, open};
+
+    let fd = open(
+        path,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::empty(),
+    )?;
+    let stat = fstat(&fd)?;
+    anyhow::ensure!(
+        FileType::from_raw_mode(stat.st_mode).is_dir(),
+        "{} is not a directory",
+        path.display()
+    );
+    anyhow::ensure!(
+        stat.st_uid == rustix::process::getuid().as_raw(),
+        "{} is not owned by the current user",
+        path.display()
+    );
+    fchmod(&fd, Mode::RUSR | Mode::WUSR | Mode::XUSR)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn make_private_directory(_path: &std::path::Path) -> anyhow::Result<()> {
+    Ok(())
 }

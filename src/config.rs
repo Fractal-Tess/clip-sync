@@ -1,6 +1,6 @@
 use std::{
     env, fs,
-    io::Write,
+    io::{Read, Write},
     path::{Path, PathBuf},
 };
 
@@ -11,6 +11,7 @@ use thiserror::Error;
 use crate::model::EffectiveSharedSettings;
 pub use crate::model::{DEFAULT_CAPTURE_THRESHOLD_BYTES, DEFAULT_MESH_QUOTA_BYTES};
 pub const DEFAULT_LISTEN_PORT: u16 = 24_892;
+const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -26,13 +27,22 @@ impl Config {
     ///
     /// Returns an error when the file cannot be read, decoded, or validated.
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
-        let source = match fs::read_to_string(path) {
-            Ok(source) => source,
+        let file = match fs::File::open(path) {
+            Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 return Ok(Self::default());
             }
             Err(source) => return Err(ConfigError::Read(source)),
         };
+        if file.metadata()?.len() > MAX_CONFIG_BYTES {
+            return Err(ConfigError::TooLarge);
+        }
+        let mut source = String::new();
+        file.take(MAX_CONFIG_BYTES + 1)
+            .read_to_string(&mut source)?;
+        if u64::try_from(source.len()).unwrap_or(u64::MAX) > MAX_CONFIG_BYTES {
+            return Err(ConfigError::TooLarge);
+        }
 
         let config: Self = toml::from_str(&source)?;
         config.validate()?;
@@ -50,12 +60,27 @@ impl Config {
         fs::create_dir_all(parent)?;
 
         let encoded = toml::to_string_pretty(self)?;
-        let temporary = path.with_extension("toml.tmp");
-        let mut file = fs::File::create(&temporary)?;
-        file.write_all(encoded.as_bytes())?;
-        file.sync_all()?;
-        drop(file);
-        fs::rename(temporary, path)?;
+        let temporary = parent.join(format!(".config.toml.{}.tmp", uuid::Uuid::new_v4()));
+        let result: Result<(), ConfigError> = (|| {
+            let mut options = fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let mut file = options.open(&temporary)?;
+            file.write_all(encoded.as_bytes())?;
+            file.sync_all()?;
+            drop(file);
+            fs::rename(&temporary, path)?;
+            fs::File::open(parent)?.sync_all()?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&temporary);
+        }
+        result?;
         Ok(())
     }
 
@@ -202,6 +227,8 @@ pub enum ConfigError {
     MissingParent,
     #[error("could not read the config: {0}")]
     Read(std::io::Error),
+    #[error("config exceeds the 1 MiB size limit")]
+    TooLarge,
     #[error("invalid TOML: {0}")]
     TomlDecode(#[from] toml::de::Error),
     #[error("could not encode TOML: {0}")]
@@ -234,6 +261,14 @@ mod tests {
         let loaded = Config::load(&path).expect("load config");
 
         assert_eq!(loaded, config);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
     }
 
     #[test]
@@ -247,5 +282,17 @@ mod tests {
         };
 
         assert!(matches!(config.validate(), Err(ConfigError::Invalid(_))));
+    }
+
+    #[test]
+    fn rejects_oversized_config_before_parsing() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let path = temp.path().join("config.toml");
+        fs::write(
+            &path,
+            vec![b'x'; usize::try_from(MAX_CONFIG_BYTES + 1).unwrap()],
+        )
+        .unwrap();
+        assert!(matches!(Config::load(&path), Err(ConfigError::TooLarge)));
     }
 }

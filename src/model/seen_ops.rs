@@ -1,12 +1,15 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de};
+
+const MAX_FRONTIER_NODES: usize = 4096;
+const MAX_SPARSE_COUNTERS: usize = 65_536;
 
 use super::{NodeId, OpId};
 
 /// Operations observed for one node: every counter at or below `frontier` is
 /// present, plus the sparse out-of-order counters in `gaps`.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 struct NodeSeen {
     frontier: u64,
     gaps: BTreeSet<u64>,
@@ -52,9 +55,68 @@ impl NodeSeen {
 /// Compact duplicate detector and anti-entropy frontier. `gaps` names the
 /// sparse set above the contiguous frontier (operations received across gaps),
 /// not the missing counters themselves.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct SeenOps {
     nodes: BTreeMap<NodeId, NodeSeen>,
+}
+
+impl<'de> Deserialize<'de> for SeenOps {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct WireNodeSeen {
+            frontier: u64,
+            gaps: Vec<u64>,
+        }
+
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct WireSeenOps {
+            nodes: BTreeMap<NodeId, WireNodeSeen>,
+        }
+
+        let wire = WireSeenOps::deserialize(deserializer)?;
+        if wire.nodes.len() > MAX_FRONTIER_NODES {
+            return Err(de::Error::custom("frontier contains too many nodes"));
+        }
+
+        let mut sparse_count = 0_usize;
+        let mut nodes = BTreeMap::new();
+        for (node, seen) in wire.nodes {
+            let wire_gap_count = seen.gaps.len();
+            sparse_count = sparse_count
+                .checked_add(wire_gap_count)
+                .ok_or_else(|| de::Error::custom("frontier sparse counter count overflowed"))?;
+            if sparse_count > MAX_SPARSE_COUNTERS {
+                return Err(de::Error::custom(
+                    "frontier contains too many sparse counters",
+                ));
+            }
+
+            let gaps = seen.gaps.into_iter().collect::<BTreeSet<_>>();
+            if gaps.len() != wire_gap_count {
+                return Err(de::Error::custom(
+                    "frontier contains duplicate sparse counters",
+                ));
+            }
+            if gaps.iter().any(|counter| *counter <= seen.frontier) {
+                return Err(de::Error::custom(
+                    "frontier sparse counters must be above its contiguous frontier",
+                ));
+            }
+            nodes.insert(
+                node,
+                NodeSeen {
+                    frontier: seen.frontier,
+                    gaps,
+                },
+            );
+        }
+        Ok(Self { nodes })
+    }
 }
 
 impl SeenOps {
@@ -134,6 +196,16 @@ mod tests {
         assert!(seen.record(operation(1)));
         assert!(!seen.record(operation(1)));
         assert!(!seen.record(operation(2)));
+    }
+
+    #[test]
+    fn deserialization_rejects_noncanonical_sparse_counters() {
+        let id = node();
+        let below_frontier = format!(r#"{{"nodes":{{"{id}":{{"frontier":2,"gaps":[2]}}}}}}"#);
+        assert!(serde_json::from_str::<SeenOps>(&below_frontier).is_err());
+
+        let duplicate = format!(r#"{{"nodes":{{"{id}":{{"frontier":0,"gaps":[2,2]}}}}}}"#);
+        assert!(serde_json::from_str::<SeenOps>(&duplicate).is_err());
     }
 
     proptest! {

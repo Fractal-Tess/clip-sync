@@ -92,6 +92,9 @@ pub enum StorageError {
     #[error("storage database could not be opened with the supplied key")]
     InvalidKey,
 
+    #[error("storage database is not a regular, non-symlink file owned by the current user")]
+    UnsafeDatabaseFile,
+
     #[error("storage schema is incompatible: {0}")]
     IncompatibleSchema(String),
 
@@ -263,7 +266,8 @@ impl EncryptedStorage {
             path,
             OpenFlags::SQLITE_OPEN_READ_WRITE
                 | OpenFlags::SQLITE_OPEN_CREATE
-                | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX
+                | OpenFlags::SQLITE_OPEN_NOFOLLOW,
         )?;
 
         apply_key(&connection, key)?;
@@ -1279,8 +1283,11 @@ fn update_replica_metadata(connection: &Connection, metadata: ReplicaMetadata) -
 }
 
 fn should_initialize(path: &Path) -> Result<bool> {
-    match fs::metadata(path) {
+    match fs::symlink_metadata(path) {
         Ok(metadata) => {
+            if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+                return Err(StorageError::UnsafeDatabaseFile);
+            }
             restrict_database_permissions(path)?;
             Ok(metadata.len() == 0)
         }
@@ -1314,9 +1321,21 @@ fn create_private_database(path: &Path) -> Result<()> {
 
 #[cfg(unix)]
 fn restrict_database_permissions(path: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
+    use rustix::fs::{FileType, Mode, OFlags, fchmod, fstat, open};
 
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    let fd = open(
+        path,
+        OFlags::RDWR | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::empty(),
+    )
+    .map_err(std::io::Error::from)?;
+    let stat = fstat(&fd).map_err(std::io::Error::from)?;
+    if !FileType::from_raw_mode(stat.st_mode).is_file()
+        || stat.st_uid != rustix::process::getuid().as_raw()
+    {
+        return Err(StorageError::UnsafeDatabaseFile);
+    }
+    fchmod(&fd, Mode::RUSR | Mode::WUSR).map_err(std::io::Error::from)?;
     Ok(())
 }
 

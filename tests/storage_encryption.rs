@@ -58,6 +58,25 @@ fn sqlcipher_storage_encrypts_plaintext_and_reopens_with_key() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn encrypted_storage_rejects_database_symlinks() {
+    use std::os::unix::fs::symlink;
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let target = temp_dir.path().join("target.db");
+    let link = temp_dir.path().join("history.db");
+    fs::write(&target, b"not a database").unwrap();
+    symlink(&target, &link).unwrap();
+    let key = StorageKey::from_bytes([0x5a; 32]);
+
+    assert!(matches!(
+        EncryptedStorage::open(&link, &key),
+        Err(StorageError::UnsafeDatabaseFile)
+    ));
+    assert_eq!(fs::read(&target).unwrap(), b"not a database");
+}
+
 fn unique_plaintext() -> String {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)

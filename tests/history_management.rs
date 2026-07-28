@@ -160,6 +160,27 @@ fn malformed_and_unknown_ids_do_not_advance_replica() {
 }
 
 #[test]
+fn far_future_peer_timestamp_does_not_poison_local_clock() {
+    let mut replica = Replica::new(node(1));
+    let peer = node(2);
+    let remote = StampedOperation::new(
+        OpId::new(peer, 1).unwrap(),
+        HlcTimestamp::new(clip_sync::replica::MAX_REMOTE_CLOCK_SKEW_MILLIS + 101, 0),
+        Operation::SetSetting {
+            key: "future-setting".to_owned(),
+            value: clip_sync::model::SettingValue::Bool(true),
+        },
+    );
+
+    assert!(matches!(
+        replica.ingest(&remote, 100),
+        Err(ReplicaError::RemoteClockTooFarAhead { .. })
+    ));
+    assert_eq!(replica.last_timestamp(), HlcTimestamp::default());
+    assert!(replica.projection().setting("future-setting").is_none());
+}
+
+#[test]
 fn history_store_persists_mutations_quota_and_restart_state() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("history.db");

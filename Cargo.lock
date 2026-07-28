@@ -812,6 +812,7 @@ dependencies = [
  "quinn",
  "rcgen",
  "rusqlite",
+ "rustix 1.1.4",
  "rustls",
  "secrecy",
  "serde",

@@ -4,6 +4,8 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use thiserror::Error;
 
 const CONTENT_DOMAIN: &[u8] = b"clip-sync/content-id/v1\0";
+pub const MAX_PAYLOAD_REPRESENTATIONS: usize = 128;
+pub const MAX_PAYLOAD_MIME_BYTES: usize = 256;
 
 /// Keyed identity of an exact set of clipboard MIME representations.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -185,6 +187,7 @@ impl Payload {
         key: &[u8; blake3::KEY_LEN],
         mut representations: Vec<Representation>,
     ) -> Result<Self, ContentError> {
+        validate_representation_set(&representations)?;
         representations
             .sort_unstable_by(|left, right| left.mime.as_bytes().cmp(right.mime.as_bytes()));
         reject_duplicate_mime(&representations)?;
@@ -235,9 +238,50 @@ impl Payload {
     /// Returns an error if bytes are noncanonical, duplicate a MIME name, have
     /// invalid sizes, or do not match the serialized descriptor.
     pub fn validate(&self, key: &[u8; blake3::KEY_LEN]) -> Result<(), ContentError> {
-        let rebuilt = Self::new(key, self.representations.clone())?;
-        if rebuilt.descriptor != self.descriptor || rebuilt.representations != self.representations
+        self.validate_structure()?;
+        let content_id = ContentId::from_representations(key, &self.representations)?;
+        if content_id != self.descriptor.content_id {
+            return Err(ContentError::DescriptorMismatch);
+        }
+        Ok(())
+    }
+
+    /// Validates serialization-level invariants without requiring the
+    /// mesh-secret-derived content key.
+    ///
+    /// # Errors
+    ///
+    /// Rejects empty/oversized representation sets, invalid MIME names,
+    /// noncanonical ordering, and descriptor mismatches.
+    pub fn validate_structure(&self) -> Result<(), ContentError> {
+        validate_representation_set(&self.representations)?;
+        if self
+            .representations
+            .windows(2)
+            .any(|pair| pair[0].mime.as_bytes() >= pair[1].mime.as_bytes())
         {
+            return Err(ContentError::NonCanonicalRepresentations);
+        }
+
+        if self.descriptor.representations.len() != self.representations.len() {
+            return Err(ContentError::DescriptorMismatch);
+        }
+        let mut logical_size = 0_u64;
+        for (descriptor, representation) in self
+            .descriptor
+            .representations
+            .iter()
+            .zip(&self.representations)
+        {
+            let byte_len = usize_to_u64(representation.bytes.len())?;
+            logical_size = logical_size
+                .checked_add(byte_len)
+                .ok_or(ContentError::SizeOverflow)?;
+            if descriptor.mime != representation.mime || descriptor.byte_len != byte_len {
+                return Err(ContentError::DescriptorMismatch);
+            }
+        }
+        if self.descriptor.logical_size != logical_size {
             return Err(ContentError::DescriptorMismatch);
         }
         Ok(())
@@ -282,6 +326,27 @@ fn reject_duplicate_mime_refs(representations: &[&Representation]) -> Result<(),
     Ok(())
 }
 
+fn validate_representation_set(representations: &[Representation]) -> Result<(), ContentError> {
+    if representations.is_empty() {
+        return Err(ContentError::EmptyPayload);
+    }
+    if representations.len() > MAX_PAYLOAD_REPRESENTATIONS {
+        return Err(ContentError::TooManyRepresentations {
+            count: representations.len(),
+            max: MAX_PAYLOAD_REPRESENTATIONS,
+        });
+    }
+    for representation in representations {
+        if representation.mime.is_empty()
+            || representation.mime.len() > MAX_PAYLOAD_MIME_BYTES
+            || representation.mime.bytes().any(|byte| byte == 0)
+        {
+            return Err(ContentError::InvalidMime(representation.mime.clone()));
+        }
+    }
+    Ok(())
+}
+
 fn hash_u64(hasher: &mut blake3::Hasher, value: u64) {
     hasher.update(&value.to_be_bytes());
 }
@@ -300,8 +365,16 @@ pub enum ContentIdParseError {
 
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum ContentError {
+    #[error("a payload must contain at least one MIME representation")]
+    EmptyPayload,
+    #[error("payload has {count} representations, exceeding the {max} limit")]
+    TooManyRepresentations { count: usize, max: usize },
+    #[error("payload contains invalid MIME type {0:?}")]
+    InvalidMime(String),
     #[error("a payload cannot contain MIME type {0:?} more than once")]
     DuplicateMime(String),
+    #[error("payload representations are not in canonical MIME order")]
+    NonCanonicalRepresentations,
     #[error("payload size cannot be represented")]
     SizeOverflow,
     #[error("payload descriptor does not match its exact representation bytes")]
@@ -360,6 +433,22 @@ mod tests {
         assert!(matches!(
             Payload::new(&KEY, representations),
             Err(ContentError::DuplicateMime(mime)) if mime == "text/plain"
+        ));
+    }
+
+    #[test]
+    fn malformed_representation_sets_are_rejected() {
+        assert!(matches!(
+            Payload::new(&KEY, Vec::new()),
+            Err(ContentError::EmptyPayload)
+        ));
+        assert!(matches!(
+            Payload::new(&KEY, vec![Representation::new("", b"value")]),
+            Err(ContentError::InvalidMime(_))
+        ));
+        assert!(matches!(
+            Payload::new(&KEY, vec![Representation::new("text/\0plain", b"value")]),
+            Err(ContentError::InvalidMime(_))
         ));
     }
 

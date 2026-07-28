@@ -5,6 +5,10 @@ use crate::model::{
     Operation, Payload, Projection, ProjectionError, SettingValue, SharedSetting, StampedOperation,
 };
 
+/// Generous tolerance for wall-clock skew without allowing a malformed peer
+/// event to pin the local HLC arbitrarily far into the future.
+pub const MAX_REMOTE_CLOCK_SKEW_MILLIS: u64 = 24 * 60 * 60 * 1000;
+
 /// In-memory authoring and projection state for one equal mesh member.
 ///
 /// The caller must durably persist each returned local operation before it is
@@ -366,6 +370,13 @@ impl Replica {
         operation: &StampedOperation,
         now_millis: u64,
     ) -> Result<ApplyOutcome, ReplicaError> {
+        let max_remote_millis = now_millis.saturating_add(MAX_REMOTE_CLOCK_SKEW_MILLIS);
+        if operation.timestamp().physical_millis() > max_remote_millis {
+            return Err(ReplicaError::RemoteClockTooFarAhead {
+                remote: operation.timestamp().physical_millis(),
+                local: now_millis,
+            });
+        }
         let mut projection = self.projection.clone();
         let outcome = projection.apply(operation)?;
         if outcome == ApplyOutcome::Duplicate {
@@ -424,6 +435,8 @@ pub enum ReplicaError {
     QuotaStateIncomplete(Vec<ContentId>),
     #[error("the local device cannot forget itself")]
     CannotForgetLocalDevice,
+    #[error("remote clock {remote}ms is too far ahead of local clock {local}ms")]
+    RemoteClockTooFarAhead { remote: u64, local: u64 },
     #[error(transparent)]
     Clock(#[from] HlcError),
     #[error(transparent)]

@@ -8,7 +8,7 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::model::StampedOperation;
+use crate::model::{Projection, StampedOperation};
 
 /// Version tag for the current JSON encoding.
 const JSON_V1: u32 = 1;
@@ -60,6 +60,7 @@ impl Codec for JsonV1Codec {
         if envelope.v != JSON_V1 {
             return Err(CodecError::UnsupportedVersion(envelope.v));
         }
+        Projection::validate_operation(&envelope.d).map_err(CodecError::InvalidOperation)?;
         Ok(envelope.d)
     }
 }
@@ -72,6 +73,8 @@ pub enum CodecError {
     Deserialize(#[source] serde_json::Error),
     #[error("unsupported envelope version {0}")]
     UnsupportedVersion(u32),
+    #[error("serialized operation violates model invariants: {0}")]
+    InvalidOperation(#[source] crate::model::ProjectionError),
 }
 
 #[cfg(test)]
@@ -135,5 +138,30 @@ mod tests {
     fn rejects_garbage_bytes() {
         let codec = JsonV1Codec;
         assert!(codec.decode_op(b"not json").is_err());
+    }
+
+    #[test]
+    fn rejects_operation_with_zero_counter() {
+        let codec = JsonV1Codec;
+        let bytes = codec.encode_op(&sample_op()).unwrap();
+        let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        value["d"]["id"]["counter"] = serde_json::json!(0);
+        assert!(
+            codec
+                .decode_op(&serde_json::to_vec(&value).unwrap())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn rejects_structurally_malformed_payload() {
+        let codec = JsonV1Codec;
+        let bytes = codec.encode_op(&sample_op()).unwrap();
+        let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        value["d"]["operation"]["payload"]["representations"][0]["mime"] = serde_json::json!("");
+        assert!(matches!(
+            codec.decode_op(&serde_json::to_vec(&value).unwrap()),
+            Err(CodecError::InvalidOperation(_))
+        ));
     }
 }

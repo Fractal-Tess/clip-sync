@@ -614,7 +614,7 @@ fn parse_identity(hello: IdentityHello) -> Result<PeerIdentity, MeshError> {
     if hello.protocol_version != PROTOCOL_VERSION {
         return Err(MeshError::UnsupportedProtocol(hello.protocol_version));
     }
-    if hello.hostname.is_empty() || hello.hostname.len() > MAX_HOSTNAME_BYTES {
+    if !valid_hostname(&hello.hostname) {
         return Err(MeshError::InvalidHostname);
     }
     if hello.frontier.len() > MAX_FRONTIER_BYTES {
@@ -901,7 +901,7 @@ async fn wait_backoff(
 }
 
 fn validate_local_config(config: &MeshRuntimeConfig) -> Result<(), MeshError> {
-    if config.hostname.is_empty() || config.hostname.len() > MAX_HOSTNAME_BYTES {
+    if !valid_hostname(&config.hostname) {
         return Err(MeshError::InvalidHostname);
     }
     if config.reconcile_interval.is_zero()
@@ -916,6 +916,12 @@ fn validate_local_config(config: &MeshRuntimeConfig) -> Result<(), MeshError> {
         return Err(MeshError::InvalidConfig);
     }
     Ok(())
+}
+
+fn valid_hostname(hostname: &str) -> bool {
+    !hostname.is_empty()
+        && hostname.len() <= MAX_HOSTNAME_BYTES
+        && !hostname.chars().any(char::is_control)
 }
 
 #[derive(Debug, Error)]

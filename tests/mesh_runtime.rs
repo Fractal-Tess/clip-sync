@@ -7,8 +7,8 @@ use std::{
 
 use clip_sync::{
     discovery::{DiscoveredPeer, DiscoverySnapshot},
-    mesh::{MeshHandle, MeshRuntime, MeshRuntimeConfig, PersistBatch},
-    model::{Operation, Payload, Representation, StampedOperation},
+    mesh::{MeshError, MeshHandle, MeshRuntime, MeshRuntimeConfig, PersistBatch},
+    model::{NodeId, Operation, Payload, Representation, StampedOperation},
     replica::Replica,
     replication::{Codec, JsonV1Codec},
     storage::{EncryptedStorage, StorageKey},
@@ -321,4 +321,18 @@ async fn three_nodes_store_forward_with_origin_offline_and_later_converge() {
 
     b.stop().await;
     c.stop().await;
+}
+
+#[tokio::test]
+async fn runtime_rejects_control_characters_in_logged_hostname() {
+    let config = MeshRuntimeConfig::new(NodeId::new(), "peer\nforged-log-line", 24_892);
+    assert!(matches!(
+        MeshRuntime::spawn(
+            config,
+            Psk::new(&PSK).unwrap(),
+            &[],
+            CancellationToken::new()
+        ),
+        Err(MeshError::InvalidHostname)
+    ));
 }

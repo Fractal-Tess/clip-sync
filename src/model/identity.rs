@@ -1,6 +1,6 @@
 use std::{fmt, str::FromStr};
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -56,10 +56,27 @@ impl FromStr for NodeId {
 
 /// Globally unique identity of an operation. Counters are one-based and must
 /// be persisted by their originating node before an operation is published.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub struct OpId {
     node: NodeId,
     counter: u64,
+}
+
+impl<'de> Deserialize<'de> for OpId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct WireOpId {
+            node: NodeId,
+            counter: u64,
+        }
+
+        let wire = WireOpId::deserialize(deserializer)?;
+        Self::new(wire.node, wire.counter).map_err(de::Error::custom)
+    }
 }
 
 impl OpId {
@@ -114,5 +131,11 @@ mod tests {
         let node = NodeId::from_uuid(Uuid::nil());
         assert_eq!(OpId::new(node, 0), Err(OpIdError::ZeroCounter));
         assert_eq!(OpId::new(node, 1).unwrap().counter(), 1);
+    }
+
+    #[test]
+    fn deserialization_cannot_bypass_one_based_counter() {
+        let encoded = format!(r#"{{"node":"{}","counter":0}}"#, Uuid::nil());
+        assert!(serde_json::from_str::<OpId>(&encoded).is_err());
     }
 }
