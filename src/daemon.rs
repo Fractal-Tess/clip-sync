@@ -334,12 +334,9 @@ pub async fn run(paths: AppPaths, mut config: Config) -> anyhow::Result<()> {
     let transport_psk = mesh_secret
         .transport_psk()
         .context("derive mesh transport key")?;
-    let chunk_store_key = mesh_secret
-        .chunk_store_key()
-        .context("derive chunk-store key")?;
     let chunk_store = ChunkStore::open(
         paths.state_dir.join("chunks"),
-        &chunk_store_key,
+        state_keys.chunk_store_key(),
         ChunkStoreConfig {
             max_payload_bytes: config.local.maximum_explicit_share_bytes,
             max_chunks_per_manifest: 65_536,

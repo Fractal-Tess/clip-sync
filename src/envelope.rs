@@ -823,7 +823,9 @@ mod tests {
         .expect("open migrated chunk store");
         let stored_blob = match reopened.manifest(manifest_id).expect("load manifest") {
             StoredManifest::Blob(blob) => blob,
-            StoredManifest::Files(_) => panic!("expected blob manifest"),
+            StoredManifest::Files(_) | StoredManifest::MimeBundle(_) => {
+                panic!("expected blob manifest")
+            }
         };
         let mut restored = Vec::new();
         reopened
