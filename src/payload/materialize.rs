@@ -216,6 +216,33 @@ impl Materializer {
         Ok(removed)
     }
 
+    /// Removes every materialization left by a previous daemon process.
+    ///
+    /// The runtime root is process-owned: after a crash no surviving process
+    /// can safely serve these paths. Symlinks are unlinked and never followed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for enumeration, removal, or an unsupported entry type.
+    pub fn cleanup_abandoned(&self) -> Result<usize, MaterializationError> {
+        let mut removed = 0_usize;
+        for entry in fs::read_dir(&self.root)? {
+            let entry = entry?;
+            let file_type = entry.file_type()?;
+            if file_type.is_dir() && !file_type.is_symlink() {
+                fs::remove_dir_all(entry.path())?;
+            } else if file_type.is_file() || file_type.is_symlink() {
+                fs::remove_file(entry.path())?;
+            } else {
+                return Err(MaterializationError::UnsafeRuntimeEntry);
+            }
+            removed = removed
+                .checked_add(1)
+                .ok_or(MaterializationError::SizeOverflow)?;
+        }
+        Ok(removed)
+    }
+
     fn write_snapshot(
         store: &ChunkStore,
         snapshot: &FileSnapshot,

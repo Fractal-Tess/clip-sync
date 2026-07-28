@@ -143,6 +143,7 @@ impl StateKeys {
                         return Err(EnvelopeError::InvalidPendingRekey);
                     }
                     verify_state(state_dir, &keys)?;
+                    cleanup_orphan_keyslot_temps(state_dir)?;
                     return Ok(keys);
                 }
                 Err(EnvelopeError::WrongSecret) if path_exists(&pending_path)? => {
@@ -154,6 +155,7 @@ impl StateKeys {
                     commit_pending(&pending_path, &keyslot_path)?;
                     let committed = read_slot(&keyslot_path, secret)?;
                     verify_state(state_dir, &committed.keys)?;
+                    cleanup_orphan_keyslot_temps(state_dir)?;
                     return Ok(committed.keys);
                 }
                 Err(error) => return Err(error),
@@ -164,7 +166,9 @@ impl StateKeys {
             return Err(EnvelopeError::InvalidPendingRekey);
         }
 
-        initialize_keyslot(state_dir, secret)
+        let keys = initialize_keyslot(state_dir, secret)?;
+        cleanup_orphan_keyslot_temps(state_dir)?;
+        Ok(keys)
     }
 
     #[must_use]
@@ -634,6 +638,33 @@ fn path_exists(path: &Path) -> io::Result<bool> {
     }
 }
 
+fn cleanup_orphan_keyslot_temps(state_dir: &Path) -> Result<usize> {
+    let mut removed = 0_usize;
+    for entry in fs::read_dir(state_dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !name.starts_with(".history.keyslot.")
+            || !Path::new(name)
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("tmp"))
+        {
+            continue;
+        }
+        let file_type = entry.file_type()?;
+        if !file_type.is_file() && !file_type.is_symlink() {
+            return Err(EnvelopeError::InvalidKeyslot);
+        }
+        fs::remove_file(entry.path())?;
+        removed = removed
+            .checked_add(1)
+            .ok_or(EnvelopeError::InvalidKeyslot)?;
+    }
+    Ok(removed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -903,6 +934,28 @@ mod tests {
             StoreLock::acquire(directory.path()),
             Err(EnvelopeError::StoreBusy)
         ));
+    }
+
+    #[test]
+    fn wrong_secret_is_read_only_and_authenticated_open_reclaims_crash_temp() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let correct = secret(21);
+        let wrong = secret(22);
+        let lock = StoreLock::acquire(directory.path()).expect("store lock");
+        StateKeys::open_or_create(&lock, &correct).expect("initialize");
+        let orphan = directory.path().join(".history.keyslot.crashed.tmp");
+        fs::write(&orphan, b"abandoned atomic replacement").expect("write orphan");
+        let before = snapshot_files(directory.path());
+
+        assert!(matches!(
+            StateKeys::open_or_create(&lock, &wrong),
+            Err(EnvelopeError::WrongSecret)
+        ));
+        assert_eq!(snapshot_files(directory.path()), before);
+        assert!(orphan.exists());
+
+        StateKeys::open_or_create(&lock, &correct).expect("authenticated reopen");
+        assert!(!orphan.exists());
     }
 
     fn snapshot_files(root: &Path) -> Vec<(PathBuf, Vec<u8>)> {

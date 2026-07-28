@@ -469,6 +469,15 @@ pub async fn run(paths: AppPaths, mut config: Config) -> anyhow::Result<()> {
         },
     )
     .context("open runtime materializer")?;
+    let abandoned_materializations = materializer
+        .cleanup_abandoned()
+        .context("clean materializations left by a previous daemon")?;
+    if abandoned_materializations != 0 {
+        tracing::info!(
+            removed = abandoned_materializations,
+            "removed abandoned runtime materializations"
+        );
+    }
     let mut transfers = TransferCoordinator::new(
         chunk_store,
         materializer,
@@ -526,6 +535,7 @@ pub async fn run(paths: AppPaths, mut config: Config) -> anyhow::Result<()> {
     )
     .context("start mesh runtime")?;
     let mesh_handle = mesh.handle();
+    state.set_mesh(mesh_handle.clone()).await;
     let discovery = spawn_discovery(
         config.clone(),
         state.clone(),
@@ -549,23 +559,13 @@ pub async fn run(paths: AppPaths, mut config: Config) -> anyhow::Result<()> {
                 .capture_threshold_bytes,
         )
         .context("apply effective clipboard capture threshold")?;
-    let (clipboard_tx, mut clipboard_rx) = tokio::sync::mpsc::unbounded_channel();
-    let clipboard_events = clipboard_tx.clone();
-    let clipboard_backend = clipboard.clone();
-    let clipboard_shutdown = shutdown.clone();
-    let mut clipboard_watch = tokio::spawn(async move {
-        clipboard_backend
-            .watch(
-                clipboard_shutdown,
-                Box::new(move |event| {
-                    let _ = clipboard_events.send(event);
-                }),
-            )
-            .await
-    });
-    state
-        .set_clipboard_status(true, "Wayland clipboard monitoring is active")
-        .await;
+    let (clipboard_tx, mut clipboard_rx) = tokio::sync::mpsc::channel(128);
+    let mut clipboard_watch = spawn_clipboard_watch(
+        clipboard.clone(),
+        state.clone(),
+        clipboard_tx,
+        shutdown.clone(),
+    );
 
     tracing::info!(socket = %paths.socket.display(), "clip-sync daemon started");
     let server = ipc::serve(&paths.socket, state.clone(), shutdown.clone());
@@ -587,20 +587,13 @@ pub async fn run(paths: AppPaths, mut config: Config) -> anyhow::Result<()> {
             }
             result = &mut clipboard_watch, if !clipboard_finished => {
                 clipboard_finished = true;
-                match result {
-                    Ok(Ok(())) => {
-                        state
-                            .set_clipboard_status(false, "Wayland clipboard monitoring stopped")
-                            .await;
-                    }
-                    Ok(Err(error)) => {
-                        state.set_clipboard_status(false, error.to_string()).await;
-                        tracing::warn!(%error, "Wayland clipboard monitoring stopped");
-                    }
-                    Err(error) => {
-                        state.set_clipboard_status(false, error.to_string()).await;
-                        tracing::warn!(%error, "Wayland clipboard task failed");
-                    }
+                if let Err(error) = result {
+                    state.set_clipboard_status(false, error.to_string()).await;
+                    tracing::warn!(%error, "Wayland clipboard supervisor failed");
+                } else if !shutdown.is_cancelled() {
+                    state
+                        .set_clipboard_status(false, "Wayland clipboard supervisor stopped")
+                        .await;
                 }
             }
             command = command_rx.recv() => {
@@ -621,7 +614,7 @@ pub async fn run(paths: AppPaths, mut config: Config) -> anyhow::Result<()> {
                     ).await;
                 }
             }
-            event = clipboard_rx.recv(), if !clipboard_finished => {
+            event = clipboard_rx.recv() => {
                 if let Some(event) = event {
                     if matches!(
                         event,
@@ -692,15 +685,12 @@ pub async fn run(paths: AppPaths, mut config: Config) -> anyhow::Result<()> {
     }
 
     shutdown.cancel();
+    drop(clipboard_rx);
     if !server_finished {
         server.await.context("stop local IPC")?;
     }
-    if !clipboard_finished {
-        match clipboard_watch.await {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => tracing::warn!(%error, "Wayland clipboard monitoring stopped"),
-            Err(error) => tracing::warn!(%error, "Wayland clipboard task failed"),
-        }
+    if !clipboard_finished && let Err(error) = clipboard_watch.await {
+        tracing::warn!(%error, "Wayland clipboard supervisor failed");
     }
     finish_task(discovery).await;
     finish_task(config_watch).await;
@@ -1015,12 +1005,13 @@ async fn update_shared_setting(
             free_space_reserve_bytes: config.local.transfer_free_space_reserve_bytes,
         })
         .context("apply shared transfer policy")?;
-    *config = Config::rewrite_shared(
+    let rewritten = Config::rewrite_shared(
         config_path,
         effective,
         history.projection().shared_settings_revision(),
     )
     .context("atomically mirror shared settings to config")?;
+    config.shared = rewritten.shared;
     Ok(())
 }
 
@@ -1265,6 +1256,11 @@ async fn handle_clipboard_event(
     transfers: &mut TransferCoordinator,
 ) -> anyhow::Result<()> {
     match event {
+        ClipboardEvent::Ready => {
+            state
+                .set_clipboard_status(true, "Wayland clipboard monitoring is active")
+                .await;
+        }
         ClipboardEvent::Captured { content, .. } => {
             let result = capture_automatic_clipboard(
                 &content,
@@ -1300,6 +1296,9 @@ async fn handle_clipboard_event(
             tracing::debug!(?reason, "clipboard offer was not captured");
         }
         ClipboardEvent::Finished => {
+            state
+                .set_clipboard_status(false, "Wayland clipboard device was removed; reconnecting")
+                .await;
             tracing::warn!("Wayland compositor finished the clipboard data-control device");
         }
         ClipboardEvent::NewOffer { .. }
@@ -1307,6 +1306,60 @@ async fn handle_clipboard_event(
         | ClipboardEvent::Cleared { .. } => {}
     }
     Ok(())
+}
+
+fn spawn_clipboard_watch<B>(
+    clipboard: B,
+    state: DaemonState,
+    events: tokio::sync::mpsc::Sender<ClipboardEvent>,
+    shutdown: CancellationToken,
+) -> JoinHandle<()>
+where
+    B: ClipboardBackend + Clone + 'static,
+{
+    tokio::spawn(async move {
+        let mut retry_delay = Duration::from_secs(1);
+        loop {
+            state
+                .set_clipboard_status(false, "connecting to the Wayland clipboard")
+                .await;
+            let callback_events = events.clone();
+            let ready = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let callback_ready = ready.clone();
+            let result = clipboard
+                .watch(
+                    shutdown.clone(),
+                    Box::new(move |event| {
+                        if matches!(event, ClipboardEvent::Ready) {
+                            callback_ready.store(true, std::sync::atomic::Ordering::SeqCst);
+                        }
+                        // The Wayland watcher owns a dedicated thread. Bounded
+                        // blocking backpressure preserves capture ordering
+                        // without allowing suspend/resume storms to grow RAM.
+                        let _ = callback_events.blocking_send(event);
+                    }),
+                )
+                .await;
+            if shutdown.is_cancelled() {
+                break;
+            }
+            let detail = match result {
+                Ok(()) => "Wayland clipboard device stopped; retrying".to_owned(),
+                Err(error) => error.to_string(),
+            };
+            state.set_clipboard_status(false, detail.clone()).await;
+            tracing::warn!(error = %detail, "Wayland clipboard monitoring is unavailable");
+            if ready.load(std::sync::atomic::Ordering::SeqCst) {
+                retry_delay = Duration::from_secs(1);
+            } else {
+                retry_delay = retry_delay.saturating_mul(2).min(Duration::from_secs(30));
+            }
+            tokio::select! {
+                () = shutdown.cancelled() => break,
+                () = tokio::time::sleep(retry_delay) => {}
+            }
+        }
+    })
 }
 
 struct MeshPersistenceContext<'a> {
@@ -1468,7 +1521,7 @@ async fn persist_mesh_batch(
     let revision = context.history.projection().shared_settings_revision();
     if !context.config.shared.matches(after, &revision) {
         match Config::rewrite_shared(context.config_path, after, revision) {
-            Ok(config) => *context.config = config,
+            Ok(config) => context.config.shared = config.shared,
             Err(error) => {
                 context.config.shared = SharedConfig {
                     mesh_quota_bytes: after.mesh_quota_bytes,
@@ -1576,6 +1629,10 @@ async fn apply_config_reload(
     state: &DaemonState,
     transfers: &mut TransferCoordinator,
 ) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !restart_required_local_change(&current.local, &changed.local),
+        "changed local bootstrap settings require a daemon restart"
+    );
     let before = history.projection().effective_shared_settings();
     let current_revision = history.projection().shared_settings_revision();
     if changed.shared.matches(before, &current_revision) {
@@ -1645,6 +1702,22 @@ async fn apply_config_reload(
     Ok(())
 }
 
+fn restart_required_local_change(
+    current: &crate::config::LocalConfig,
+    changed: &crate::config::LocalConfig,
+) -> bool {
+    current.mesh_key_file != changed.mesh_key_file
+        || current.listen_port != changed.listen_port
+        || current.discovery_interval_seconds != changed.discovery_interval_seconds
+        || current.reconcile_interval_seconds != changed.reconcile_interval_seconds
+        || current.reconnect_min_seconds != changed.reconnect_min_seconds
+        || current.reconnect_max_seconds != changed.reconnect_max_seconds
+        || current.netbird_command != changed.netbird_command
+        || current.materialization_free_space_reserve_bytes
+            != changed.materialization_free_space_reserve_bytes
+        || current.max_concurrent_chunk_streams != changed.max_concurrent_chunk_streams
+}
+
 fn spawn_config_watch(
     path: std::path::PathBuf,
     initial: Config,
@@ -1660,8 +1733,9 @@ fn spawn_config_watch(
             }
             match Config::load(&path) {
                 Ok(config) if config != observed => {
+                    let reload = config_change_requires_reload(&observed, &config);
                     observed = config.clone();
-                    if updates.send(config).is_err() {
+                    if reload && updates.send(config).is_err() {
                         break;
                     }
                 }
@@ -1672,6 +1746,20 @@ fn spawn_config_watch(
             }
         }
     })
+}
+
+fn config_change_requires_reload(observed: &Config, changed: &Config) -> bool {
+    if observed.local != changed.local {
+        return true;
+    }
+    if observed.shared == changed.shared {
+        return false;
+    }
+
+    // Daemon-authored shared-setting mirrors always advance the replicated
+    // register fingerprint. A human edit changes values while retaining (or
+    // clearing) the last fingerprint, so it still becomes a mesh operation.
+    changed.shared.revision.is_empty() || changed.shared.revision == observed.shared.revision
 }
 
 fn unix_time_millis() -> anyhow::Result<u64> {
@@ -1703,6 +1791,7 @@ fn spawn_discovery(
                     state.set_discovery(snapshot).await;
                 }
                 Err(error) => {
+                    mesh.clear_discovery();
                     state.set_discovery_error(error.to_string()).await;
                     tracing::warn!(%error, "NetBird discovery is unavailable");
                 }
@@ -1740,7 +1829,14 @@ async fn shutdown_signal() -> std::io::Result<()> {
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)]
 mod tests {
-    use std::{collections::BTreeSet, net::UdpSocket};
+    use std::{
+        collections::BTreeSet,
+        net::UdpSocket,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
 
     use async_trait::async_trait;
 
@@ -1806,6 +1902,55 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Default)]
+    struct RecoveringClipboard {
+        watches: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl ClipboardBackend for RecoveringClipboard {
+        async fn probe(&self) -> Result<ProbeResult, BackendError> {
+            Err(BackendError::NoDisplay)
+        }
+
+        async fn watch(
+            &self,
+            shutdown: CancellationToken,
+            on_event: Box<dyn Fn(ClipboardEvent) + Send + Sync>,
+        ) -> Result<(), BackendError> {
+            let attempt = self.watches.fetch_add(1, Ordering::SeqCst);
+            std::thread::spawn(move || on_event(ClipboardEvent::Ready))
+                .join()
+                .expect("scripted clipboard callback");
+            if attempt == 0 {
+                return Err(BackendError::Connection("injected disconnect".to_owned()));
+            }
+            shutdown.cancelled().await;
+            Ok(())
+        }
+
+        async fn set_clipboard_content(
+            &self,
+            _content: ClipboardContent,
+        ) -> Result<FeedbackMarker, BackendError> {
+            Err(BackendError::WatchNotRunning)
+        }
+
+        async fn inspect_current_clipboard(
+            &self,
+            _maximum_bytes: u64,
+        ) -> Result<CurrentClipboardInspection, BackendError> {
+            Err(BackendError::WatchNotRunning)
+        }
+
+        async fn capture_current_clipboard(
+            &self,
+            _inspection: &CurrentClipboardInspection,
+        ) -> Result<ClipboardContent, BackendError> {
+            Err(BackendError::WatchNotRunning)
+        }
+    }
+
     fn clipboard(bytes: &[u8]) -> TestClipboard {
         let mime = MimeType::new("text/plain").unwrap();
         let content = ClipboardContent::new_with_max(
@@ -1822,6 +1967,72 @@ mod tests {
             inspection,
             content,
         }
+    }
+
+    #[tokio::test]
+    async fn clipboard_supervisor_reconnects_after_injected_disconnect() {
+        let temporary = tempfile::tempdir().unwrap();
+        let (commands, _command_rx) = tokio::sync::mpsc::unbounded_channel();
+        let state = DaemonState::new(
+            "test".to_owned(),
+            temporary.path().join("config.toml"),
+            Config::default(),
+            commands,
+        );
+        let backend = RecoveringClipboard::default();
+        let watches = backend.watches.clone();
+        let shutdown = CancellationToken::new();
+        let (events, mut received) = tokio::sync::mpsc::channel(4);
+        let task = spawn_clipboard_watch(backend, state, events, shutdown.clone());
+
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while watches.load(Ordering::SeqCst) < 2 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("clipboard watcher did not reconnect");
+        assert!(matches!(received.recv().await, Some(ClipboardEvent::Ready)));
+        assert!(matches!(received.recv().await, Some(ClipboardEvent::Ready)));
+
+        shutdown.cancel();
+        drop(received);
+        task.await.expect("clipboard supervisor");
+    }
+
+    #[test]
+    fn config_watcher_suppresses_daemon_revisions_but_not_external_edits() {
+        let mut observed = Config::default();
+        observed.shared.revision = "a1".to_owned();
+
+        for revision in 2..10_000 {
+            let mut daemon_write = observed.clone();
+            daemon_write.shared.mesh_quota_bytes += 1;
+            daemon_write.shared.revision = format!("{revision:x}");
+            assert!(!config_change_requires_reload(&observed, &daemon_write));
+            observed = daemon_write;
+        }
+
+        let mut external_shared = observed.clone();
+        external_shared.shared.mesh_quota_bytes += 1;
+        assert!(config_change_requires_reload(&observed, &external_shared));
+
+        let mut external_local = observed.clone();
+        external_local.local.listen_port += 1;
+        external_local.shared.revision = "ffff".to_owned();
+        assert!(config_change_requires_reload(&observed, &external_local));
+        assert!(restart_required_local_change(
+            &observed.local,
+            &external_local.local
+        ));
+
+        let mut live_policy = observed.local.clone();
+        live_policy.maximum_explicit_share_bytes += 1;
+        live_policy.transfer_free_space_reserve_bytes += 1;
+        assert!(!restart_required_local_change(
+            &observed.local,
+            &live_policy
+        ));
     }
 
     fn open_state(

@@ -18,7 +18,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::{
-    discovery::DiscoverySnapshot,
+    discovery::{DiscoverySnapshot, MAX_DISCOVERED_PEERS},
     model::{NodeId, OpId, Operation, SeenOps, StampedOperation},
     replication::{AntiEntropyState, BatchLimits, Codec, JsonV1Codec, OpLog},
     transfer::{TransferChunk, TransferId},
@@ -28,8 +28,9 @@ use crate::{
 use super::protocol::{
     ChunkStreamRequest, ChunkStreamResponse, IdentityHello, MAX_BATCH_OPERATIONS,
     MAX_CHUNK_CONTROL_BYTES, MAX_ENCRYPTED_CHUNK_BYTES, MAX_FRONTIER_BYTES, MAX_HOSTNAME_BYTES,
-    MAX_MEMBERSHIP_BYTES, PROTOCOL_VERSION, ProtocolError, STREAM_KIND_CHUNK, STREAM_KIND_SYNC,
-    SyncRequest, SyncResponse, read_message, read_message_bounded, validate_batch, write_message,
+    MAX_MEMBERSHIP_BYTES, PROTOCOL_VERSION, ProtocolError, ProtocolHello, STREAM_KIND_CHUNK,
+    STREAM_KIND_SYNC, SyncRequest, SyncResponse, read_message, read_message_bounded,
+    validate_batch, write_message,
 };
 
 const SERVER_NAME: &str = "clip-sync.mesh";
@@ -38,12 +39,16 @@ const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(30);
 const PERSIST_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_RECONCILE_ROUNDS: usize = 1024;
 const MAX_CONCURRENT_HANDSHAKES: usize = 32;
+const MAX_ACTIVE_CONNECTIONS: usize = 128;
+const MAX_GENERATION_TASKS: usize =
+    MAX_DISCOVERED_PEERS + MAX_ACTIVE_CONNECTIONS + MAX_CONCURRENT_HANDSHAKES;
 const MAX_CONCURRENT_CHUNK_STREAMS: usize = 4;
 const MAX_MISSING_CHUNKS_PER_ROUND: usize = 64;
 const CHUNK_BROKER_TIMEOUT: Duration = Duration::from_secs(30);
 const CLOSE_DUPLICATE: u32 = 0x201;
 const CLOSE_FORGOTTEN: u32 = 0x202;
 const CLOSE_SHUTDOWN: u32 = 0x203;
+const CLOSE_PROTOCOL: u32 = 0x204;
 
 /// Runtime tuning for one mesh member.
 #[derive(Clone, Debug)]
@@ -169,6 +174,7 @@ impl PersistResult {
 pub struct MeshHandle {
     discovery: watch::Sender<Option<DiscoverySnapshot>>,
     revision: watch::Sender<u64>,
+    status: watch::Sender<MeshRuntimeStatus>,
     state: Arc<RwLock<AntiEntropyState>>,
     known_members: Arc<RwLock<BTreeSet<NodeId>>>,
     forgotten_devices: Arc<RwLock<BTreeSet<NodeId>>>,
@@ -179,6 +185,17 @@ impl MeshHandle {
     /// Updates the `NetBird` bind address and dial set.
     pub fn update_discovery(&self, snapshot: DiscoverySnapshot) {
         self.discovery.send_replace(Some(snapshot));
+    }
+
+    /// Removes a stale bind/dial set when discovery becomes unavailable.
+    pub fn clear_discovery(&self) {
+        self.discovery.send_replace(None);
+    }
+
+    /// Returns current supervisor-owned listener and connection state.
+    #[must_use]
+    pub fn status(&self) -> MeshRuntimeStatus {
+        self.status.borrow().clone()
     }
 
     /// Records an already-durable local operation and wakes every live session.
@@ -221,6 +238,15 @@ impl MeshHandle {
                 .close(CLOSE_FORGOTTEN.into(), b"device identity forgotten");
         }
     }
+}
+
+/// Live, redacted mesh runtime state used by diagnostics and soak tests.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MeshRuntimeStatus {
+    pub listener_address: Option<SocketAddr>,
+    pub discovered_addresses: usize,
+    pub active_connections: usize,
+    pub last_listener_error: Option<String>,
 }
 
 /// Owned background mesh supervisor.
@@ -298,6 +324,7 @@ impl MeshRuntime {
         let registry = Arc::new(Mutex::new(BTreeMap::new()));
         let (discovery, discovery_rx) = watch::channel(None);
         let (revision, _) = watch::channel(0_u64);
+        let (status, _) = watch::channel(MeshRuntimeStatus::default());
         let (persist_tx, persist_rx) = mpsc::channel(32);
         let (chunk_tx, chunk_rx) = if transfers {
             let (tx, rx) = mpsc::channel(32);
@@ -308,6 +335,7 @@ impl MeshRuntime {
         let handle = MeshHandle {
             discovery,
             revision: revision.clone(),
+            status: status.clone(),
             state: state.clone(),
             known_members: known_members.clone(),
             forgotten_devices: forgotten_devices.clone(),
@@ -318,6 +346,7 @@ impl MeshRuntime {
             psk: Arc::new(psk),
             state,
             revision,
+            status,
             persist_tx,
             chunk_tx,
             registry,
@@ -353,6 +382,7 @@ struct RuntimeContext {
     psk: Arc<Psk>,
     state: Arc<RwLock<AntiEntropyState>>,
     revision: watch::Sender<u64>,
+    status: watch::Sender<MeshRuntimeStatus>,
     persist_tx: mpsc::Sender<PersistBatch>,
     chunk_tx: Option<mpsc::Sender<MeshChunkCommand>>,
     registry: Arc<Mutex<BTreeMap<NodeId, ActiveConnection>>>,
@@ -412,17 +442,38 @@ async fn supervise(
                             peers,
                             task,
                         });
+                        context.status.send_modify(|status| {
+                            status.listener_address = Some(bind);
+                            status.discovered_addresses =
+                                discovered_addresses(&snapshot, context.config.listen_port).len();
+                            status.last_listener_error = None;
+                        });
                         tracing::info!(%bind, "mesh QUIC listener active");
                     }
                     Err(error) => {
+                        context.status.send_modify(|status| {
+                            status.listener_address = None;
+                            status.discovered_addresses =
+                                discovered_addresses(&snapshot, context.config.listen_port).len();
+                            status.last_listener_error = Some(error.to_string());
+                        });
                         tracing::warn!(%bind, %error, "could not bind mesh QUIC listener");
                     }
                 }
             } else if let Some(generation) = &generation {
-                generation
-                    .peers
-                    .send_replace(discovered_addresses(&snapshot, context.config.listen_port));
+                let addresses = discovered_addresses(&snapshot, context.config.listen_port);
+                context.status.send_modify(|status| {
+                    status.discovered_addresses = addresses.len();
+                });
+                generation.peers.send_replace(addresses);
             }
+        } else {
+            stop_generation(&mut generation).await;
+            context.status.send_modify(|status| {
+                status.listener_address = None;
+                status.discovered_addresses = 0;
+                status.active_connections = 0;
+            });
         }
 
         tokio::select! {
@@ -432,12 +483,16 @@ async fn supervise(
                     break;
                 }
             }
-            () = tokio::time::sleep(context.config.reconnect_min),
-                if generation.is_none() && discovery.borrow().is_some() => {}
+            () = tokio::time::sleep(context.config.reconnect_min) => {}
         }
     }
 
     stop_generation(&mut generation).await;
+    context.status.send_modify(|status| {
+        status.listener_address = None;
+        status.discovered_addresses = 0;
+        status.active_connections = 0;
+    });
 }
 
 #[derive(Debug)]
@@ -463,6 +518,9 @@ fn discovered_addresses(snapshot: &DiscoverySnapshot, port: u16) -> Vec<SocketAd
         .iter()
         .filter(|peer| peer.connected && peer.address != snapshot.local_address)
         .map(|peer| SocketAddr::new(peer.address, port))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .take(MAX_DISCOVERED_PEERS)
         .collect()
 }
 
@@ -473,6 +531,7 @@ async fn run_generation(
     shutdown: CancellationToken,
 ) {
     let handshakes = Arc::new(Semaphore::new(MAX_CONCURRENT_HANDSHAKES));
+    let sessions = Arc::new(Semaphore::new(MAX_ACTIVE_CONNECTIONS));
     let mut tasks = JoinSet::new();
     let mut dialers = BTreeMap::<SocketAddr, CancellationToken>::new();
     update_dialers(
@@ -482,6 +541,7 @@ async fn run_generation(
         &mut tasks,
         &mut dialers,
         &peer_updates.borrow_and_update(),
+        &sessions,
     );
 
     loop {
@@ -498,12 +558,17 @@ async fn run_generation(
                     &mut tasks,
                     &mut dialers,
                     &peer_updates.borrow_and_update(),
+                    &sessions,
                 );
             }
             incoming = endpoint.accept() => {
                 let Some(incoming) = incoming else {
                     break;
                 };
+                if tasks.len() >= MAX_GENERATION_TASKS {
+                    incoming.refuse();
+                    continue;
+                }
                 let Ok(permit) = handshakes.clone().try_acquire_owned() else {
                     incoming.refuse();
                     continue;
@@ -512,6 +577,7 @@ async fn run_generation(
                     &mut tasks,
                     incoming,
                     permit,
+                    sessions.clone(),
                     context.clone(),
                     shutdown.clone(),
                 );
@@ -520,6 +586,15 @@ async fn run_generation(
                 if let Some(Err(error)) = completed {
                     tracing::warn!(%error, "mesh connection task panicked");
                 }
+                update_dialers(
+                    &endpoint,
+                    &context,
+                    &shutdown,
+                    &mut tasks,
+                    &mut dialers,
+                    &peer_updates.borrow(),
+                    &sessions,
+                );
             }
         }
     }
@@ -555,6 +630,7 @@ fn spawn_incoming(
     tasks: &mut JoinSet<()>,
     incoming: quinn::Incoming,
     permit: tokio::sync::OwnedSemaphorePermit,
+    sessions: Arc<Semaphore>,
     context: Arc<RuntimeContext>,
     shutdown: CancellationToken,
 ) {
@@ -580,11 +656,18 @@ fn spawn_incoming(
             }
         };
         drop(permit);
+        let Ok(session_permit) = sessions.try_acquire_owned() else {
+            authenticated
+                .connection()
+                .close(CLOSE_SHUTDOWN.into(), b"mesh connection limit reached");
+            return;
+        };
         if let Err(error) = run_connection(
             authenticated.into_inner(),
             Direction::Inbound,
             context,
             shutdown,
+            session_permit,
         )
         .await
         {
@@ -600,6 +683,7 @@ fn update_dialers(
     tasks: &mut JoinSet<()>,
     dialers: &mut BTreeMap<SocketAddr, CancellationToken>,
     addresses: &[SocketAddr],
+    sessions: &Arc<Semaphore>,
 ) {
     dialers.retain(|address, cancellation| {
         if addresses.contains(address) {
@@ -610,7 +694,7 @@ fn update_dialers(
         }
     });
     for address in addresses {
-        if dialers.contains_key(address) {
+        if dialers.contains_key(address) || tasks.len() >= MAX_GENERATION_TASKS {
             continue;
         }
         let cancellation = shutdown.child_token();
@@ -620,6 +704,7 @@ fn update_dialers(
             *address,
             context.clone(),
             cancellation,
+            sessions.clone(),
         ));
     }
 }
@@ -629,6 +714,7 @@ async fn dial_peer(
     address: SocketAddr,
     context: Arc<RuntimeContext>,
     shutdown: CancellationToken,
+    sessions: Arc<Semaphore>,
 ) {
     let mut attempt = 0_u32;
     loop {
@@ -671,6 +757,16 @@ async fn dial_peer(
                 }
             }
         };
+        let Ok(session_permit) = sessions.clone().try_acquire_owned() else {
+            authenticated
+                .connection()
+                .close(CLOSE_SHUTDOWN.into(), b"mesh connection limit reached");
+            if wait_backoff(&context.config, address, attempt, &shutdown).await {
+                return;
+            }
+            attempt = attempt.saturating_add(1);
+            continue;
+        };
 
         attempt = 0;
         let mut duplicate = false;
@@ -679,6 +775,7 @@ async fn dial_peer(
             Direction::Outbound,
             context.clone(),
             shutdown.clone(),
+            session_permit,
         )
         .await
         {
@@ -698,13 +795,24 @@ async fn run_connection(
     direction: Direction,
     context: Arc<RuntimeContext>,
     shutdown: CancellationToken,
+    _session_permit: tokio::sync::OwnedSemaphorePermit,
 ) -> Result<(), MeshError> {
-    let peer = timeout(
+    let peer = match timeout(
         HANDSHAKE_TIMEOUT,
         exchange_identity(&connection, direction, &context),
     )
     .await
-    .map_err(|_| MeshError::HandshakeTimeout)??;
+    {
+        Ok(Ok(peer)) => peer,
+        Ok(Err(error)) => {
+            connection.close(CLOSE_PROTOCOL.into(), b"incompatible mesh protocol");
+            return Err(error);
+        }
+        Err(_) => {
+            connection.close(CLOSE_PROTOCOL.into(), b"mesh handshake timed out");
+            return Err(MeshError::HandshakeTimeout);
+        }
+    };
 
     if peer.node_id == context.config.node_id {
         connection.close(CLOSE_DUPLICATE.into(), b"duplicate node identity");
@@ -775,18 +883,29 @@ async fn exchange_identity(
     direction: Direction,
     context: &RuntimeContext,
 ) -> Result<PeerIdentity, MeshError> {
-    let local = local_identity(context).await?;
+    let local_protocol = ProtocolHello {
+        minimum_version: PROTOCOL_VERSION,
+        maximum_version: PROTOCOL_VERSION,
+    };
     let peer = match direction {
         Direction::Outbound => {
             let (mut send, mut recv) = connection.open_bi().await?;
+            write_message(&mut send, &local_protocol).await?;
+            let peer_protocol: ProtocolHello = read_message(&mut recv).await?;
+            validate_protocol(&peer_protocol)?;
+            let local = local_identity(context).await?;
             write_message(&mut send, &local).await?;
-            let peer = read_message(&mut recv).await?;
+            let peer: IdentityHello = read_message(&mut recv).await?;
             send.finish()?;
             peer
         }
         Direction::Inbound => {
             let (mut send, mut recv) = connection.accept_bi().await?;
-            let peer = read_message(&mut recv).await?;
+            let peer_protocol: ProtocolHello = read_message(&mut recv).await?;
+            write_message(&mut send, &local_protocol).await?;
+            validate_protocol(&peer_protocol)?;
+            let peer: IdentityHello = read_message(&mut recv).await?;
+            let local = local_identity(context).await?;
             write_message(&mut send, &local).await?;
             send.finish()?;
             peer
@@ -800,7 +919,6 @@ async fn local_identity(context: &RuntimeContext) -> Result<IdentityHello, MeshE
     let members = context.known_members.read().await;
     let known_members = encode_membership(&members)?;
     Ok(IdentityHello {
-        protocol_version: PROTOCOL_VERSION,
         node_id: context.config.node_id.as_uuid().as_bytes().to_vec(),
         hostname: context.config.hostname.clone(),
         frontier,
@@ -809,9 +927,6 @@ async fn local_identity(context: &RuntimeContext) -> Result<IdentityHello, MeshE
 }
 
 fn parse_identity(hello: IdentityHello) -> Result<PeerIdentity, MeshError> {
-    if hello.protocol_version != PROTOCOL_VERSION {
-        return Err(MeshError::UnsupportedProtocol(hello.protocol_version));
-    }
     if !valid_hostname(&hello.hostname) {
         return Err(MeshError::InvalidHostname);
     }
@@ -834,6 +949,19 @@ fn parse_identity(hello: IdentityHello) -> Result<PeerIdentity, MeshError> {
         frontier,
         known_members,
     })
+}
+
+fn validate_protocol(hello: &ProtocolHello) -> Result<(), MeshError> {
+    if hello.minimum_version > hello.maximum_version
+        || PROTOCOL_VERSION < hello.minimum_version
+        || PROTOCOL_VERSION > hello.maximum_version
+    {
+        return Err(MeshError::UnsupportedProtocol {
+            minimum: hello.minimum_version,
+            maximum: hello.maximum_version,
+        });
+    }
+    Ok(())
 }
 
 async fn register_connection(
@@ -860,6 +988,9 @@ async fn register_connection(
             connection: connection.clone(),
         },
     );
+    context.status.send_modify(|status| {
+        status.active_connections = registry.len();
+    });
     true
 }
 
@@ -870,6 +1001,9 @@ async fn remove_connection(context: &RuntimeContext, peer: NodeId, stable_id: us
         .is_some_and(|active| active.stable_id == stable_id)
     {
         registry.remove(&peer);
+        context.status.send_modify(|status| {
+            status.active_connections = registry.len();
+        });
     }
 }
 
@@ -1479,8 +1613,10 @@ pub enum MeshError {
     InvalidHostname,
     #[error("peer node identity is invalid")]
     InvalidNodeId,
-    #[error("peer uses unsupported protocol version {0}")]
-    UnsupportedProtocol(u32),
+    #[error(
+        "peer protocol range {minimum}..={maximum} does not include local version {PROTOCOL_VERSION}"
+    )]
+    UnsupportedProtocol { minimum: u32, maximum: u32 },
     #[error("peer duplicated the local active node identity {0}")]
     DuplicateNodeIdentity(NodeId),
     #[error("forgotten peer node identity {0} was rejected")]
@@ -1537,9 +1673,8 @@ pub enum MeshError {
 mod tests {
     use super::*;
 
-    fn hello(version: u32) -> IdentityHello {
+    fn hello() -> IdentityHello {
         IdentityHello {
-            protocol_version: version,
             node_id: Uuid::from_u128(7).as_bytes().to_vec(),
             hostname: "node".to_owned(),
             frontier: serde_json::to_vec(&SeenOps::default()).unwrap(),
@@ -1550,18 +1685,26 @@ mod tests {
     #[test]
     fn rolling_protocol_version_mismatch_is_rejected_before_session_state() {
         assert!(matches!(
-            parse_identity(hello(PROTOCOL_VERSION - 1)),
-            Err(MeshError::UnsupportedProtocol(version)) if version == PROTOCOL_VERSION - 1
+            validate_protocol(&ProtocolHello {
+                minimum_version: PROTOCOL_VERSION - 1,
+                maximum_version: PROTOCOL_VERSION - 1,
+            }),
+            Err(MeshError::UnsupportedProtocol { minimum, maximum })
+                if minimum == PROTOCOL_VERSION - 1 && maximum == PROTOCOL_VERSION - 1
         ));
         assert!(matches!(
-            parse_identity(hello(PROTOCOL_VERSION + 1)),
-            Err(MeshError::UnsupportedProtocol(version)) if version == PROTOCOL_VERSION + 1
+            validate_protocol(&ProtocolHello {
+                minimum_version: PROTOCOL_VERSION + 1,
+                maximum_version: PROTOCOL_VERSION + 1,
+            }),
+            Err(MeshError::UnsupportedProtocol { minimum, maximum })
+                if minimum == PROTOCOL_VERSION + 1 && maximum == PROTOCOL_VERSION + 1
         ));
     }
 
     #[test]
     fn malformed_membership_advertisement_is_rejected() {
-        let mut malformed = hello(PROTOCOL_VERSION);
+        let mut malformed = hello();
         malformed.known_members = b"not-json".to_vec();
         assert!(matches!(
             parse_identity(malformed),

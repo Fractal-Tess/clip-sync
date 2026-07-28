@@ -1,4 +1,4 @@
-use std::{fs, io::Cursor, time::Duration};
+use std::{collections::BTreeSet, fs, io::Cursor, time::Duration};
 
 use clip_sync::{
     model::NodeId,
@@ -87,6 +87,78 @@ fn encrypted_fixed_chunks_deduplicate_and_refcounts_reclaim() {
 
     assert!(store.remove_manifest(second_id).expect("remove second"));
     assert!(!store.has_chunk(shared_chunk));
+}
+
+#[test]
+fn crash_reopen_reclaims_unbounded_staging_pressure_in_bounded_batches() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    {
+        let mut store = store(&directory);
+        for index in 0_u32..1_100 {
+            let bytes = index.to_le_bytes();
+            store
+                .stage_reader(
+                    &mut Cursor::new(bytes),
+                    bytes.len() as u64,
+                    &CancellationToken::new(),
+                )
+                .expect("stage uncommitted chunk");
+        }
+        for index in 0..256 {
+            fs::write(
+                store
+                    .root()
+                    .join("staging")
+                    .join(format!("{index}.staging")),
+                b"injected partial write",
+            )
+            .expect("write injected staging");
+        }
+    }
+
+    let reopened = store(&directory);
+    assert_eq!(
+        fs::read_dir(reopened.root().join("objects"))
+            .expect("objects")
+            .count(),
+        0
+    );
+    assert_eq!(
+        fs::read_dir(reopened.root().join("staging"))
+            .expect("staging")
+            .count(),
+        0
+    );
+}
+
+#[test]
+fn crash_cleanup_reclaims_manifest_committed_before_history_transaction() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let mut store = store(&directory);
+    let blob = store
+        .stage_reader(
+            &mut Cursor::new(b"cross-database crash window"),
+            1024,
+            &CancellationToken::new(),
+        )
+        .expect("stage");
+    let chunk = blob.chunks()[0].id();
+    let manifest = store
+        .commit_manifest(&StoredManifest::Blob(blob))
+        .expect("commit before injected crash");
+    assert!(store.has_chunk(chunk));
+
+    assert_eq!(
+        store
+            .cleanup_untracked_manifests(&BTreeSet::new())
+            .expect("startup reconciliation"),
+        1
+    );
+    assert!(matches!(
+        store.manifest(manifest),
+        Err(ChunkStoreError::MissingManifest(_))
+    ));
+    assert!(!store.has_chunk(chunk));
 }
 
 #[test]
@@ -323,6 +395,34 @@ fn materialization_reports_free_space_failure_before_writing() {
         materializer.materialize(&store, manifest_id, &cancellation),
         Err(MaterializationError::InsufficientSpace { .. })
     ));
+}
+
+#[cfg(unix)]
+#[test]
+fn startup_cleanup_reclaims_crashed_materializations_without_following_symlinks() {
+    use std::os::unix::fs::symlink;
+
+    let directory = tempfile::tempdir().expect("tempdir");
+    let runtime = directory.path().join("runtime");
+    let materializer =
+        Materializer::new(&runtime, MaterializerConfig::default()).expect("materializer");
+    let abandoned = runtime.join("abandoned-manifest");
+    fs::create_dir(&abandoned).expect("abandoned directory");
+    fs::write(abandoned.join("payload"), b"runtime plaintext").expect("abandoned payload");
+    let outside = directory.path().join("must-survive");
+    fs::write(&outside, b"outside").expect("outside target");
+    symlink(&outside, runtime.join("abandoned-link")).expect("abandoned symlink");
+    fs::write(runtime.join(".partial.staging"), b"partial").expect("abandoned staging");
+
+    assert_eq!(
+        materializer.cleanup_abandoned().expect("startup cleanup"),
+        3
+    );
+    assert_eq!(
+        fs::read(&outside).expect("outside target survives"),
+        b"outside"
+    );
+    assert_eq!(fs::read_dir(&runtime).expect("runtime root").count(), 0);
 }
 
 #[tokio::test]

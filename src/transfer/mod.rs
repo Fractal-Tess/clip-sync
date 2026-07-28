@@ -9,8 +9,8 @@ pub use coordinator::{
     TransferProgress, operation_transfer_id,
 };
 pub use protocol::{
-    BeginTransfer, CancelTransfer, ChunkAck, ChunkRequest, CompleteTransfer, TransferControl,
-    TransferProtocolError,
+    BeginTransfer, CancelTransfer, ChunkAck, ChunkRequest, CompleteTransfer,
+    TRANSFER_PROTOCOL_VERSION, TransferControl, TransferProtocolError,
 };
 pub use state::{
     PeerProgress, TransferError, TransferId, TransferPhase, TransferRecord, TransferStateLimits,

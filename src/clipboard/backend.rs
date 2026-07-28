@@ -17,6 +17,9 @@ use super::types::{
 /// A clipboard event emitted by the backend to the daemon.
 #[derive(Clone, Debug)]
 pub enum ClipboardEvent {
+    /// The watcher completed its registry round-trip and is actively serving
+    /// the regular clipboard.
+    Ready,
     /// A new selection was advertised by the compositor.
     NewOffer {
         generation: Generation,

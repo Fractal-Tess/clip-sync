@@ -4,7 +4,7 @@ use prost::Message;
 use quinn::{RecvStream, SendStream};
 use thiserror::Error;
 
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 pub const MAX_CONTROL_FRAME_BYTES: usize = 24 * 1024 * 1024;
 pub const MAX_FRONTIER_BYTES: usize = 1024 * 1024;
 pub const MAX_MEMBERSHIP_BYTES: usize = 1024 * 1024;
@@ -15,10 +15,18 @@ pub const STREAM_KIND_CHUNK: u8 = 2;
 pub const MAX_ENCRYPTED_CHUNK_BYTES: usize = 4 * 1024 * 1024 + 48;
 pub const MAX_CHUNK_CONTROL_BYTES: usize = 512;
 
+/// Metadata-free rolling-version preflight exchanged after PSK
+/// authentication and before node identity, membership, or frontier data.
+#[derive(Clone, PartialEq, Message)]
+pub struct ProtocolHello {
+    #[prost(uint32, tag = "1")]
+    pub minimum_version: u32,
+    #[prost(uint32, tag = "2")]
+    pub maximum_version: u32,
+}
+
 #[derive(Clone, PartialEq, Message)]
 pub struct IdentityHello {
-    #[prost(uint32, tag = "1")]
-    pub protocol_version: u32,
     #[prost(bytes = "vec", tag = "2")]
     pub node_id: Vec<u8>,
     #[prost(string, tag = "3")]

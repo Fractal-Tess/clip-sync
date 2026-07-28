@@ -446,6 +446,12 @@ impl TransferCoordinator {
         projection: &Projection,
     ) -> Result<(), TransferCoordinatorError> {
         let mut views = projection.transfers();
+        let retained_manifests = views
+            .iter()
+            .filter_map(|view| view.manifest_id())
+            .collect::<BTreeSet<_>>();
+        self.store
+            .cleanup_untracked_manifests(&retained_manifests)?;
         views.sort_by_key(|view| view.phase() == TransferPhase::Cancelled);
         for view in views {
             let (Some(content_id), Some(manifest_id), Some(manifest)) =

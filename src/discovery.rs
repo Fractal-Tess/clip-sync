@@ -6,6 +6,9 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::{process::Command, time::timeout};
 
+/// Hard cap on peer-derived dial tasks and retained discovery diagnostics.
+pub const MAX_DISCOVERED_PEERS: usize = 512;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DiscoverySnapshot {
     pub local_address: IpAddr,
@@ -52,6 +55,12 @@ impl NetbirdDiscovery {
     /// Returns an error for malformed JSON or invalid local/peer addresses.
     pub fn parse(source: &[u8]) -> Result<DiscoverySnapshot, DiscoveryError> {
         let status: NetbirdStatus = serde_json::from_slice(source)?;
+        if status.peers.details.len() > MAX_DISCOVERED_PEERS {
+            return Err(DiscoveryError::TooManyPeers {
+                observed: status.peers.details.len(),
+                maximum: MAX_DISCOVERED_PEERS,
+            });
+        }
         let local_network: IpNet = status
             .netbird_ip
             .parse()
@@ -136,6 +145,8 @@ pub enum DiscoveryError {
     Json(#[from] serde_json::Error),
     #[error("NetBird returned an invalid address: {0}")]
     InvalidAddress(String),
+    #[error("NetBird returned {observed} peers, exceeding the {maximum}-peer safety limit")]
+    TooManyPeers { observed: usize, maximum: usize },
 }
 
 #[cfg(test)]
@@ -174,6 +185,28 @@ mod tests {
         assert!(matches!(
             NetbirdDiscovery::parse(source.as_bytes()),
             Err(DiscoveryError::InvalidAddress(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_peer_sets_that_would_create_unbounded_dial_tasks() {
+        let peers = (0..=MAX_DISCOVERED_PEERS)
+            .map(|index| {
+                format!(
+                    r#"{{"fqdn":"peer-{index}","netbirdIp":"100.64.0.1","status":"Connected"}}"#
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let source = format!(
+            r#"{{"netbirdIp":"100.91.0.2/16","fqdn":"vd","peers":{{"details":[{peers}]}}}}"#
+        );
+        assert!(matches!(
+            NetbirdDiscovery::parse(source.as_bytes()),
+            Err(DiscoveryError::TooManyPeers {
+                observed,
+                maximum: MAX_DISCOVERED_PEERS
+            }) if observed == MAX_DISCOVERED_PEERS + 1
         ));
     }
 }

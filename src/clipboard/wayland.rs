@@ -970,6 +970,7 @@ async fn run_wayland_watch(
     queue
         .roundtrip(&mut state)
         .map_err(|error| BackendError::Protocol(error.to_string()))?;
+    state.emit(ClipboardEvent::Ready);
 
     loop {
         queue

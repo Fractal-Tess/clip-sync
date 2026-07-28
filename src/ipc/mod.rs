@@ -35,6 +35,8 @@ use crate::{
         PeerItem, PeersResponse, Request, Response, ShareClipboardResponse, SharedSettingKind,
         StatusResponse, TransferItem, TransfersResponse, request, response,
     },
+    mesh::{MESH_PROTOCOL_VERSION, MeshHandle},
+    transfer::TRANSFER_PROTOCOL_VERSION,
 };
 
 const MAX_IPC_FRAME_BYTES: usize = 1024 * 1024;
@@ -87,6 +89,7 @@ struct DaemonStateInner {
     discovery: RwLock<Option<DiscoverySnapshot>>,
     discovery_error: RwLock<Option<String>>,
     clipboard_status: RwLock<DiagnosticStatus>,
+    mesh: RwLock<Option<MeshHandle>>,
     history: RwLock<HistorySearchIndex>,
     devices: RwLock<Vec<DeviceItem>>,
     commands: mpsc::UnboundedSender<DaemonCommand>,
@@ -154,6 +157,7 @@ impl DaemonState {
                     ok: true,
                     detail: "clipboard monitoring is starting".to_owned(),
                 }),
+                mesh: RwLock::new(None),
                 history: RwLock::new(HistorySearchIndex::default()),
                 devices: RwLock::new(Vec::new()),
                 commands,
@@ -167,6 +171,7 @@ impl DaemonState {
     }
 
     pub async fn set_discovery_error(&self, error: impl Into<String>) {
+        *self.inner.discovery.write().await = None;
         *self.inner.discovery_error.write().await = Some(error.into());
     }
 
@@ -175,6 +180,10 @@ impl DaemonState {
             ok,
             detail: detail.into(),
         };
+    }
+
+    pub async fn set_mesh(&self, mesh: MeshHandle) {
+        *self.inner.mesh.write().await = Some(mesh);
     }
 
     pub async fn set_history(&self, history: Vec<HistoryItem>) {
@@ -418,6 +427,57 @@ impl DaemonState {
                 let discovery = self.inner.discovery.read().await;
                 let discovery_error = self.inner.discovery_error.read().await;
                 let clipboard = self.inner.clipboard_status.read().await.clone();
+                let active_config = self.inner.config.read().await.clone();
+                let config_check = Config::load(&self.inner.config_path);
+                let (config_ok, config_detail) = match config_check {
+                    Ok(on_disk) if on_disk == active_config => (
+                        true,
+                        format!("{} (loaded and current)", self.inner.config_path.display()),
+                    ),
+                    Ok(_) => (
+                        false,
+                        format!(
+                            "{} differs from the daemon's active configuration",
+                            self.inner.config_path.display()
+                        ),
+                    ),
+                    Err(error) => (false, error.to_string()),
+                };
+                let mesh = self
+                    .inner
+                    .mesh
+                    .read()
+                    .await
+                    .as_ref()
+                    .map(MeshHandle::status);
+                let (listener_ok, listener_detail, connections_ok, connection_detail) =
+                    if let Some(mesh) = mesh {
+                        let listener_detail = if let Some(address) = mesh.listener_address {
+                            format!("listening on {address}")
+                        } else if let Some(error) = mesh.last_listener_error {
+                            format!("listener unavailable: {error}")
+                        } else {
+                            "listener inactive while NetBird discovery is unavailable".to_owned()
+                        };
+                        (
+                            mesh.listener_address.is_some(),
+                            listener_detail,
+                            true,
+                            format!(
+                                "{} active of {}/{} discovered addresses",
+                                mesh.active_connections,
+                                mesh.discovered_addresses,
+                                crate::discovery::MAX_DISCOVERED_PEERS
+                            ),
+                        )
+                    } else {
+                        (
+                            false,
+                            "mesh supervisor is not attached".to_owned(),
+                            false,
+                            "mesh supervisor is not attached".to_owned(),
+                        )
+                    };
                 let discovery_ok = discovery.is_some() && discovery_error.is_none();
                 let discovery_detail = if let Some(error) = discovery_error.as_deref() {
                     error.to_owned()
@@ -438,8 +498,8 @@ impl DaemonState {
                         },
                         DiagnosticCheck {
                             name: "config".to_owned(),
-                            ok: true,
-                            detail: self.inner.config_path.display().to_string(),
+                            ok: config_ok,
+                            detail: config_detail,
                         },
                         DiagnosticCheck {
                             name: "encrypted_storage".to_owned(),
@@ -449,7 +509,8 @@ impl DaemonState {
                         DiagnosticCheck {
                             name: "mesh_secret".to_owned(),
                             ok: true,
-                            detail: "loaded from an owner-only key file".to_owned(),
+                            detail: "owner-only key file and encrypted keyslot authenticated"
+                                .to_owned(),
                         },
                         DiagnosticCheck {
                             name: "clipboard".to_owned(),
@@ -460,6 +521,23 @@ impl DaemonState {
                             name: "netbird".to_owned(),
                             ok: discovery_ok,
                             detail: discovery_detail,
+                        },
+                        DiagnosticCheck {
+                            name: "mesh_listener".to_owned(),
+                            ok: listener_ok,
+                            detail: listener_detail,
+                        },
+                        DiagnosticCheck {
+                            name: "mesh_connections".to_owned(),
+                            ok: connections_ok,
+                            detail: connection_detail,
+                        },
+                        DiagnosticCheck {
+                            name: "protocol_versions".to_owned(),
+                            ok: true,
+                            detail: format!(
+                                "ipc={IPC_PROTOCOL_VERSION}, mesh={MESH_PROTOCOL_VERSION}, transfer={TRANSFER_PROTOCOL_VERSION}"
+                            ),
                         },
                     ],
                 })

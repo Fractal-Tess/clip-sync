@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeSet,
     fmt,
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
@@ -11,7 +12,7 @@ use chacha20poly1305::{
     aead::{AeadInOut, KeyInit},
 };
 use hkdf::Hkdf;
-use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use sha2::Sha256;
 use thiserror::Error;
@@ -356,6 +357,8 @@ impl ChunkStore {
                 "PRAGMA foreign_keys = ON;
              PRAGMA journal_mode = WAL;
              PRAGMA synchronous = FULL;
+             PRAGMA journal_size_limit = 16777216;
+             PRAGMA wal_autocheckpoint = 1000;
              CREATE TABLE IF NOT EXISTS chunk_catalog (
                  id BLOB PRIMARY KEY NOT NULL CHECK(length(id) = 32),
                  logical_size INTEGER NOT NULL CHECK(logical_size BETWEEN 1 AND 4194304),
@@ -959,6 +962,56 @@ impl ChunkStore {
         transaction.commit()?;
         self.cleanup_unreferenced()?;
         Ok(true)
+    }
+
+    /// Reclaims committed manifests that have no durable history reference.
+    ///
+    /// This closes the cross-database crash window between committing chunks
+    /// and appending the corresponding history operation. IDs are scanned in
+    /// fixed batches so recovery memory remains bounded.
+    ///
+    /// # Errors
+    ///
+    /// Returns malformed catalog, SQL, or filesystem cleanup errors.
+    pub fn cleanup_untracked_manifests(
+        &mut self,
+        retained: &BTreeSet<ManifestId>,
+    ) -> Result<usize, ChunkStoreError> {
+        const BATCH: usize = 1024;
+        let mut cursor: Option<[u8; 32]> = None;
+        let mut removed = 0_usize;
+        loop {
+            let mut statement = self.connection.prepare(
+                "SELECT id FROM manifests
+                 WHERE (?1 IS NULL OR id > ?1)
+                 ORDER BY id
+                 LIMIT ?2",
+            )?;
+            let rows = statement.query_map(
+                params![cursor.as_ref().map(<[u8; 32]>::as_slice), 1024_i64],
+                |row| row.get::<_, Vec<u8>>(0),
+            )?;
+            let mut ids = Vec::with_capacity(BATCH);
+            for row in rows {
+                let bytes: [u8; 32] = row?
+                    .try_into()
+                    .map_err(|_| ChunkStoreError::CorruptCatalog)?;
+                ids.push(ManifestId(bytes));
+            }
+            drop(statement);
+            let Some(last) = ids.last() else {
+                break;
+            };
+            cursor = Some(*last.as_bytes());
+            for id in ids {
+                if !retained.contains(&id) && self.remove_manifest(id)? {
+                    removed = removed
+                        .checked_add(1)
+                        .ok_or(ChunkStoreError::SizeOverflow)?;
+                }
+            }
+        }
+        Ok(removed)
     }
 
     /// Removes all cataloged zero-ref chunks and abandoned staging files.

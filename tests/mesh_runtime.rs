@@ -104,6 +104,10 @@ impl TestNode {
         self.handle.update_discovery(snapshot(self.address, peers));
     }
 
+    fn clear_discovery(&self) {
+        self.handle.clear_discovery();
+    }
+
     async fn copy(&self, text: &str) {
         let (reply, complete) = oneshot::channel();
         self.commands
@@ -246,6 +250,19 @@ async fn wait_for_count(node: &TestNode, expected: usize, stage: &str) {
     })
     .await
     .unwrap_or_else(|_| panic!("mesh convergence timed out during {stage}"));
+}
+
+async fn wait_for_listener(node: &TestNode, expected: Option<SocketAddr>, stage: &str) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if node.handle.status().listener_address == expected {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("mesh listener transition timed out during {stage}"));
 }
 
 fn storage_key() -> StorageKey {
@@ -406,4 +423,64 @@ async fn forgotten_identity_is_rejected_but_reset_identity_joins_as_new() {
 
     a.stop().await;
     b.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn discovery_loss_stops_stale_listener_and_rebinds_after_resume() {
+    init_tracing();
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("resume.db");
+    let port = unused_port();
+    let first = loopback(1);
+    let second = loopback(2);
+    let mut node = TestNode::start(&path, first, port);
+
+    node.discover(&[]);
+    wait_for_listener(
+        &node,
+        Some(SocketAddr::new(first, port)),
+        "initial NetBird bind",
+    )
+    .await;
+
+    node.clear_discovery();
+    wait_for_listener(&node, None, "NetBird outage").await;
+    assert_eq!(node.handle.status().active_connections, 0);
+
+    node.address = second;
+    node.discover(&[]);
+    wait_for_listener(
+        &node,
+        Some(SocketAddr::new(second, port)),
+        "post-resume rebind",
+    )
+    .await;
+
+    node.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn repeated_suspend_resume_churn_keeps_runtime_state_bounded() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("churn.db");
+    let port = unused_port();
+    let node = TestNode::start(&path, loopback(1), port);
+
+    for _ in 0..250 {
+        node.discover(&[loopback(2), loopback(3)]);
+        node.clear_discovery();
+    }
+    node.discover(&[]);
+    wait_for_listener(
+        &node,
+        Some(SocketAddr::new(loopback(1), port)),
+        "listener churn recovery",
+    )
+    .await;
+    let status = node.handle.status();
+    assert_eq!(status.discovered_addresses, 0);
+    assert_eq!(status.active_connections, 0);
+    assert!(status.last_listener_error.is_none());
+
+    node.stop().await;
 }
