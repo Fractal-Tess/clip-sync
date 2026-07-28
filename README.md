@@ -75,7 +75,7 @@ history remains in the encrypted SQLCipher operation store.
 | 0 | Validate Wayland, NetBird, QUIC authentication, encrypted storage, and egui integration | Complete |
 | 1 | Project foundation, config, model, IPC, CLI, and local checks | Complete |
 | 2 | Encrypted local text history | Complete |
-| 3 | Two-node text mesh vertical slice | Complete in implementation and automated tests; live `vd`/`kiwi` validation in progress |
+| 3 | Two-node text mesh vertical slice | Complete; disposable live `vd`/`kiwi` NetBird smoke passed |
 | 4 | Keyboard-first egui switcher | Complete; live Hyprland shell/singleton smoke passed |
 | 5 | Arbitrary MIME and safe file snapshots | Complete in implementation and integration tests |
 | 6 | Chunked, cancellable, resumable large sharing | Complete in implementation and integration tests |
