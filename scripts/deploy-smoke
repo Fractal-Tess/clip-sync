@@ -231,7 +231,7 @@ wait_remote_history "$second"
 local_before_remote=$root/local-before-remote.txt
 timeout 3 wl-paste --no-newline --type text/plain >"$local_before_remote"
 third="clip-sync-kiwi-to-vd-$(date +%s%N)"
-remote "printf %s '$third' | XDG_RUNTIME_DIR='$remote_root/runtime' WAYLAND_DISPLAY='$remote_wayland' timeout 5 wl-copy --foreground --type text/plain"
+remote "printf %s '$third' | XDG_RUNTIME_DIR='$remote_root/runtime' WAYLAND_DISPLAY='$remote_wayland' timeout 5 wl-copy --foreground --type text/plain || true"
 wait_local_history "$third"
 timeout 3 wl-paste --no-newline --type text/plain >"$root/local-after-remote.txt"
 cmp -s "$local_before_remote" "$root/local-after-remote.txt" || {
