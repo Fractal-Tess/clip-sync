@@ -5,9 +5,18 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
+    clipboard::{
+        backend::{ClipboardBackend, ClipboardEvent},
+        types::{ClipboardContent, ClipboardRepresentation, MimeType},
+        wayland::WaylandBackend,
+    },
     config::{AppPaths, Config},
+    crypto::MeshSecret,
     discovery::{NetbirdDiscovery, PeerDiscovery},
-    ipc::{self, DaemonState},
+    ipc::{self, DaemonCommand, DaemonState, protocol::HistoryItem},
+    model::{Payload, Representation},
+    replica::Replica,
+    storage::EncryptedStorage,
 };
 
 /// Runs discovery and local IPC until a termination signal is received.
@@ -15,34 +24,291 @@ use crate::{
 /// # Errors
 ///
 /// Returns an error when runtime setup, IPC serving, or signal handling fails.
+#[allow(clippy::too_many_lines)]
 pub async fn run(paths: AppPaths, config: Config) -> anyhow::Result<()> {
     fs::create_dir_all(&paths.state_dir).context("create state directory")?;
     fs::create_dir_all(&paths.runtime_dir).context("create runtime directory")?;
+
+    let mesh_secret = MeshSecret::load(&config.local.mesh_key_file)
+        .context("load mesh secret from configured file")?;
+    let storage_key = mesh_secret.storage_key().context("derive storage key")?;
+    let storage_path = paths.state_dir.join("history.db");
+    let mut storage = EncryptedStorage::open(&storage_path, &storage_key)
+        .with_context(|| format!("open encrypted history at {}", storage_path.display()))?;
+    let metadata = storage
+        .local_replica_metadata()
+        .context("load local replica identity")?;
+    let projection = storage
+        .rebuild_projection()
+        .context("rebuild history projection")?;
+    let mut replica = Replica::restore(
+        metadata.node_id(),
+        metadata.next_operation_counter().saturating_sub(1),
+        metadata.last_hlc(),
+        projection,
+    );
+
+    let content_key = mesh_secret
+        .content_key()
+        .context("derive content identity key")?;
 
     let hostname = hostname::get()
         .context("read system hostname")?
         .to_string_lossy()
         .into_owned();
-    let state = DaemonState::new(hostname, paths.config.clone(), config.clone());
+    let (command_tx, mut command_rx) = tokio::sync::mpsc::unbounded_channel();
+    let state = DaemonState::new(hostname, paths.config.clone(), config.clone(), command_tx);
+    state.set_history(history_items(&replica)).await;
     let shutdown = CancellationToken::new();
     let discovery = spawn_discovery(config, state.clone(), shutdown.clone());
 
+    let clipboard = WaylandBackend::new();
+    let (clipboard_tx, mut clipboard_rx) = tokio::sync::mpsc::unbounded_channel();
+    let clipboard_events = clipboard_tx.clone();
+    let clipboard_watch = clipboard.watch(
+        shutdown.clone(),
+        Box::new(move |event| {
+            let _ = clipboard_events.send(event);
+        }),
+    );
+
     tracing::info!(socket = %paths.socket.display(), "clip-sync daemon started");
-    let server = ipc::serve(&paths.socket, state, shutdown.clone());
+    let server = ipc::serve(&paths.socket, state.clone(), shutdown.clone());
+    let termination = shutdown_signal();
     tokio::pin!(server);
-    tokio::select! {
-        result = &mut server => result.context("serve local IPC")?,
-        result = shutdown_signal() => {
-            result.context("listen for shutdown signal")?;
-            shutdown.cancel();
-            server.await.context("stop local IPC")?;
+    tokio::pin!(clipboard_watch);
+    tokio::pin!(termination);
+    let mut server_finished = false;
+    let mut clipboard_finished = false;
+
+    loop {
+        tokio::select! {
+            result = &mut server, if !server_finished => {
+                server_finished = true;
+                result.context("serve local IPC")?;
+                break;
+            }
+            result = &mut clipboard_watch, if !clipboard_finished => {
+                clipboard_finished = true;
+                if let Err(error) = result {
+                    tracing::warn!(%error, "Wayland clipboard monitoring stopped");
+                }
+            }
+            command = command_rx.recv() => {
+                if let Some(command) = command {
+                    handle_daemon_command(
+                        command,
+                        &clipboard,
+                        &mut replica,
+                        &mut storage,
+                        &state,
+                    ).await;
+                }
+            }
+            event = clipboard_rx.recv(), if !clipboard_finished => {
+                if let Some(event) = event {
+                    handle_clipboard_event(
+                        event,
+                        &mut replica,
+                        &mut storage,
+                        &state,
+                        &content_key,
+                    ).await?;
+                }
+            }
+            result = &mut termination => {
+                result.context("listen for shutdown signal")?;
+                break;
+            }
         }
     }
 
     shutdown.cancel();
+    if !server_finished {
+        server.await.context("stop local IPC")?;
+    }
+    if !clipboard_finished && let Err(error) = clipboard_watch.await {
+        tracing::warn!(%error, "Wayland clipboard monitoring stopped");
+    }
     finish_task(discovery).await;
     tracing::info!("clip-sync daemon stopped");
     Ok(())
+}
+
+async fn handle_daemon_command(
+    command: DaemonCommand,
+    clipboard: &WaylandBackend,
+    replica: &mut Replica,
+    storage: &mut EncryptedStorage,
+    state: &DaemonState,
+) {
+    match command {
+        DaemonCommand::Activate { content_id, reply } => {
+            let result = activate_history_item(&content_id, clipboard, replica, storage, state)
+                .await
+                .map_err(|error| error.to_string());
+            let _ = reply.send(result);
+        }
+    }
+}
+
+async fn activate_history_item(
+    encoded_content_id: &str,
+    clipboard: &WaylandBackend,
+    replica: &mut Replica,
+    storage: &mut EncryptedStorage,
+    state: &DaemonState,
+) -> anyhow::Result<()> {
+    let content_id = encoded_content_id
+        .parse()
+        .context("content ID is invalid")?;
+    let payload = replica
+        .projection()
+        .payload(content_id)
+        .cloned()
+        .context("history item is unavailable")?;
+    if !replica.projection().is_visible(content_id) {
+        anyhow::bail!("history item is deleted");
+    }
+
+    let representations = payload
+        .representations()
+        .iter()
+        .map(|representation| {
+            let mime = MimeType::new(representation.mime())
+                .context("stored MIME type cannot be served")?;
+            Ok(ClipboardRepresentation::new(mime, representation.bytes()))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let clipboard_content =
+        ClipboardContent::new(representations).context("stored history item cannot be served")?;
+    clipboard
+        .set_clipboard_content(clipboard_content)
+        .await
+        .context("set active Wayland clipboard")?;
+
+    let mut next = replica.clone();
+    let operation = next
+        .activate(content_id, unix_time_millis()?)
+        .context("author clipboard activation")?;
+    storage
+        .append_local_operation(&operation)
+        .context("persist clipboard activation")?;
+    *replica = next;
+    state.set_history(history_items(replica)).await;
+    Ok(())
+}
+
+fn history_items(replica: &Replica) -> Vec<HistoryItem> {
+    replica
+        .projection()
+        .visible_items()
+        .into_iter()
+        .map(|view| {
+            let payload = view.payload();
+            let mime_types = payload.map_or_else(Vec::new, |payload| {
+                payload
+                    .representations()
+                    .iter()
+                    .map(|representation| representation.mime().to_owned())
+                    .collect()
+            });
+            let logical_size = payload.map_or(0, |payload| payload.descriptor().logical_size());
+            HistoryItem {
+                content_id: view.content_id().to_string(),
+                preview: payload.map_or_else(|| "Unavailable payload".to_owned(), history_preview),
+                mime_types,
+                logical_size,
+                source_node: view.last_activity().operation_id().node().to_string(),
+                pinned: view.pinned(),
+                physical_millis: view.last_activity().timestamp().physical_millis(),
+            }
+        })
+        .collect()
+}
+
+fn history_preview(payload: &Payload) -> String {
+    if let Some(text) = payload
+        .representations()
+        .iter()
+        .find(|representation| representation.mime().starts_with("text/plain"))
+    {
+        let decoded = String::from_utf8_lossy(text.bytes());
+        let mut preview = decoded
+            .chars()
+            .map(|character| {
+                if character.is_control() {
+                    ' '
+                } else {
+                    character
+                }
+            })
+            .take(160)
+            .collect::<String>();
+        if decoded.chars().count() > 160 {
+            preview.push('…');
+        }
+        return preview;
+    }
+
+    let mime = payload
+        .representations()
+        .first()
+        .map_or("unknown", |representation| representation.mime());
+    format!("{mime} · {} bytes", payload.descriptor().logical_size())
+}
+
+async fn handle_clipboard_event(
+    event: ClipboardEvent,
+    replica: &mut Replica,
+    storage: &mut EncryptedStorage,
+    state: &DaemonState,
+    content_key: &[u8; 32],
+) -> anyhow::Result<()> {
+    match event {
+        ClipboardEvent::Captured { content, .. } => {
+            let representations = content
+                .representations()
+                .iter()
+                .map(|representation| {
+                    Representation::new(representation.mime_type().as_str(), representation.bytes())
+                })
+                .collect::<Vec<_>>();
+            let payload = Payload::new(content_key, representations)
+                .context("build captured clipboard payload")?;
+            let mut next = replica.clone();
+            let operation = next
+                .copy(payload, unix_time_millis()?)
+                .context("author clipboard history operation")?;
+            storage
+                .append_local_operation(&operation)
+                .context("persist clipboard history operation")?;
+            *replica = next;
+            state.set_history(history_items(replica)).await;
+            tracing::debug!(
+                history_entries = replica.projection().visible_items().len(),
+                "captured clipboard history entry"
+            );
+        }
+        ClipboardEvent::CaptureRejected { reason, .. } => {
+            tracing::debug!(?reason, "clipboard offer was not captured");
+        }
+        ClipboardEvent::Finished => {
+            tracing::warn!("Wayland compositor finished the clipboard data-control device");
+        }
+        ClipboardEvent::NewOffer { .. }
+        | ClipboardEvent::OwnContent { .. }
+        | ClipboardEvent::Cleared { .. } => {}
+    }
+    Ok(())
+}
+
+fn unix_time_millis() -> anyhow::Result<u64> {
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .context("system clock is before the Unix epoch")?
+        .as_millis();
+    u64::try_from(millis).context("system clock milliseconds exceed u64")
 }
 
 fn spawn_discovery(

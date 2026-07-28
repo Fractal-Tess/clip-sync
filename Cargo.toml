@@ -10,7 +10,8 @@ categories = ["command-line-utilities", "network-programming"]
 
 [features]
 default = []
-ui = []
+ui = ["dep:eframe"]
+eframe = ["dep:eframe"]
 
 [lints.rust]
 unsafe_code = "forbid"
@@ -24,15 +25,26 @@ anyhow = "1.0.104"
 async-trait = "0.1.91"
 blake3 = "1.8.5"
 bytes = "1.12.1"
+chacha20poly1305 = "0.11.0"
 clap = { version = "4.6.4", features = ["derive"] }
 directories = "6.0.0"
+eframe = { version = "0.35.0", default-features = false, features = ["accesskit", "default_fonts", "glow", "wayland"], optional = true }
 futures-util = { version = "0.3.33", features = ["sink"] }
+getrandom = "0.4.3"
 hex = "0.4.3"
+hkdf = "0.13.0"
+hmac = "0.13.0"
 hostname = "0.4.2"
 ipnet = { version = "2.12.0", features = ["serde"] }
 prost = "0.14.4"
+quinn = { version = "0.11.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+rcgen = { version = "0.14.8", default-features = false, features = ["crypto", "ring"] }
+rusqlite = { version = "0.40.1", default-features = false, features = ["backup", "bundled-sqlcipher-vendored-openssl", "cache", "limits"] }
+rustls = { version = "0.23.42", default-features = false, features = ["ring", "std"] }
+secrecy = "0.10.3"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
+sha2 = "0.11.0"
 thiserror = "2.0.19"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "process", "signal", "sync", "time", "fs", "io-util"] }
 tokio-util = { version = "0.7.19", features = ["codec", "rt"] }
@@ -40,7 +52,11 @@ toml = "1.1.3"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
 uuid = { version = "1.24.0", features = ["v4", "serde"] }
+wayland-client = "0.31.15"
+wayland-protocols = { version = "0.32.13", features = ["client", "staging"] }
+wayland-protocols-wlr = { version = "0.3.12", features = ["client"] }
 xdg = "3.0.0"
+zeroize = { version = "1.9.0", features = ["derive"] }
 
 [dev-dependencies]
 proptest = "1.11.0"

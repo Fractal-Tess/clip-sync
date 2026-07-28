@@ -21,6 +21,10 @@
           version = "0.1.0";
           src = ./.;
           cargoLock.lockFile = ./Cargo.lock;
+          nativeBuildInputs = with pkgs; [
+            perl
+            pkg-config
+          ];
 
           meta = {
             description = "A masterless, encrypted clipboard-history mesh";
@@ -50,10 +54,18 @@
             packages = with pkgs; [
               cargo
               clippy
+              libGL
+              libxkbcommon
               pkg-config
               protobuf
               rustc
               rustfmt
+              wayland
+            ];
+            LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath [
+              pkgs.libGL
+              pkgs.libxkbcommon
+              pkgs.wayland
             ];
           };
         }

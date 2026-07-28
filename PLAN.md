@@ -497,7 +497,7 @@ Exit criterion: each spike has a tiny automated or documented repeatable test an
 - Cargo package, optional `ui` feature, flake/dev shell, formatting/lint/test commands, tracing, config parsing, IDs, HLC, and operation types.
 - Unix IPC skeleton and CLI command structure.
 - Temporary development-key support with strict warnings.
-- CI for `cargo fmt --check`, `cargo clippy --all-targets --all-features`, tests, and daemon-only build.
+- Repeatable local checks for `cargo fmt --check`, `cargo clippy --all-targets --all-features`, tests, and daemon-only builds; no hosted CI/CD is required.
 
 ### Milestone 2 — encrypted local text history
 
@@ -603,7 +603,7 @@ Use `proptest` for state-machine invariants:
 - Verify unauthenticated peers receive no metadata.
 - Fuzz protocol decoders and clipboard MIME metadata.
 - Bound allocations, message sizes, stream counts, and decompression ratios.
-- Run `cargo audit` and dependency-deny policy in CI.
+- Run `cargo audit` and dependency-deny checks in the local release/check workflow.
 
 ### Real-device smoke matrix
 

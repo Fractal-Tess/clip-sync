@@ -13,7 +13,7 @@ use serde::Serialize;
 use thiserror::Error;
 use tokio::{
     net::{UnixListener, UnixStream},
-    sync::RwLock,
+    sync::{RwLock, mpsc, oneshot},
 };
 use tokio_util::{
     codec::{Framed, LengthDelimitedCodec},
@@ -24,8 +24,8 @@ use crate::{
     config::Config,
     discovery::DiscoverySnapshot,
     ipc::protocol::{
-        ConfigResponse, ErrorResponse, IPC_PROTOCOL_VERSION, Request, Response, StatusResponse,
-        request, response,
+        ConfigResponse, ErrorResponse, HistoryItem, HistoryResponse, IPC_PROTOCOL_VERSION,
+        MutationResponse, Request, Response, StatusResponse, request, response,
     },
 };
 
@@ -42,11 +42,25 @@ struct DaemonStateInner {
     config_path: PathBuf,
     config: Config,
     discovery: RwLock<Option<DiscoverySnapshot>>,
+    history: RwLock<Vec<HistoryItem>>,
+    commands: mpsc::UnboundedSender<DaemonCommand>,
+}
+
+pub enum DaemonCommand {
+    Activate {
+        content_id: String,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
 }
 
 impl DaemonState {
     #[must_use]
-    pub fn new(hostname: String, config_path: PathBuf, config: Config) -> Self {
+    pub fn new(
+        hostname: String,
+        config_path: PathBuf,
+        config: Config,
+        commands: mpsc::UnboundedSender<DaemonCommand>,
+    ) -> Self {
         Self {
             inner: Arc::new(DaemonStateInner {
                 started: Instant::now(),
@@ -54,6 +68,8 @@ impl DaemonState {
                 config_path,
                 config,
                 discovery: RwLock::new(None),
+                history: RwLock::new(Vec::new()),
+                commands,
             }),
         }
     }
@@ -62,6 +78,11 @@ impl DaemonState {
         *self.inner.discovery.write().await = Some(discovery);
     }
 
+    pub async fn set_history(&self, history: Vec<HistoryItem>) {
+        *self.inner.history.write().await = history;
+    }
+
+    #[allow(clippy::too_many_lines)]
     async fn handle(&self, request: Request) -> Response {
         let request_id = request.request_id;
         if request.protocol_version != IPC_PROTOCOL_VERSION {
@@ -127,6 +148,66 @@ impl DaemonState {
                             request_id,
                             "serialization_failed",
                             error.to_string(),
+                        );
+                    }
+                }
+            }
+            Some(request::Body::History(history_request)) => {
+                let query = history_request.query.to_lowercase();
+                let limit = if history_request.limit == 0 {
+                    100
+                } else {
+                    history_request.limit.min(500)
+                };
+                let limit = usize::try_from(limit).unwrap_or(500);
+                let items = self
+                    .inner
+                    .history
+                    .read()
+                    .await
+                    .iter()
+                    .filter(|item| {
+                        query.is_empty()
+                            || item.preview.to_lowercase().contains(&query)
+                            || item.source_node.to_lowercase().contains(&query)
+                            || item
+                                .mime_types
+                                .iter()
+                                .any(|mime| mime.to_lowercase().contains(&query))
+                            || item.content_id.starts_with(&query)
+                    })
+                    .take(limit)
+                    .cloned()
+                    .collect();
+                response::Body::History(HistoryResponse { items })
+            }
+            Some(request::Body::Activate(activate)) => {
+                let (reply, result) = oneshot::channel();
+                if self
+                    .inner
+                    .commands
+                    .send(DaemonCommand::Activate {
+                        content_id: activate.content_id,
+                        reply,
+                    })
+                    .is_err()
+                {
+                    return error_response(
+                        request_id,
+                        "daemon_unavailable",
+                        "daemon command processor is unavailable",
+                    );
+                }
+                match result.await {
+                    Ok(Ok(())) => response::Body::Mutation(MutationResponse { ok: true }),
+                    Ok(Err(message)) => {
+                        return error_response(request_id, "activation_failed", message);
+                    }
+                    Err(_) => {
+                        return error_response(
+                            request_id,
+                            "daemon_unavailable",
+                            "daemon command processor stopped",
                         );
                     }
                 }
@@ -283,10 +364,12 @@ mod tests {
     async fn status_round_trip_over_unix_socket() {
         let temporary = tempfile::tempdir().expect("temporary directory");
         let socket = temporary.path().join("daemon.sock");
+        let (commands, _command_rx) = mpsc::unbounded_channel();
         let state = DaemonState::new(
             "test-node".to_owned(),
             temporary.path().join("config.toml"),
             Config::default(),
+            commands,
         );
         let shutdown = CancellationToken::new();
         let server_shutdown = shutdown.clone();

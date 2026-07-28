@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if ! cargo fmt --version >/dev/null 2>&1; then
+  if [[ -n "${CLIP_SYNC_CHECK_IN_NIX:-}" ]]; then
+    echo "cargo-fmt is unavailable inside the development shell" >&2
+    exit 1
+  fi
+  exec env CLIP_SYNC_CHECK_IN_NIX=1 nix develop --command "$0" "$@"
+fi
+
+cargo fmt --all --check
+cargo check --no-default-features
+cargo check --all-targets --all-features
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-features
+
+if [[ "${1:-}" == "--nix" ]]; then
+  nix flake check --print-build-logs
+fi

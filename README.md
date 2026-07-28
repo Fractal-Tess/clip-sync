@@ -50,11 +50,11 @@ The UI commands will only be available when built with the optional `ui` Cargo f
 
 | Phase | Goal | Status |
 | --- | --- | --- |
-| 0 | Validate Wayland, NetBird, QUIC authentication, encrypted storage, and egui integration | In progress (NetBird complete) |
-| 1 | Project foundation, config, model, IPC, CLI, and CI | In progress (core slice landed) |
-| 2 | Encrypted local text history | Planned |
-| 3 | Two-node text mesh vertical slice | Planned |
-| 4 | Keyboard-first egui switcher | Planned |
+| 0 | Validate Wayland, NetBird, QUIC authentication, encrypted storage, and egui integration | In progress (4/5 validated; native capture remains) |
+| 1 | Project foundation, config, model, IPC, CLI, and local checks | Complete |
+| 2 | Encrypted local text history | In progress (capture, persistence, list, and activate landed) |
+| 3 | Two-node text mesh vertical slice | In progress (QUIC auth and anti-entropy core landed) |
+| 4 | Keyboard-first egui switcher | In progress (native shell landed) |
 | 5 | Arbitrary MIME and safe file snapshots | Planned |
 | 6 | Chunked, cancellable, resumable large sharing | Planned |
 | 7 | Retention and convergence hardening | Planned |
@@ -73,7 +73,7 @@ Please report vulnerabilities according to [SECURITY.md](SECURITY.md).
 
 ## Development
 
-The current foundation includes validated TOML configuration, NetBird JSON discovery, a versioned Protobuf Unix-socket IPC service, daemon status/doctor commands, a deterministic operation projection, gap-aware version frontiers, keyed exact-byte content IDs, property tests, CI, and a Nix flake.
+The current foundation includes validated TOML configuration, NetBird and Wayland capability discovery, a versioned Protobuf Unix-socket IPC service, daemon status/doctor commands, a deterministic operation projection, gap-aware version frontiers, keyed exact-byte content IDs, SQLCipher and QUIC-authentication spikes, an optional egui shell, property tests, repeatable local checks, and a Nix flake. See [the Milestone 0 findings](docs/milestone-0.md) for validated behavior and honest limitations.
 
 ```console
 nix develop
@@ -84,12 +84,11 @@ cargo run -- daemon
 cargo run -- status --json
 ```
 
-The repository uses stable Rust and exposes the standard checks:
+All validation runs locally; the repository intentionally has no hosted CI/CD workflow.
 
 ```console
-cargo fmt --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all-features
+./scripts/check          # format, daemon/UI builds, clippy, and tests
+./scripts/check --nix    # also build and validate the Nix package
 ```
 
 Nix development and packaging support will be added as the Rust foundation lands.
