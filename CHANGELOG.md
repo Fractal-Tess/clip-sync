@@ -15,5 +15,7 @@ All notable changes will be documented here. The project is pre-alpha; storage, 
 - TLS-exporter-bound QUIC shared-key authentication.
 - Transport-independent bounded anti-entropy and store-and-forward tests.
 - CLI daemon status, diagnostics, history listing, and activation commands.
+- Typed, quoted, bounded history search across CLI, IPC, and egui with
+  deterministic newest-first results and an in-memory metadata index.
 - Optional egui switcher and control-center shell.
 - Nix development shell and package.

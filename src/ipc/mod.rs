@@ -28,6 +28,7 @@ use tokio_util::{
 use crate::{
     config::Config,
     discovery::DiscoverySnapshot,
+    history_search::{HistoryQuery, HistorySearchIndex},
     ipc::protocol::{
         ConfigResponse, DeviceItem, DiagnosticCheck, DiagnosticsResponse, ErrorResponse,
         HistoryItem, HistoryResponse, HistoryUpdateAction, IPC_PROTOCOL_VERSION, MutationResponse,
@@ -86,7 +87,7 @@ struct DaemonStateInner {
     discovery: RwLock<Option<DiscoverySnapshot>>,
     discovery_error: RwLock<Option<String>>,
     clipboard_status: RwLock<DiagnosticStatus>,
-    history: RwLock<Vec<HistoryItem>>,
+    history: RwLock<HistorySearchIndex>,
     devices: RwLock<Vec<DeviceItem>>,
     commands: mpsc::UnboundedSender<DaemonCommand>,
 }
@@ -153,7 +154,7 @@ impl DaemonState {
                     ok: true,
                     detail: "clipboard monitoring is starting".to_owned(),
                 }),
-                history: RwLock::new(Vec::new()),
+                history: RwLock::new(HistorySearchIndex::default()),
                 devices: RwLock::new(Vec::new()),
                 commands,
             }),
@@ -177,7 +178,8 @@ impl DaemonState {
     }
 
     pub async fn set_history(&self, history: Vec<HistoryItem>) {
-        *self.inner.history.write().await = history;
+        let index = HistorySearchIndex::new(history);
+        *self.inner.history.write().await = index;
     }
 
     pub async fn set_devices(&self, devices: Vec<DeviceItem>) {
@@ -268,32 +270,22 @@ impl DaemonState {
                 }
             }
             Some(request::Body::History(history_request)) => {
-                let query = history_request.query.to_lowercase();
-                let limit = if history_request.limit == 0 {
-                    100
-                } else {
-                    history_request.limit.min(500)
+                let query = match HistoryQuery::parse(&history_request.query) {
+                    Ok(query) => query,
+                    Err(error) => {
+                        return error_response(
+                            request_id,
+                            "invalid_history_query",
+                            error.to_string(),
+                        );
+                    }
                 };
-                let limit = usize::try_from(limit).unwrap_or(500);
                 let items = self
                     .inner
                     .history
                     .read()
                     .await
-                    .iter()
-                    .filter(|item| {
-                        query.is_empty()
-                            || item.preview.to_lowercase().contains(&query)
-                            || item.source_node.to_lowercase().contains(&query)
-                            || item
-                                .mime_types
-                                .iter()
-                                .any(|mime| mime.to_lowercase().contains(&query))
-                            || item.content_id.starts_with(&query)
-                    })
-                    .take(limit)
-                    .cloned()
-                    .collect();
+                    .search(&query, history_request.limit);
                 response::Body::History(HistoryResponse { items })
             }
             Some(request::Body::Activate(activate)) => {
@@ -1162,6 +1154,152 @@ mod tests {
         };
         assert_eq!(history.items.len(), 1);
         assert_eq!(history.items[0].content_id, "alpha");
+    }
+
+    #[tokio::test]
+    async fn history_search_applies_typed_filters_in_newest_first_order() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let (commands, _command_rx) = mpsc::unbounded_channel();
+        let state = DaemonState::new(
+            "test-node".to_owned(),
+            temporary.path().join("config.toml"),
+            Config::default(),
+            commands,
+        );
+        state
+            .set_history(vec![
+                HistoryItem {
+                    content_id: "old".to_owned(),
+                    preview: "Release Notes".to_owned(),
+                    mime_types: vec!["text/markdown".to_owned()],
+                    logical_size: 4_096,
+                    source_node: "Office Laptop".to_owned(),
+                    pinned: true,
+                    physical_millis: 1_704_067_199_000,
+                },
+                HistoryItem {
+                    content_id: "new".to_owned(),
+                    preview: "Release Notes".to_owned(),
+                    mime_types: vec!["text/markdown".to_owned()],
+                    logical_size: 4_500,
+                    source_node: "Office Laptop".to_owned(),
+                    pinned: true,
+                    physical_millis: 1_704_067_199_500,
+                },
+                HistoryItem {
+                    content_id: "wrong-device".to_owned(),
+                    preview: "Release Notes".to_owned(),
+                    mime_types: vec!["text/markdown".to_owned()],
+                    logical_size: 4_500,
+                    source_node: "Phone".to_owned(),
+                    pinned: true,
+                    physical_millis: 1_704_067_199_900,
+                },
+            ])
+            .await;
+
+        let response = state
+            .handle(Request {
+                protocol_version: IPC_PROTOCOL_VERSION,
+                request_id: 81,
+                body: Some(request::Body::History(HistoryRequest {
+                    query: concat!(
+                        r#""release notes" device:"office laptop" type:markdown "#,
+                        "pinned:true min-size:4KiB max-size:5KB ",
+                        "before:2024-01-01T00:00:00Z"
+                    )
+                    .to_owned(),
+                    limit: 500,
+                })),
+            })
+            .await;
+        let Some(response::Body::History(history)) = response.body else {
+            panic!("expected history response");
+        };
+        assert_eq!(
+            history
+                .items
+                .iter()
+                .map(|item| item.content_id.as_str())
+                .collect::<Vec<_>>(),
+            ["new", "old"]
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_history_query_error_is_stable_and_does_not_echo_value() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let (commands, _command_rx) = mpsc::unbounded_channel();
+        let state = DaemonState::new(
+            "test-node".to_owned(),
+            temporary.path().join("config.toml"),
+            Config::default(),
+            commands,
+        );
+        let response = state
+            .handle(Request {
+                protocol_version: IPC_PROTOCOL_VERSION,
+                request_id: 82,
+                body: Some(request::Body::History(HistoryRequest {
+                    query: "pinned:private-value".to_owned(),
+                    limit: 100,
+                })),
+            })
+            .await;
+        let Some(response::Body::Error(error)) = response.body else {
+            panic!("expected error response");
+        };
+        assert_eq!(error.code, "invalid_history_query");
+        assert_eq!(
+            error.message,
+            "invalid query at byte 0: pinned expects true or false"
+        );
+        assert!(!error.message.contains("private-value"));
+    }
+
+    #[tokio::test]
+    async fn large_history_search_stays_responsive_and_bounded() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let (commands, _command_rx) = mpsc::unbounded_channel();
+        let state = DaemonState::new(
+            "test-node".to_owned(),
+            temporary.path().join("config.toml"),
+            Config::default(),
+            commands,
+        );
+        let items = (0_u64..50_000)
+            .map(|index| HistoryItem {
+                content_id: format!("content-{index:05}"),
+                preview: format!("ordinary clipboard preview {index}"),
+                mime_types: vec!["text/plain".to_owned()],
+                logical_size: index,
+                source_node: format!("device-{}", index % 8),
+                pinned: index % 10 == 0,
+                physical_millis: index,
+            })
+            .collect();
+        state.set_history(items).await;
+
+        let started = Instant::now();
+        let response = state
+            .handle(Request {
+                protocol_version: IPC_PROTOCOL_VERSION,
+                request_id: 83,
+                body: Some(request::Body::History(HistoryRequest {
+                    query: "not-present pinned:false type:text".to_owned(),
+                    limit: u32::MAX,
+                })),
+            })
+            .await;
+        let elapsed = started.elapsed();
+        let Some(response::Body::History(history)) = response.body else {
+            panic!("expected history response");
+        };
+        assert!(history.items.is_empty());
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "50k-entry metadata search took {elapsed:?}"
+        );
     }
 
     #[tokio::test]

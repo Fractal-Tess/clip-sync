@@ -653,7 +653,7 @@ impl ClipSyncApp {
                 let search = ui.add_sized(
                     [ui.available_width(), 42.0],
                     egui::TextEdit::singleline(&mut self.search)
-                        .hint_text("Search history")
+                        .hint_text("Search or filter (device:, type:, pinned:)")
                         .font(FontId::proportional(16.0)),
                 );
                 if self.switcher_state == SwitcherState::NeedsFocus {
@@ -791,7 +791,8 @@ impl ClipSyncApp {
         ui.horizontal(|ui| {
             let search = ui.add_sized(
                 [ui.available_width() - 210.0, 36.0],
-                egui::TextEdit::singleline(&mut self.search).hint_text("Search merged history"),
+                egui::TextEdit::singleline(&mut self.search)
+                    .hint_text("Search or filter merged history"),
             );
             if search.changed() {
                 self.selected_history = 0;
@@ -851,7 +852,7 @@ impl ClipSyncApp {
         }
         ui.label(
             RichText::new(
-                "Items with locally available payloads can be activated. Pins and deletes replicate.",
+                "Filters: device:, type:, before:, pinned:, min-size:, max-size:. Quote phrases. Items with local payloads can be activated.",
             )
             .color(MUTED)
             .size(12.0),

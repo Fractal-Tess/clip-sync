@@ -46,6 +46,21 @@ clip-sync doctor --json
 
 The UI commands will only be available when built with the optional `ui` Cargo feature.
 
+History search combines case-insensitive free text with typed filters. Terms and
+repeated filters are conjunctive, quoted phrases preserve spaces, and results
+are always newest first:
+
+```console
+clip-sync history search '"release notes" device:kiwi type:text pinned:true'
+clip-sync history search 'before:2026-07-29T12:00:00Z min-size:4KiB max-size:2MB'
+clip-sync history search 'before:1785326400000'
+```
+
+`before:` accepts an RFC3339 timestamp or Unix milliseconds. Size bounds are
+inclusive and accept bytes or `KB`, `KiB`, `MB`, `MiB`, `GB`, and `GiB`.
+Search uses only the daemon's bounded preview and metadata view; the underlying
+history remains in the encrypted SQLCipher operation store.
+
 ## Status and roadmap
 
 | Phase | Goal | Status |

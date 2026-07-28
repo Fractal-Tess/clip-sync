@@ -9,6 +9,7 @@ use crate::{
     crypto::MeshSecret,
     daemon,
     envelope::{RekeyOutcome, rekey_state},
+    history_search::HistoryQuery,
     ipc::{
         self,
         protocol::{
@@ -103,6 +104,8 @@ enum UiCommand {
 enum HistoryCommand {
     /// List newest history entries, optionally matching a query.
     List {
+        /// Free text and filters: device:, type:, before:, pinned:, min-size:, max-size:.
+        #[arg(value_name = "QUERY")]
         query: Option<String>,
         #[arg(long, default_value_t = 100)]
         limit: u32,
@@ -111,6 +114,8 @@ enum HistoryCommand {
     },
     /// Search retained history.
     Search {
+        /// Free text and filters; quote the complete query when it contains spaces.
+        #[arg(value_name = "QUERY")]
         query: String,
         #[arg(long, default_value_t = 100)]
         limit: u32,
@@ -416,6 +421,13 @@ async fn history_query(
     limit: u32,
     json: bool,
 ) -> anyhow::Result<()> {
+    if let Err(error) = HistoryQuery::parse(&query) {
+        return Err(operation_error(
+            json,
+            "invalid_history_query",
+            &error.to_string(),
+        ));
+    }
     let response = daemon_request(
         paths,
         3,
@@ -428,17 +440,7 @@ async fn history_query(
             let items = history
                 .items
                 .into_iter()
-                .map(|item| {
-                    serde_json::json!({
-                        "content_id": item.content_id,
-                        "preview": item.preview,
-                        "mime_types": item.mime_types,
-                        "logical_size": item.logical_size,
-                        "source_node": item.source_node,
-                        "pinned": item.pinned,
-                        "physical_millis": item.physical_millis,
-                    })
-                })
+                .map(|item| history_item_json(&item))
                 .collect::<Vec<_>>();
             print_json(&items)
         }
@@ -456,6 +458,18 @@ async fn history_query(
         Some(response::Body::Error(error)) => Err(daemon_response_error(&error, json)),
         _ => Err(unexpected_response(json, "history query")),
     }
+}
+
+fn history_item_json(item: &crate::ipc::protocol::HistoryItem) -> serde_json::Value {
+    serde_json::json!({
+        "content_id": item.content_id,
+        "preview": item.preview,
+        "mime_types": item.mime_types,
+        "logical_size": item.logical_size,
+        "source_node": item.source_node,
+        "pinned": item.pinned,
+        "physical_millis": item.physical_millis,
+    })
 }
 
 async fn history_update(
@@ -867,6 +881,30 @@ mod tests {
                     "code": "daemon_unavailable",
                     "message": "not running",
                 }
+            })
+        );
+    }
+
+    #[test]
+    fn history_json_fields_are_stable() {
+        assert_eq!(
+            history_item_json(&crate::ipc::protocol::HistoryItem {
+                content_id: "content".to_owned(),
+                preview: "preview".to_owned(),
+                mime_types: vec!["text/plain".to_owned()],
+                logical_size: 42,
+                source_node: "device".to_owned(),
+                pinned: true,
+                physical_millis: 1_704_067_200_000,
+            }),
+            serde_json::json!({
+                "content_id": "content",
+                "preview": "preview",
+                "mime_types": ["text/plain"],
+                "logical_size": 42,
+                "source_node": "device",
+                "pinned": true,
+                "physical_millis": 1_704_067_200_000_u64,
             })
         );
     }
