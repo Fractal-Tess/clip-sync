@@ -71,6 +71,8 @@
           default = pkgs.mkShell {
             packages = with pkgs; [
               cargo
+              cargo-audit
+              cargo-deny
               clippy
               libGL
               libxkbcommon

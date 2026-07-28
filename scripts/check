@@ -9,12 +9,27 @@ if ! cargo fmt --version >/dev/null 2>&1; then
   exec env CLIP_SYNC_CHECK_IN_NIX=1 nix develop --command "$0" "$@"
 fi
 
+run_nix=0
+run_security=0
+for argument in "$@"; do
+  case "$argument" in
+    --nix) run_nix=1 ;;
+    --security) run_security=1 ;;
+    *) echo "unknown check option: $argument" >&2; exit 2 ;;
+  esac
+done
+
 cargo fmt --all --check
 cargo check --no-default-features
 cargo check --all-targets --all-features
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-features
 
-if [[ "${1:-}" == "--nix" ]]; then
+if [[ $run_security -eq 1 ]]; then
+  cargo audit
+  cargo deny check advisories sources
+fi
+
+if [[ $run_nix -eq 1 ]]; then
   nix flake check --print-build-logs
 fi
