@@ -212,7 +212,7 @@ Because history encryption is rooted in the mesh secret, rotation is a coordinat
 4. Repeat on every node.
 5. Deploy the new configured secret and restart the mesh.
 
-Use envelope encryption so rekeying normally rewrites wrapped data keys and database protection rather than every large payload chunk. Make interrupted rekey recovery transactional.
+Use envelope encryption so rekeying normally rewrites wrapped data keys rather than every database page or large payload chunk. Keep a small authenticated, mode-`0600` keyslot sidecar outside the encrypted database: the mesh-secret-derived key-encryption key unwraps a random SQLCipher database key and chunk-store key. Make keyslot replacement, reopen verification, and interrupted rekey recovery transactional.
 
 ## 5. Storage and at-rest encryption
 
@@ -259,7 +259,7 @@ Define a narrow interface for:
 - becoming clipboard owner and serving several MIME representations;
 - observing when clipboard ownership/content changes.
 
-Implement it first with `wlr-data-control` for Hyprland. Do not shell out to `wl-paste`/`wl-copy` in the production backend, although those tools are useful as test oracles.
+Implement `ext-data-control-v1` first, with the deprecated `wlr-data-control-v1` as a compatibility fallback for older Hyprland versions. Do not shell out to `wl-paste`/`wl-copy` in the production backend, although those tools are useful as test oracles.
 
 ### Capturing offers
 
@@ -277,7 +277,7 @@ For arbitrary formats, preserve MIME names and bytes exactly. Restoration re-off
 
 ### Content identity and deduplication
 
-Calculate a BLAKE3 digest over a canonical sequence of exact MIME names, lengths, and exact bytes. Sort MIME representations by MIME name before hashing.
+Calculate a domain-separated, keyed BLAKE3 digest over a canonical sequence of exact MIME names, lengths, and exact bytes. Sort MIME representations by MIME name before hashing. The key prevents offline dictionary tests against common clipboard text if identifiers or encrypted-store structure are exposed.
 
 History state is not merely a list of blobs. It consists of immutable content plus replicated operations:
 
@@ -483,7 +483,7 @@ Use a versioned request/response and subscription protocol over the Unix socket.
 
 Prove the riskiest dependencies before building the full architecture:
 
-1. Capture and restore several MIME representations through `wlr-data-control` on Hyprland.
+1. Capture and restore several MIME representations through `ext-data-control-v1`, with `wlr-data-control-v1` fallback, on Hyprland.
 2. Keep serving restored clipboard bytes after the source application exits.
 3. Parse live `netbird status --json`, locate `kiwi`, and bind only to the NetBird address.
 4. Establish Quinn connections over NetBird and complete TLS-exporter-bound key confirmation.

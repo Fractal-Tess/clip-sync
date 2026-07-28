@@ -1,0 +1,47 @@
+[package]
+name = "clip-sync"
+version = "0.1.0"
+edition = "2024"
+description = "A masterless, encrypted clipboard-history mesh"
+repository = "https://github.com/Fractal-Tess/clip-sync"
+license = "MIT"
+keywords = ["clipboard", "mesh", "wayland", "peer-to-peer"]
+categories = ["command-line-utilities", "network-programming"]
+
+[features]
+default = []
+ui = []
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+
+[dependencies]
+anyhow = "1.0.104"
+async-trait = "0.1.91"
+blake3 = "1.8.5"
+bytes = "1.12.1"
+clap = { version = "4.6.4", features = ["derive"] }
+directories = "6.0.0"
+futures-util = { version = "0.3.33", features = ["sink"] }
+hex = "0.4.3"
+hostname = "0.4.2"
+ipnet = { version = "2.12.0", features = ["serde"] }
+prost = "0.14.4"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+thiserror = "2.0.19"
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "process", "signal", "sync", "time", "fs", "io-util"] }
+tokio-util = { version = "0.7.19", features = ["codec", "rt"] }
+toml = "1.1.3"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
+uuid = { version = "1.24.0", features = ["v4", "serde"] }
+xdg = "3.0.0"
+
+[dev-dependencies]
+proptest = "1.11.0"
+tempfile = "3.27.0"

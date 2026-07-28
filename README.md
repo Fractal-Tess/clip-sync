@@ -50,8 +50,8 @@ The UI commands will only be available when built with the optional `ui` Cargo f
 
 | Phase | Goal | Status |
 | --- | --- | --- |
-| 0 | Validate Wayland, NetBird, QUIC authentication, encrypted storage, and egui integration | In progress |
-| 1 | Project foundation, config, model, IPC, CLI, and CI | Planned |
+| 0 | Validate Wayland, NetBird, QUIC authentication, encrypted storage, and egui integration | In progress (NetBird complete) |
+| 1 | Project foundation, config, model, IPC, CLI, and CI | In progress (core slice landed) |
 | 2 | Encrypted local text history | Planned |
 | 3 | Two-node text mesh vertical slice | Planned |
 | 4 | Keyboard-first egui switcher | Planned |
@@ -73,7 +73,18 @@ Please report vulnerabilities according to [SECURITY.md](SECURITY.md).
 
 ## Development
 
-The repository will use stable Rust and expose the standard checks:
+The current foundation includes validated TOML configuration, NetBird JSON discovery, a versioned Protobuf Unix-socket IPC service, daemon status/doctor commands, a deterministic operation projection, gap-aware version frontiers, keyed exact-byte content IDs, property tests, CI, and a Nix flake.
+
+```console
+nix develop
+cargo run -- config init
+cargo run -- doctor
+cargo run -- daemon
+# In another shell:
+cargo run -- status --json
+```
+
+The repository uses stable Rust and exposes the standard checks:
 
 ```console
 cargo fmt --check
