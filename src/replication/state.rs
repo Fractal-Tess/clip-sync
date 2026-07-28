@@ -143,6 +143,13 @@ impl AntiEntropyState {
         let op = codec.decode_op(raw)?;
         let id = op.id();
 
+        // A compacted operation remains in the durable seen summary but no
+        // longer has a forwarding-log entry. Never recreate that entry from a
+        // stale or adversarial replay.
+        if self.seen.contains(id) && !self.log.contains(id) {
+            return Ok(IngestOutcome::Duplicate);
+        }
+
         let is_new = self.log.insert(id, raw.to_vec())?;
         if !is_new {
             return Ok(IngestOutcome::Duplicate);
@@ -253,6 +260,13 @@ impl AntiEntropyState {
         }
         missing
     }
+
+    /// Drops operations that were compacted from durable storage. The seen
+    /// frontier deliberately remains unchanged so peers cannot replay or
+    /// request already-compacted history.
+    pub fn compact_log(&mut self, operations: &[OpId]) {
+        self.log.remove_all(operations);
+    }
 }
 
 #[derive(Debug, Error)]
@@ -313,6 +327,22 @@ mod tests {
         assert!(matches!(outcome, IngestOutcome::Applied(_)));
         assert!(state.seen().contains(op.id()));
         assert!(state.log().contains(op.id()));
+    }
+
+    #[test]
+    fn compacted_operation_replay_does_not_restore_forwarding_entry() {
+        let codec = JsonV1Codec;
+        let op = make_op(node(1), 1, b"compacted");
+        let raw = codec.encode_op(&op).unwrap();
+        let mut seen = SeenOps::default();
+        seen.record(op.id());
+        let mut state = AntiEntropyState::restore(seen, OpLog::default());
+
+        assert_eq!(
+            state.ingest_raw(&raw, &codec).unwrap(),
+            IngestOutcome::Duplicate
+        );
+        assert!(!state.log().contains(op.id()));
     }
 
     #[test]

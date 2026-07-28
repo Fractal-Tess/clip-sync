@@ -7,7 +7,9 @@ use std::{
 
 use clip_sync::{
     discovery::{DiscoveredPeer, DiscoverySnapshot},
-    mesh::{MeshChunkCommand, MeshHandle, MeshRuntime, MeshRuntimeConfig, PersistBatch},
+    mesh::{
+        MeshChunkCommand, MeshHandle, MeshRuntime, MeshRuntimeConfig, PersistBatch, PersistResult,
+    },
     model::{ContentId, Operation, Payload, Representation, StampedOperation},
     payload::{
         ChunkStore, ChunkStoreConfig, ChunkStoreKey, ExplicitSharePolicy, Materializer,
@@ -181,7 +183,7 @@ async fn run_worker(
             () = shutdown.cancelled() => break,
             batch = persist.recv() => {
                 let Some(batch) = batch else { break };
-                let result = persist_batch(batch.operations(), &mut history, &mut transfers);
+                let result = persist_batch(&batch, &mut history, &mut transfers);
                 if result.is_ok() {
                     mesh.notify_transfers();
                 }
@@ -238,12 +240,13 @@ async fn run_worker(
 }
 
 fn persist_batch(
-    raw: &[Vec<u8>],
+    batch: &PersistBatch,
     history: &mut HistoryStore,
     transfers: &mut TransferCoordinator,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<PersistResult> {
     let codec = JsonV1Codec;
-    let operations = raw
+    let operations = batch
+        .operations()
         .iter()
         .map(|operation| codec.decode_op(operation))
         .collect::<Result<Vec<StampedOperation>, _>>()?;
@@ -254,9 +257,15 @@ fn persist_batch(
             payload.validate(&CONTENT_KEY)?;
         }
     }
-    history.ingest_batch(&operations, 10_000)?;
+    history.ingest_authenticated_batch(
+        batch.peer(),
+        batch.peer_frontier(),
+        batch.known_members(),
+        &operations,
+        10_000,
+    )?;
     transfers.reconcile_projection(history.projection())?;
-    Ok(())
+    Ok(PersistResult::default())
 }
 
 fn handle_chunk_command(

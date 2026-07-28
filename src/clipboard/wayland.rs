@@ -45,7 +45,8 @@ use super::backend::{BackendError, ClipboardBackend, ClipboardEvent};
 use super::types::{
     BoundedMimeOffer, CaptureBudget, ClipboardContent, ClipboardRepresentation,
     CurrentClipboardInspection, DataControlProtocol, FeedbackDecision, FeedbackMarker,
-    FeedbackState, Generation, MimeType, OfferMimeList, ProbeResult, RejectReason, SelectionKind,
+    FeedbackState, Generation, MAX_CAPTURE_BYTES, MimeType, OfferMimeList, ProbeResult,
+    RejectReason, SelectionKind,
 };
 
 // Interface names as they appear in the Wayland global registry.
@@ -61,15 +62,38 @@ const MAX_CONCURRENT_SOURCE_WRITERS: usize = 32;
 /// Probes for data-control support by connecting to the compositor's Wayland
 /// display. Capture and ownership use the protocol directly and never shell out
 /// to external clipboard tools.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct WaylandBackend {
     commands: Arc<StdMutex<Option<mpsc::UnboundedSender<ClipboardCommand>>>>,
+    capture_threshold: Arc<AtomicU64>,
 }
 
 impl WaylandBackend {
     #[must_use]
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            commands: Arc::new(StdMutex::new(None)),
+            capture_threshold: Arc::new(AtomicU64::new(MAX_CAPTURE_BYTES)),
+        }
+    }
+
+    /// Applies the current replicated automatic-capture threshold. Captures
+    /// already in flight retain the limit they started with.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a zero threshold.
+    pub fn set_capture_threshold(&self, max_bytes: u64) -> Result<(), BackendError> {
+        if max_bytes == 0 {
+            return Err(BackendError::InvalidCaptureThreshold);
+        }
+        self.capture_threshold.store(max_bytes, Ordering::SeqCst);
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn capture_threshold(&self) -> u64 {
+        self.capture_threshold.load(Ordering::SeqCst)
     }
 
     fn active_sender(&self) -> Result<mpsc::UnboundedSender<ClipboardCommand>, BackendError> {
@@ -108,6 +132,7 @@ impl ClipboardBackend for WaylandBackend {
         }
 
         let (done_tx, done_rx) = oneshot::channel();
+        let capture_threshold = self.capture_threshold.clone();
         std::thread::Builder::new()
             .name("clip-sync-wayland".to_owned())
             .spawn(move || {
@@ -116,7 +141,12 @@ impl ClipboardBackend for WaylandBackend {
                     .build()
                     .map_err(|error| BackendError::Connection(error.to_string()))
                     .and_then(|runtime| {
-                        runtime.block_on(run_wayland_watch(shutdown, command_rx, on_event))
+                        runtime.block_on(run_wayland_watch(
+                            shutdown,
+                            command_rx,
+                            on_event,
+                            capture_threshold,
+                        ))
                     });
                 let _ = done_tx.send(result);
             })
@@ -197,6 +227,12 @@ impl ClipboardBackend for WaylandBackend {
             return Err(BackendError::CurrentOfferChanged);
         }
         Ok(content)
+    }
+}
+
+impl Default for WaylandBackend {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -358,6 +394,7 @@ struct CaptureAssembly {
     offer: DataControlOffer,
     slots: Vec<Option<ClipboardRepresentation>>,
     remaining: usize,
+    max_bytes: u64,
 }
 
 struct CaptureMessage {
@@ -384,6 +421,7 @@ struct WaylandState {
     capture_tx: mpsc::UnboundedSender<CaptureMessage>,
     on_event: Box<dyn Fn(ClipboardEvent) + Send + Sync>,
     shutdown: CancellationToken,
+    capture_threshold: Arc<AtomicU64>,
     feedback: FeedbackState,
     owned_source: Option<OwnedClipboardSource>,
     source_writers: Arc<Semaphore>,
@@ -397,6 +435,7 @@ impl WaylandState {
         capture_tx: mpsc::UnboundedSender<CaptureMessage>,
         on_event: Box<dyn Fn(ClipboardEvent) + Send + Sync>,
         shutdown: CancellationToken,
+        capture_threshold: Arc<AtomicU64>,
     ) -> Self {
         Self {
             manager,
@@ -408,6 +447,7 @@ impl WaylandState {
             capture_tx,
             on_event,
             shutdown,
+            capture_threshold,
             feedback: FeedbackState::default(),
             owned_source: None,
             source_writers: Arc::new(Semaphore::new(MAX_CONCURRENT_SOURCE_WRITERS)),
@@ -539,7 +579,8 @@ impl WaylandState {
     ) {
         let mime_types = mime_list.types().to_vec();
         let expected = mime_types.len();
-        let budget = Arc::new(StdMutex::new(CaptureBudget::new()));
+        let max_bytes = self.capture_threshold.load(Ordering::SeqCst);
+        let budget = Arc::new(StdMutex::new(CaptureBudget::with_max(max_bytes)));
 
         self.captures.insert(
             generation,
@@ -548,6 +589,7 @@ impl WaylandState {
                 offer: offer.clone(),
                 slots: vec![None; expected],
                 remaining: expected,
+                max_bytes,
             },
         );
 
@@ -633,7 +675,7 @@ impl WaylandState {
             return;
         };
 
-        match ClipboardContent::new(representations) {
+        match ClipboardContent::new_with_max(representations, assembly.max_bytes) {
             Ok(content) => self.emit(ClipboardEvent::Captured {
                 generation,
                 kind: assembly.kind,
@@ -899,6 +941,7 @@ async fn run_wayland_watch(
     shutdown: CancellationToken,
     mut command_rx: mpsc::UnboundedReceiver<ClipboardCommand>,
     on_event: Box<dyn Fn(ClipboardEvent) + Send + Sync>,
+    capture_threshold: Arc<AtomicU64>,
 ) -> Result<(), BackendError> {
     let conn = Connection::connect_to_env().map_err(|e| BackendError::Connection(e.to_string()))?;
     let (globals, mut queue) = globals::registry_queue_init::<WaylandState>(&conn)
@@ -913,7 +956,13 @@ async fn run_wayland_watch(
     }
 
     let (capture_tx, mut capture_rx) = mpsc::unbounded_channel();
-    let mut state = WaylandState::new(manager, capture_tx, on_event, shutdown.clone());
+    let mut state = WaylandState::new(
+        manager,
+        capture_tx,
+        on_event,
+        shutdown.clone(),
+        capture_threshold,
+    );
     for seat in &seats {
         state.add_device(seat, &qh);
     }

@@ -108,6 +108,22 @@ impl TransferCoordinator {
         &mut self.store
     }
 
+    /// Replaces the resource policy used for future explicit shares.
+    ///
+    /// In-flight transfers retain their already-durable quota classification.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the replacement policy is internally inconsistent.
+    pub fn update_policy(
+        &mut self,
+        policy: ExplicitSharePolicy,
+    ) -> Result<(), TransferCoordinatorError> {
+        policy.validate()?;
+        self.policy = policy;
+        Ok(())
+    }
+
     /// Inspects an already streamed live snapshot without allocating chunks.
     ///
     /// # Errors

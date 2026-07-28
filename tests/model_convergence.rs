@@ -263,6 +263,63 @@ fn fixture_has_expected_merged_timeline_and_registers() {
     assert!(projection.is_device_forgotten(node(99)));
 }
 
+#[test]
+fn partitioned_shared_settings_and_membership_converge_after_heal() {
+    let a = node(10);
+    let b = node(20);
+    let retired = node(30);
+    let operations = [
+        stamp(
+            a,
+            1,
+            100,
+            0,
+            Operation::SetSetting {
+                key: "mesh_quota_bytes".to_owned(),
+                value: SettingValue::Unsigned(100),
+            },
+        ),
+        stamp(
+            b,
+            1,
+            101,
+            0,
+            Operation::SetSetting {
+                key: "capture_threshold_bytes".to_owned(),
+                value: SettingValue::Unsigned(50),
+            },
+        ),
+        stamp(
+            retired,
+            1,
+            102,
+            0,
+            Operation::SetSetting {
+                key: "mesh_quota_bytes".to_owned(),
+                value: SettingValue::Unsigned(200),
+            },
+        ),
+        stamp(a, 2, 103, 0, Operation::ForgetDevice { node_id: retired }),
+    ];
+
+    let deliveries = [[0_usize, 3, 1, 2], [1, 2, 3, 0], [2, 1, 0, 3]];
+    let projections = deliveries.map(|delivery| {
+        let mut projection = Projection::default();
+        for index in delivery {
+            projection.apply(&operations[index]).unwrap();
+        }
+        projection
+    });
+
+    assert_eq!(projections[0], projections[1]);
+    assert_eq!(projections[1], projections[2]);
+    assert_eq!(
+        projections[0].effective_shared_settings().mesh_quota_bytes,
+        200
+    );
+    assert!(projections[0].is_device_forgotten(retired));
+}
+
 proptest! {
     #[test]
     fn replicas_converge_under_reordering_and_duplication(

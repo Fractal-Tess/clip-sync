@@ -387,23 +387,24 @@ impl ClipboardContent {
     pub fn new(
         representations: Vec<ClipboardRepresentation>,
     ) -> Result<Self, ClipboardContentError> {
-        Self::new_with_limit(representations, MAX_CAPTURE_BYTES)
+        Self::new_with_max(representations, MAX_CAPTURE_BYTES)
     }
 
-    /// Builds clipboard content with an explicit daemon-enforced aggregate cap.
+    /// Builds clipboard content with a caller-provided aggregate byte limit.
     ///
-    /// This is used only for confirmed explicit shares and activation; ordinary
-    /// automatic capture continues to use [`Self::new`].
+    /// This is used by the daemon's replicated automatic-capture threshold,
+    /// confirmed explicit shares, and activation.
     ///
     /// # Errors
     ///
-    /// Returns the same validation errors as [`Self::new`] or when the caller
-    /// supplied a zero/exceeded aggregate bound.
-    pub fn new_with_limit(
+    /// Returns the same structural errors as [`Self::new`], or
+    /// [`ClipboardContentError::TooLarge`] when `max_bytes` is zero or
+    /// exceeded.
+    pub fn new_with_max(
         representations: Vec<ClipboardRepresentation>,
-        maximum_bytes: u64,
+        max_bytes: u64,
     ) -> Result<Self, ClipboardContentError> {
-        if maximum_bytes == 0 {
+        if max_bytes == 0 {
             return Err(ClipboardContentError::TooLarge { total_bytes: 0 });
         }
         if representations.is_empty() {
@@ -433,11 +434,23 @@ impl ClipboardContent {
                 .saturating_add(u64::try_from(representation.bytes().len()).unwrap_or(u64::MAX));
         }
 
-        if total_bytes > maximum_bytes {
+        if total_bytes > max_bytes {
             return Err(ClipboardContentError::TooLarge { total_bytes });
         }
 
         Ok(Self { representations })
+    }
+
+    /// Compatibility alias for explicit-share callers.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same validation errors as [`Self::new_with_max`].
+    pub fn new_with_limit(
+        representations: Vec<ClipboardRepresentation>,
+        maximum_bytes: u64,
+    ) -> Result<Self, ClipboardContentError> {
+        Self::new_with_max(representations, maximum_bytes)
     }
 
     /// Returns the MIME byte representations in offer order.

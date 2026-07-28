@@ -72,6 +72,14 @@ impl OpLog {
     pub fn iter(&self) -> impl Iterator<Item = (OpId, &[u8])> {
         self.entries.iter().map(|(id, raw)| (*id, raw.as_slice()))
     }
+
+    /// Removes compacted durable entries while leaving the caller's
+    /// acknowledgement/seen summary intact.
+    pub fn remove_all(&mut self, operations: &[OpId]) {
+        for operation in operations {
+            self.entries.remove(operation);
+        }
+    }
 }
 
 #[derive(Clone, Debug, Error, PartialEq, Eq)]

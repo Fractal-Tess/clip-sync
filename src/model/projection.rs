@@ -648,6 +648,34 @@ impl Projection {
             .map(|(_, id, manifest_id, manifest)| (id, manifest_id, manifest))
     }
 
+    pub fn forgotten_devices(&self) -> impl Iterator<Item = NodeId> + '_ {
+        self.forgotten_devices.keys().copied()
+    }
+
+    /// Stable, non-secret revision derived from the winning shared-setting
+    /// registers. It is written to TOML so a daemon can recognize its own
+    /// atomic replacement after a restart or config-watch notification.
+    #[must_use]
+    pub fn shared_settings_revision(&self) -> String {
+        let mut hash = blake3::Hasher::new();
+        hash.update(b"clip-sync/shared-settings-revision/v1");
+        for setting in [
+            SharedSetting::MeshQuotaBytes,
+            SharedSetting::CaptureThresholdBytes,
+        ] {
+            hash.update(setting.key().as_bytes());
+            if let Some(event) = self.setting_event(setting.key()) {
+                hash.update(&event.timestamp().physical_millis().to_be_bytes());
+                hash.update(&event.timestamp().logical().to_be_bytes());
+                hash.update(event.operation_id().node().as_uuid().as_bytes());
+                hash.update(&event.operation_id().counter().to_be_bytes());
+            } else {
+                hash.update(&[0; 36]);
+            }
+        }
+        hash.finalize().to_hex().to_string()
+    }
+
     /// Computes the oldest-first eviction set from only quota-chargeable
     /// entries. Pins and explicit oversized shares are excluded from both the
     /// usage total and the candidate set.
@@ -735,15 +763,54 @@ impl Projection {
         self.tombstones()
             .into_iter()
             .filter(|tombstone| {
-                active.iter().all(|member| {
-                    self.member_has_seen(
-                        *member,
-                        tombstone.deletion.operation_id(),
-                        local_node,
-                        acknowledgements,
-                    )
-                })
+                tombstone.currently_deleted
+                    && active.iter().all(|member| {
+                        self.member_has_seen(
+                            *member,
+                            tombstone.deletion.operation_id(),
+                            local_node,
+                            acknowledgements,
+                        ) && (*member == local_node
+                            || acknowledgements
+                                .peer(*member)
+                                .is_some_and(|frontier| frontier.is_subset_of(&self.seen)))
+                    })
             })
+            .collect()
+    }
+
+    /// Removes fully acknowledged, currently-deleted content records from
+    /// projection state. Callers must delete the corresponding immutable
+    /// operations in the same durable transaction.
+    pub(crate) fn remove_compacted_tombstones(&mut self, content_ids: &BTreeSet<ContentId>) {
+        self.content
+            .retain(|content_id, _| !content_ids.contains(content_id));
+    }
+
+    pub(crate) fn merge_compacted_seen(&mut self, compacted_seen: &SeenOps) {
+        self.seen.merge(compacted_seen);
+    }
+
+    #[must_use]
+    pub fn active_known_members(
+        &self,
+        local_node: NodeId,
+        acknowledgements: &Acknowledgements,
+    ) -> BTreeSet<NodeId> {
+        self.active_members(local_node, acknowledgements)
+    }
+
+    #[must_use]
+    pub fn stably_forgotten_devices(
+        &self,
+        local_node: NodeId,
+        acknowledgements: &Acknowledgements,
+    ) -> BTreeSet<NodeId> {
+        let active = self.active_members(local_node, acknowledgements);
+        self.forgotten_devices
+            .keys()
+            .copied()
+            .filter(|target| !active.contains(target))
             .collect()
     }
 
@@ -802,6 +869,7 @@ impl Projection {
     ) -> BTreeSet<NodeId> {
         let mut members = self.known_members.clone();
         members.insert(local_node);
+        members.extend(acknowledgements.known_members());
         let forget_targets = self
             .forgotten_devices
             .keys()

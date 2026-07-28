@@ -76,6 +76,8 @@ pub enum BackendError {
     CurrentOfferUnavailable,
     #[error("the current clipboard changed during explicit inspection")]
     CurrentOfferChanged,
+    #[error("capture threshold must be greater than zero")]
+    InvalidCaptureThreshold,
 }
 
 /// Backend-neutral interface for clipboard monitoring.

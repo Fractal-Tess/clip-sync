@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -12,11 +12,21 @@ use super::{NodeId, OpId, SeenOps};
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Acknowledgements {
     peers: BTreeMap<NodeId, SeenOps>,
+    known_members: BTreeSet<NodeId>,
 }
 
 impl Acknowledgements {
     pub fn record(&mut self, peer: NodeId, seen: &SeenOps) {
+        self.known_members.insert(peer);
         self.peers.entry(peer).or_default().merge(seen);
+    }
+
+    pub fn record_known(&mut self, member: NodeId) {
+        self.known_members.insert(member);
+    }
+
+    pub fn remove_peer(&mut self, peer: NodeId) {
+        self.peers.remove(&peer);
     }
 
     #[must_use]
@@ -32,5 +42,9 @@ impl Acknowledgements {
 
     pub fn peers(&self) -> impl Iterator<Item = (NodeId, &SeenOps)> {
         self.peers.iter().map(|(node, seen)| (*node, seen))
+    }
+
+    pub fn known_members(&self) -> impl Iterator<Item = NodeId> + '_ {
+        self.known_members.iter().copied()
     }
 }

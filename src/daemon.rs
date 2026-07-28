@@ -10,19 +10,21 @@ use crate::{
         types::{ClipboardContent, ClipboardRepresentation, CurrentClipboardInspection, MimeType},
         wayland::WaylandBackend,
     },
-    config::{AppPaths, Config},
+    config::{AppPaths, Config, SharedConfig},
     crypto::MeshSecret,
     discovery::{NetbirdDiscovery, PeerDiscovery},
     ipc::{self, DaemonCommand, DaemonState, protocol::HistoryItem},
-    mesh::{MeshChunkCommand, MeshHandle, MeshRuntime, MeshRuntimeConfig, PersistBatch},
-    model::{Operation, Payload, Representation, StampedOperation},
+    mesh::{
+        MeshChunkCommand, MeshHandle, MeshRuntime, MeshRuntimeConfig, PersistBatch, PersistResult,
+    },
+    model::{Operation, Payload, Representation, SharedSetting, StampedOperation},
     payload::{
         ChunkStore, ChunkStoreConfig, ExplicitShareInspection, ExplicitSharePolicy,
         FileSnapshotLimits, Materializer, MaterializerConfig, parse_file_uri_list,
     },
     replica::Replica,
     replication::{Codec, JsonV1Codec},
-    storage::HistoryStore,
+    storage::{CompactionReport, HistoryStore},
     transfer::{TransferCoordinator, TransferId, TransferStateLimits},
 };
 
@@ -303,7 +305,7 @@ async fn enforce_and_publish_quota(
 ///
 /// Returns an error when runtime setup, IPC serving, or signal handling fails.
 #[allow(clippy::too_many_lines)]
-pub async fn run(paths: AppPaths, config: Config) -> anyhow::Result<()> {
+pub async fn run(paths: AppPaths, mut config: Config) -> anyhow::Result<()> {
     fs::create_dir_all(&paths.state_dir).context("create state directory")?;
     fs::create_dir_all(&paths.runtime_dir).context("create runtime directory")?;
     make_private_directory(&paths.state_dir).context("secure state directory")?;
@@ -317,6 +319,8 @@ pub async fn run(paths: AppPaths, config: Config) -> anyhow::Result<()> {
     let storage_path = paths.state_dir.join("history.db");
     let mut history = HistoryStore::open(&storage_path, &storage_key)
         .with_context(|| format!("open encrypted history at {}", storage_path.display()))?;
+    initialize_shared_settings(&mut history, &paths.config, &mut config)
+        .context("reconcile shared mesh settings with config")?;
     let persisted_operations = history
         .storage()
         .load_operations()
@@ -385,7 +389,17 @@ pub async fn run(paths: AppPaths, config: Config) -> anyhow::Result<()> {
     mesh_config.reconnect_min = Duration::from_secs(config.local.reconnect_min_seconds);
     mesh_config.reconnect_max = Duration::from_secs(config.local.reconnect_max_seconds);
     mesh_config.max_concurrent_chunk_streams = config.local.max_concurrent_chunk_streams;
-    let maximum_explicit_share_bytes = config.local.maximum_explicit_share_bytes;
+    mesh_config.initial_seen = history.projection().seen_ops().clone();
+    let acknowledgements = history
+        .acknowledgements()
+        .context("load durable mesh membership")?;
+    mesh_config.known_members = history
+        .projection()
+        .known_members()
+        .chain(acknowledgements.known_members())
+        .chain(std::iter::once(history.replica().node_id()))
+        .collect();
+    mesh_config.forgotten_devices = history.projection().forgotten_devices().collect();
     let (mesh, mut mesh_rx, mut mesh_chunk_rx) = MeshRuntime::spawn_with_transfers(
         mesh_config,
         transport_psk,
@@ -394,9 +408,29 @@ pub async fn run(paths: AppPaths, config: Config) -> anyhow::Result<()> {
     )
     .context("start mesh runtime")?;
     let mesh_handle = mesh.handle();
-    let discovery = spawn_discovery(config, state.clone(), mesh_handle.clone(), shutdown.clone());
+    let discovery = spawn_discovery(
+        config.clone(),
+        state.clone(),
+        mesh_handle.clone(),
+        shutdown.clone(),
+    );
+    let (config_tx, mut config_rx) = tokio::sync::mpsc::unbounded_channel();
+    let config_watch = spawn_config_watch(
+        paths.config.clone(),
+        config.clone(),
+        config_tx,
+        shutdown.clone(),
+    );
 
     let clipboard = WaylandBackend::new();
+    clipboard
+        .set_capture_threshold(
+            history
+                .projection()
+                .effective_shared_settings()
+                .capture_threshold_bytes,
+        )
+        .context("apply effective clipboard capture threshold")?;
     let (clipboard_tx, mut clipboard_rx) = tokio::sync::mpsc::unbounded_channel();
     let clipboard_events = clipboard_tx.clone();
     let clipboard_backend = clipboard.clone();
@@ -461,7 +495,7 @@ pub async fn run(paths: AppPaths, config: Config) -> anyhow::Result<()> {
                         &mesh_handle,
                         &mut transfers,
                         &content_key,
-                        maximum_explicit_share_bytes,
+                        config.local.maximum_explicit_share_bytes,
                         &mut active_materialization,
                         &mut pending_materialization_cleanup,
                         &materialization_root,
@@ -496,14 +530,33 @@ pub async fn run(paths: AppPaths, config: Config) -> anyhow::Result<()> {
             }
             batch = mesh_rx.recv() => {
                 if let Some(batch) = batch {
-                    handle_mesh_batch(
-                        batch,
+                    let mut context = MeshPersistenceContext {
+                        history: &mut history,
+                        state: &state,
+                        content_key: &content_key,
+                        clipboard: &clipboard,
+                        mesh: &mesh_handle,
+                        config_path: &paths.config,
+                        config: &mut config,
+                        transfers: &mut transfers,
+                    };
+                    handle_mesh_batch(batch, &mut context).await;
+                }
+            }
+            changed = config_rx.recv() => {
+                if let Some(changed) = changed
+                    && let Err(error) = apply_config_reload(
+                        changed,
+                        &paths.config,
+                        &mut config,
                         &mut history,
-                        &state,
-                        &content_key,
-                        &mut transfers,
+                        &clipboard,
                         &mesh_handle,
-                    ).await;
+                        &state,
+                        &mut transfers,
+                    ).await
+                {
+                    tracing::warn!(%error, "config reload was rejected");
                 }
             }
             command = mesh_chunk_rx.recv() => {
@@ -530,6 +583,7 @@ pub async fn run(paths: AppPaths, config: Config) -> anyhow::Result<()> {
         }
     }
     finish_task(discovery).await;
+    finish_task(config_watch).await;
     mesh.wait().await;
     tracing::info!("clip-sync daemon stopped");
     Ok(())
@@ -675,7 +729,7 @@ async fn activate_history_item(
                 })
                 .collect::<anyhow::Result<Vec<_>>>()?;
             (
-                ClipboardContent::new(representations)
+                ClipboardContent::new_with_max(representations, u64::MAX)
                     .context("stored history item cannot be served")?,
                 None,
             )
@@ -869,23 +923,25 @@ async fn handle_clipboard_event(
     Ok(())
 }
 
-async fn handle_mesh_batch(
-    batch: PersistBatch,
-    history: &mut HistoryStore,
-    state: &DaemonState,
-    content_key: &[u8; 32],
-    transfers: &mut TransferCoordinator,
-    mesh: &MeshHandle,
-) {
-    let result = persist_mesh_batch(batch.operations(), history, content_key, transfers);
-    let result = result.and_then(|()| {
-        transfers
-            .reconcile_projection(history.projection())
-            .context("reconcile received transfer state")
-    });
+struct MeshPersistenceContext<'a> {
+    history: &'a mut HistoryStore,
+    state: &'a DaemonState,
+    content_key: &'a [u8; 32],
+    clipboard: &'a WaylandBackend,
+    mesh: &'a MeshHandle,
+    config_path: &'a std::path::Path,
+    config: &'a mut Config,
+    transfers: &'a mut TransferCoordinator,
+}
+
+async fn handle_mesh_batch(batch: PersistBatch, context: &mut MeshPersistenceContext<'_>) {
+    let result = persist_mesh_batch(&batch, context).await;
     if result.is_ok() {
-        state.set_history(history_items(history.replica())).await;
-        mesh.notify_transfers();
+        context
+            .state
+            .set_history(history_items(context.history.replica()))
+            .await;
+        context.mesh.notify_transfers();
     }
     batch.complete(result.map_err(|error| error.to_string()));
 }
@@ -926,14 +982,13 @@ fn handle_mesh_chunk_command(
     }
 }
 
-fn persist_mesh_batch(
-    raw_operations: &[Vec<u8>],
-    history: &mut HistoryStore,
-    content_key: &[u8; 32],
-    transfers: &TransferCoordinator,
-) -> anyhow::Result<()> {
+async fn persist_mesh_batch(
+    batch: &PersistBatch,
+    context: &mut MeshPersistenceContext<'_>,
+) -> anyhow::Result<PersistResult> {
     let codec = JsonV1Codec;
-    let operations = raw_operations
+    let operations = batch
+        .operations()
         .iter()
         .map(|raw| codec.decode_op(raw).context("decode remote operation"))
         .collect::<anyhow::Result<Vec<StampedOperation>>>()?;
@@ -942,7 +997,7 @@ fn persist_mesh_batch(
             operation.operation()
         {
             payload
-                .validate(content_key)
+                .validate(context.content_key)
                 .context("validate remote clipboard payload identity")?;
         }
         if let Operation::BeginShare {
@@ -951,16 +1006,266 @@ fn persist_mesh_batch(
             ..
         } = operation.operation()
         {
-            transfers
+            context
+                .transfers
                 .validate_manifest(*manifest_id, manifest)
                 .context("validate remote transfer manifest")?;
         }
     }
 
-    history
-        .ingest_batch(&operations, unix_time_millis()?)
-        .context("persist remote operation batch")?;
+    let before = context.history.projection().effective_shared_settings();
+    context
+        .history
+        .ingest_authenticated_batch(
+            batch.peer(),
+            batch.peer_frontier(),
+            batch.known_members(),
+            &operations,
+            unix_time_millis()?,
+        )
+        .context("persist authenticated remote operation batch and frontier")?;
+    context
+        .transfers
+        .reconcile_projection(context.history.projection())
+        .context("reconcile received transfer state")?;
+    let after = context.history.projection().effective_shared_settings();
+
+    if before != after {
+        if let Err(error) = context
+            .clipboard
+            .set_capture_threshold(after.capture_threshold_bytes)
+        {
+            tracing::warn!(
+                %error,
+                "durable shared setting could not be applied to clipboard capture"
+            );
+        }
+
+        if before.mesh_quota_bytes != after.mesh_quota_bytes {
+            match unix_time_millis()
+                .context("read wall clock for quota enforcement")
+                .and_then(|now| {
+                    context
+                        .history
+                        .enforce_quota(now)
+                        .context("persist deterministic quota evictions")
+                }) {
+                Ok(evictions) => {
+                    for operation in &evictions {
+                        if let Err(error) = context.mesh.record_local(operation).await {
+                            tracing::warn!(
+                                %error,
+                                operation_id = %operation.id(),
+                                "durable quota eviction could not be queued for replication"
+                            );
+                        }
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        "quota enforcement deferred until all visible payloads are available"
+                    );
+                }
+            }
+        }
+    }
+    let revision = context.history.projection().shared_settings_revision();
+    if !context.config.shared.matches(after, &revision) {
+        match Config::rewrite_shared(context.config_path, after, revision) {
+            Ok(config) => *context.config = config,
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "durable replicated settings could not be mirrored to config"
+                );
+            }
+        }
+    }
+    if let Err(error) = context.transfers.update_policy(ExplicitSharePolicy {
+        automatic_capture_threshold_bytes: after.capture_threshold_bytes,
+        mesh_quota_bytes: after.mesh_quota_bytes,
+        maximum_explicit_share_bytes: context.config.local.maximum_explicit_share_bytes,
+        free_space_reserve_bytes: context.config.local.transfer_free_space_reserve_bytes,
+    }) {
+        tracing::warn!(
+            %error,
+            "durable shared settings could not be applied to explicit-share policy"
+        );
+    }
+
+    let compacted = match context.history.compact_acknowledged_tombstones() {
+        Ok(compacted) => compacted,
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                "acknowledged tombstone compaction will be retried later"
+            );
+            CompactionReport::default()
+        }
+    };
+    Ok(PersistResult::new(compacted.operations().to_vec()))
+}
+
+fn initialize_shared_settings(
+    history: &mut HistoryStore,
+    config_path: &std::path::Path,
+    config: &mut Config,
+) -> anyhow::Result<()> {
+    let projection = history.projection();
+    let effective = projection.effective_shared_settings();
+    let revision = projection.shared_settings_revision();
+    let has_replicated_settings = projection
+        .setting_event(SharedSetting::MeshQuotaBytes.key())
+        .is_some()
+        || projection
+            .setting_event(SharedSetting::CaptureThresholdBytes.key())
+            .is_some();
+    let external_edit = if has_replicated_settings {
+        !config.shared.revision.is_empty() && !config.shared.matches(effective, &revision)
+    } else {
+        config.shared.mesh_quota_bytes != effective.mesh_quota_bytes
+            || config.shared.capture_threshold_bytes != effective.capture_threshold_bytes
+    };
+
+    if external_edit {
+        let now = unix_time_millis()?;
+        if config.shared.mesh_quota_bytes != effective.mesh_quota_bytes {
+            history
+                .set_mesh_quota_and_enforce(config.shared.mesh_quota_bytes, now)
+                .context("apply configured shared mesh quota")?;
+        }
+        let current = history.projection().effective_shared_settings();
+        if config.shared.capture_threshold_bytes != current.capture_threshold_bytes {
+            history
+                .set_shared_setting(
+                    SharedSetting::CaptureThresholdBytes,
+                    config.shared.capture_threshold_bytes,
+                    now,
+                )
+                .context("apply configured shared capture threshold")?;
+        }
+    }
+
+    let effective = history.projection().effective_shared_settings();
+    let revision = history.projection().shared_settings_revision();
+    if !config.shared.matches(effective, &revision) {
+        config.shared = SharedConfig {
+            mesh_quota_bytes: effective.mesh_quota_bytes,
+            capture_threshold_bytes: effective.capture_threshold_bytes,
+            revision,
+        };
+        config
+            .save(config_path)
+            .context("atomically save effective shared settings")?;
+    }
     Ok(())
+}
+
+async fn apply_config_reload(
+    mut changed: Config,
+    config_path: &std::path::Path,
+    current: &mut Config,
+    history: &mut HistoryStore,
+    clipboard: &WaylandBackend,
+    mesh: &MeshHandle,
+    state: &DaemonState,
+    transfers: &mut TransferCoordinator,
+) -> anyhow::Result<()> {
+    let before = history.projection().effective_shared_settings();
+    let current_revision = history.projection().shared_settings_revision();
+    if changed.shared.matches(before, &current_revision) {
+        transfers
+            .update_policy(ExplicitSharePolicy {
+                automatic_capture_threshold_bytes: before.capture_threshold_bytes,
+                mesh_quota_bytes: before.mesh_quota_bytes,
+                maximum_explicit_share_bytes: changed.local.maximum_explicit_share_bytes,
+                free_space_reserve_bytes: changed.local.transfer_free_space_reserve_bytes,
+            })
+            .context("apply reloaded explicit-share policy")?;
+        *current = changed;
+        return Ok(());
+    }
+
+    let now = unix_time_millis()?;
+    let mut authored = Vec::new();
+    if changed.shared.mesh_quota_bytes != before.mesh_quota_bytes {
+        authored.extend(
+            history
+                .set_mesh_quota_and_enforce(changed.shared.mesh_quota_bytes, now)
+                .context("apply reloaded shared mesh quota")?,
+        );
+    }
+    let effective = history.projection().effective_shared_settings();
+    if changed.shared.capture_threshold_bytes != effective.capture_threshold_bytes {
+        authored.push(
+            history
+                .set_shared_setting(
+                    SharedSetting::CaptureThresholdBytes,
+                    changed.shared.capture_threshold_bytes,
+                    now,
+                )
+                .context("apply reloaded shared capture threshold")?,
+        );
+    }
+    for operation in &authored {
+        mesh.record_local(operation)
+            .await
+            .context("publish config-authored shared setting")?;
+    }
+
+    let effective = history.projection().effective_shared_settings();
+    clipboard
+        .set_capture_threshold(effective.capture_threshold_bytes)
+        .context("apply config-authored capture threshold")?;
+    transfers
+        .update_policy(ExplicitSharePolicy {
+            automatic_capture_threshold_bytes: effective.capture_threshold_bytes,
+            mesh_quota_bytes: effective.mesh_quota_bytes,
+            maximum_explicit_share_bytes: changed.local.maximum_explicit_share_bytes,
+            free_space_reserve_bytes: changed.local.transfer_free_space_reserve_bytes,
+        })
+        .context("apply config-authored explicit-share policy")?;
+    changed.shared = SharedConfig {
+        mesh_quota_bytes: effective.mesh_quota_bytes,
+        capture_threshold_bytes: effective.capture_threshold_bytes,
+        revision: history.projection().shared_settings_revision(),
+    };
+    changed
+        .save(config_path)
+        .context("atomically save config-authored shared settings")?;
+    *current = changed;
+    state.set_history(history_items(history.replica())).await;
+    Ok(())
+}
+
+fn spawn_config_watch(
+    path: std::path::PathBuf,
+    initial: Config,
+    updates: tokio::sync::mpsc::UnboundedSender<Config>,
+    shutdown: CancellationToken,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut observed = initial;
+        loop {
+            tokio::select! {
+                () = shutdown.cancelled() => break,
+                () = tokio::time::sleep(Duration::from_millis(500)) => {}
+            }
+            match Config::load(&path) {
+                Ok(config) if config != observed => {
+                    observed = config.clone();
+                    if updates.send(config).is_err() {
+                        break;
+                    }
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::debug!(%error, "waiting for config to become valid");
+                }
+            }
+        }
+    })
 }
 
 fn unix_time_millis() -> anyhow::Result<u64> {

@@ -50,6 +50,22 @@ impl NodeSeen {
         );
         self.advance_frontier();
     }
+
+    fn is_subset_of(&self, other: &Self) -> bool {
+        if self.frontier > other.frontier {
+            let required = self.frontier - other.frontier;
+            let available = other
+                .gaps
+                .range((other.frontier + 1)..=self.frontier)
+                .count();
+            if u64::try_from(available).unwrap_or(u64::MAX) != required {
+                return false;
+            }
+        }
+        self.gaps
+            .iter()
+            .all(|counter| *counter <= other.frontier || other.gaps.contains(counter))
+    }
 }
 
 /// Compact duplicate detector and anti-entropy frontier. `gaps` names the
@@ -156,6 +172,19 @@ impl SeenOps {
         for (node, other_seen) in &other.nodes {
             self.nodes.entry(*node).or_default().merge(other_seen);
         }
+    }
+
+    /// Returns true when every represented operation is also present in
+    /// `other`. Retention uses this to avoid compacting while an authenticated
+    /// peer advertises operations that have not reached durable local state.
+    #[must_use]
+    pub fn is_subset_of(&self, other: &Self) -> bool {
+        self.nodes
+            .iter()
+            .all(|(node, seen)| match other.nodes.get(node) {
+                Some(other_seen) => seen.is_subset_of(other_seen),
+                None => seen.frontier == 0 && seen.gaps.is_empty(),
+            })
     }
 }
 

@@ -7,11 +7,11 @@ use std::{
 
 use clip_sync::{
     discovery::{DiscoveredPeer, DiscoverySnapshot},
-    mesh::{MeshError, MeshHandle, MeshRuntime, MeshRuntimeConfig, PersistBatch},
+    mesh::{MeshError, MeshHandle, MeshRuntime, MeshRuntimeConfig, PersistBatch, PersistResult},
     model::{NodeId, Operation, Payload, Representation, StampedOperation},
     replica::Replica,
     replication::{Codec, JsonV1Codec},
-    storage::{EncryptedStorage, StorageKey},
+    storage::{EncryptedStorage, HistoryStore, StorageKey},
     transport::Psk,
 };
 use tokio::{
@@ -34,6 +34,7 @@ enum NodeCommand {
 }
 
 struct TestNode {
+    node_id: NodeId,
     address: IpAddr,
     handle: MeshHandle,
     runtime: MeshRuntime,
@@ -44,6 +45,15 @@ struct TestNode {
 
 impl TestNode {
     fn start(path: &Path, address: IpAddr, port: u16) -> Self {
+        Self::start_with_forgotten(path, address, port, std::collections::BTreeSet::new())
+    }
+
+    fn start_with_forgotten(
+        path: &Path,
+        address: IpAddr,
+        port: u16,
+        forgotten_devices: std::collections::BTreeSet<NodeId>,
+    ) -> Self {
         let key = storage_key();
         let storage = EncryptedStorage::open(path, &key).unwrap();
         let metadata = storage.local_replica_metadata().unwrap();
@@ -60,6 +70,8 @@ impl TestNode {
         config.reconcile_interval = Duration::from_millis(75);
         config.reconnect_min = Duration::from_millis(25);
         config.reconnect_max = Duration::from_millis(200);
+        config.initial_seen = replica.projection().seen_ops().clone();
+        config.forgotten_devices = forgotten_devices;
         let (runtime, persist) = MeshRuntime::spawn(
             config,
             Psk::new(&PSK).unwrap(),
@@ -78,6 +90,7 @@ impl TestNode {
             shutdown.clone(),
         ));
         Self {
+            node_id: metadata.node_id(),
             address,
             handle,
             runtime,
@@ -136,10 +149,17 @@ async fn run_storage_worker(
                 };
                 let result = persist_remote(
                     request.operations(),
+                    request.peer(),
+                    request.peer_frontier(),
+                    request.known_members(),
                     &mut storage,
                     &mut replica,
                 );
-                request.complete(result.map_err(|error| error.to_string()));
+                request.complete(
+                    result
+                        .map(|()| PersistResult::default())
+                        .map_err(|error| error.to_string()),
+                );
             }
             command = commands.recv() => {
                 let Some(command) = command else {
@@ -169,6 +189,9 @@ async fn run_storage_worker(
 
 fn persist_remote(
     raw_operations: &[Vec<u8>],
+    peer: NodeId,
+    peer_frontier: &clip_sync::model::SeenOps,
+    known_members: &std::collections::BTreeSet<NodeId>,
     storage: &mut EncryptedStorage,
     replica: &mut Replica,
 ) -> anyhow::Result<()> {
@@ -186,7 +209,13 @@ fn persist_remote(
     for operation in &operations {
         next.ingest(operation, now_millis())?;
     }
-    storage.append_remote_operations(&operations, next.last_timestamp())?;
+    storage.append_authenticated_peer_batch(
+        peer,
+        peer_frontier,
+        known_members,
+        &operations,
+        next.last_timestamp(),
+    )?;
     *replica = next;
     Ok(())
 }
@@ -335,4 +364,46 @@ async fn runtime_rejects_control_characters_in_logged_hostname() {
         ),
         Err(MeshError::InvalidHostname)
     ));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn forgotten_identity_is_rejected_but_reset_identity_joins_as_new() {
+    init_tracing();
+    let temp = tempfile::tempdir().unwrap();
+    let a_path = temp.path().join("forgotten-a.db");
+    let b_path = temp.path().join("forgotten-b.db");
+    let port = unused_port();
+    let a_ip = loopback(1);
+    let b_ip = loopback(2);
+
+    let a = TestNode::start(&a_path, a_ip, port);
+    let old_identity = a.node_id;
+    let b = TestNode::start_with_forgotten(
+        &b_path,
+        b_ip,
+        port,
+        std::collections::BTreeSet::from([old_identity]),
+    );
+    a.copy("must-not-cross-forgotten-session").await;
+    a.discover(&[b_ip]);
+    b.discover(&[a_ip]);
+    tokio::time::sleep(Duration::from_millis(750)).await;
+    assert_eq!(b.visible_count().await, 0);
+
+    a.stop().await;
+    {
+        let mut reset = HistoryStore::open(&a_path, &storage_key()).unwrap();
+        let replacement = reset.reset_identity().unwrap();
+        assert_ne!(replacement, old_identity);
+    }
+
+    let a = TestNode::start(&a_path, a_ip, port);
+    assert_ne!(a.node_id, old_identity);
+    a.discover(&[b_ip]);
+    b.discover(&[a_ip]);
+    a.copy("new-identity-is-accepted").await;
+    wait_for_count(&b, 1, "reset identity join").await;
+
+    a.stop().await;
+    b.stop().await;
 }

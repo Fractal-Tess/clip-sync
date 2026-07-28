@@ -56,12 +56,20 @@ impl Config {
     /// Returns an error when validation, encoding, or file replacement fails.
     pub fn save(&self, path: &Path) -> Result<(), ConfigError> {
         self.validate()?;
-        let parent = path.parent().ok_or(ConfigError::MissingParent)?;
+        let target = writable_target(path)?;
+        let parent = target.parent().ok_or(ConfigError::MissingParent)?;
         fs::create_dir_all(parent)?;
 
         let encoded = toml::to_string_pretty(self)?;
-        let temporary = parent.join(format!(".config.toml.{}.tmp", uuid::Uuid::new_v4()));
-        let result: Result<(), ConfigError> = (|| {
+        let temporary = parent.join(format!(
+            ".{}.{}.tmp",
+            target
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("config.toml"),
+            uuid::Uuid::new_v4()
+        ));
+        let result = (|| {
             let mut options = fs::OpenOptions::new();
             options.write(true).create_new(true);
             #[cfg(unix)]
@@ -70,18 +78,44 @@ impl Config {
                 options.mode(0o600);
             }
             let mut file = options.open(&temporary)?;
+            if let Ok(metadata) = fs::metadata(&target) {
+                file.set_permissions(metadata.permissions())?;
+            }
             file.write_all(encoded.as_bytes())?;
             file.sync_all()?;
             drop(file);
-            fs::rename(&temporary, path)?;
-            fs::File::open(parent)?.sync_all()?;
+            fs::rename(&temporary, &target)?;
+            sync_directory(parent)?;
             Ok(())
         })();
         if result.is_err() {
             let _ = fs::remove_file(&temporary);
         }
-        result?;
-        Ok(())
+        result
+    }
+
+    /// Rewrites only replicated settings while preserving local bootstrap
+    /// values from the latest valid file on disk.
+    ///
+    /// The revision is derived from the winning replicated registers. Config
+    /// watchers can suppress a reload when both values and revision match.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error instead of overwriting a concurrently malformed file.
+    pub fn rewrite_shared(
+        path: &Path,
+        settings: EffectiveSharedSettings,
+        revision: impl Into<String>,
+    ) -> Result<Self, ConfigError> {
+        let mut config = Self::load(path)?;
+        config.shared = SharedConfig {
+            mesh_quota_bytes: settings.mesh_quota_bytes,
+            capture_threshold_bytes: settings.capture_threshold_bytes,
+            revision: revision.into(),
+        };
+        config.save(path)?;
+        Ok(config)
     }
 
     /// Validates resource limits and required local settings.
@@ -98,6 +132,17 @@ impl Config {
         if self.shared.capture_threshold_bytes == 0 {
             return Err(ConfigError::Invalid(
                 "shared.capture_threshold_bytes must be greater than zero",
+            ));
+        }
+        if self.shared.revision.len() > 128
+            || !self
+                .shared
+                .revision
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(ConfigError::Invalid(
+                "shared.revision must be empty or at most 128 hexadecimal characters",
             ));
         }
         if self.local.discovery_interval_seconds == 0 {
@@ -148,6 +193,8 @@ impl Config {
 pub struct SharedConfig {
     pub mesh_quota_bytes: u64,
     pub capture_threshold_bytes: u64,
+    /// Daemon-authored fingerprint of the winning replicated registers.
+    pub revision: String,
 }
 
 impl Default for SharedConfig {
@@ -155,7 +202,17 @@ impl Default for SharedConfig {
         Self {
             mesh_quota_bytes: DEFAULT_MESH_QUOTA_BYTES,
             capture_threshold_bytes: DEFAULT_CAPTURE_THRESHOLD_BYTES,
+            revision: String::new(),
         }
+    }
+}
+
+impl SharedConfig {
+    #[must_use]
+    pub fn matches(&self, settings: EffectiveSharedSettings, revision: &str) -> bool {
+        self.mesh_quota_bytes == settings.mesh_quota_bytes
+            && self.capture_threshold_bytes == settings.capture_threshold_bytes
+            && self.revision == revision
     }
 }
 
@@ -164,6 +221,7 @@ impl From<EffectiveSharedSettings> for SharedConfig {
         Self {
             mesh_quota_bytes: settings.mesh_quota_bytes,
             capture_threshold_bytes: settings.capture_threshold_bytes,
+            revision: String::new(),
         }
     }
 }
@@ -282,6 +340,42 @@ pub enum ConfigError {
     Invalid(&'static str),
     #[error("config I/O failed: {0}")]
     Io(#[from] std::io::Error),
+    #[error("config path contains too many symbolic-link hops")]
+    SymlinkLoop,
+}
+
+fn writable_target(path: &Path) -> Result<PathBuf, ConfigError> {
+    let mut target = path.to_owned();
+    for _ in 0..16 {
+        match fs::symlink_metadata(&target) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                let link = fs::read_link(&target)?;
+                target = if link.is_absolute() {
+                    link
+                } else {
+                    target
+                        .parent()
+                        .ok_or(ConfigError::MissingParent)?
+                        .join(link)
+                };
+            }
+            Ok(_) => return Ok(target),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(target),
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Err(ConfigError::SymlinkLoop)
+}
+
+#[cfg(unix)]
+fn sync_directory(path: &Path) -> Result<(), ConfigError> {
+    fs::File::open(path)?.sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_directory(_path: &Path) -> Result<(), ConfigError> {
+    Ok(())
 }
 
 #[cfg(test)]
@@ -356,5 +450,54 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn rejects_malformed_shared_revision() {
+        let mut config = Config::default();
+        config.shared.revision = "not-a-register-revision".to_owned();
+        assert!(matches!(config.validate(), Err(ConfigError::Invalid(_))));
+    }
+
+    #[test]
+    fn replicated_rewrite_preserves_local_values_and_revision() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config.toml");
+        let mut original = Config::default();
+        original.local.listen_port = 31_337;
+        original.save(&path).unwrap();
+
+        let settings = EffectiveSharedSettings {
+            mesh_quota_bytes: 99,
+            capture_threshold_bytes: 77,
+        };
+        let rewritten = Config::rewrite_shared(&path, settings, "a1b2").unwrap();
+        assert_eq!(rewritten.local.listen_port, 31_337);
+        assert!(rewritten.shared.matches(settings, "a1b2"));
+        assert_eq!(Config::load(&path).unwrap(), rewritten);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_save_updates_symlink_target_without_replacing_link() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("managed.toml");
+        let link = temp.path().join("config.toml");
+        Config::default().save(&target).unwrap();
+        symlink("managed.toml", &link).unwrap();
+
+        let mut changed = Config::default();
+        changed.local.listen_port = 30_001;
+        changed.save(&link).unwrap();
+
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(Config::load(&target).unwrap().local.listen_port, 30_001);
     }
 }

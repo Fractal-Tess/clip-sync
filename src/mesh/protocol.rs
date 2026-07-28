@@ -4,9 +4,10 @@ use prost::Message;
 use quinn::{RecvStream, SendStream};
 use thiserror::Error;
 
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 pub const MAX_CONTROL_FRAME_BYTES: usize = 24 * 1024 * 1024;
 pub const MAX_FRONTIER_BYTES: usize = 1024 * 1024;
+pub const MAX_MEMBERSHIP_BYTES: usize = 1024 * 1024;
 pub const MAX_HOSTNAME_BYTES: usize = 255;
 pub const MAX_BATCH_OPERATIONS: usize = 128;
 pub const STREAM_KIND_SYNC: u8 = 1;
@@ -24,6 +25,8 @@ pub struct IdentityHello {
     pub hostname: String,
     #[prost(bytes = "vec", tag = "4")]
     pub frontier: Vec<u8>,
+    #[prost(bytes = "vec", tag = "5")]
+    pub known_members: Vec<u8>,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -34,6 +37,8 @@ pub struct SyncRequest {
     pub operations: Vec<Vec<u8>>,
     #[prost(bool, tag = "3")]
     pub has_more: bool,
+    #[prost(bytes = "vec", tag = "4")]
+    pub known_members: Vec<u8>,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -44,6 +49,8 @@ pub struct SyncResponse {
     pub operations: Vec<Vec<u8>>,
     #[prost(bool, tag = "3")]
     pub has_more: bool,
+    #[prost(bytes = "vec", tag = "4")]
+    pub known_members: Vec<u8>,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -107,12 +114,19 @@ pub async fn read_message_bounded<M: Message + Default>(
     M::decode(encoded.as_slice()).map_err(ProtocolError::Decode)
 }
 
-pub fn validate_batch(frontier: &[u8], operations: &[Vec<u8>]) -> Result<(), ProtocolError> {
+pub fn validate_batch(
+    frontier: &[u8],
+    known_members: &[u8],
+    operations: &[Vec<u8>],
+) -> Result<(), ProtocolError> {
     if frontier.len() > MAX_FRONTIER_BYTES {
         return Err(ProtocolError::FrontierTooLarge(frontier.len()));
     }
     if operations.len() > MAX_BATCH_OPERATIONS {
         return Err(ProtocolError::TooManyOperations(operations.len()));
+    }
+    if known_members.len() > MAX_MEMBERSHIP_BYTES {
+        return Err(ProtocolError::MembershipTooLarge(known_members.len()));
     }
     let total = operations
         .iter()
@@ -132,6 +146,8 @@ pub enum ProtocolError {
     FrameTooLarge(usize),
     #[error("frontier is too large ({0} bytes)")]
     FrontierTooLarge(usize),
+    #[error("membership advertisement is too large ({0} bytes)")]
+    MembershipTooLarge(usize),
     #[error("batch contains too many operations ({0})")]
     TooManyOperations(usize),
     #[error("operation batch is too large ({0} bytes)")]

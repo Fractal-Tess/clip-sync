@@ -56,7 +56,7 @@ fn version_one_database_migrates_and_keeps_its_new_replica_identity() {
         let storage = EncryptedStorage::open(&path, &key).unwrap();
         assert_eq!(
             storage.meta_value("schema_version").unwrap().as_deref(),
-            Some("3")
+            Some("4")
         );
         assert!(storage.load_operations().unwrap().is_empty());
         storage.replica_metadata().unwrap()
@@ -64,6 +64,48 @@ fn version_one_database_migrates_and_keeps_its_new_replica_identity() {
 
     let storage = EncryptedStorage::open(&path, &key).unwrap();
     assert_eq!(storage.replica_metadata().unwrap(), metadata);
+}
+
+#[test]
+fn future_schema_version_is_rejected_without_downgrade() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let path = temp_dir.path().join("future-schema.db");
+    let key_bytes = [23_u8; 32];
+    let key = StorageKey::from_bytes(key_bytes);
+    EncryptedStorage::open(&path, &key)
+        .unwrap()
+        .close()
+        .unwrap();
+
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute_batch(&format!(
+            "PRAGMA key = \"x'{}'\";
+             UPDATE storage_meta SET value = '999' WHERE key = 'schema_version';
+             PRAGMA user_version = 999;",
+            hex::encode(key_bytes)
+        ))
+        .unwrap();
+    connection.close().unwrap();
+
+    assert!(matches!(
+        EncryptedStorage::open(&path, &key),
+        Err(StorageError::IncompatibleSchema(message))
+            if message.contains("unsupported schema_version 999")
+    ));
+
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute_batch(&format!("PRAGMA key = \"x'{}'\";", hex::encode(key_bytes)))
+        .unwrap();
+    let version: String = connection
+        .query_row(
+            "SELECT value FROM storage_meta WHERE key = 'schema_version'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(version, "999");
 }
 
 #[test]

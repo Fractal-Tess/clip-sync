@@ -80,7 +80,7 @@ impl ExplicitSharePolicy {
         })
     }
 
-    fn validate(self) -> Result<(), ExplicitShareError> {
+    pub(crate) fn validate(self) -> Result<(), ExplicitShareError> {
         if self.automatic_capture_threshold_bytes == 0
             || self.mesh_quota_bytes == 0
             || self.maximum_explicit_share_bytes == 0

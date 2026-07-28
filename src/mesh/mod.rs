@@ -5,4 +5,5 @@ mod runtime;
 
 pub use runtime::{
     MeshChunkCommand, MeshError, MeshHandle, MeshRuntime, MeshRuntimeConfig, PersistBatch,
+    PersistResult,
 };

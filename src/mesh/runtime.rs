@@ -1,6 +1,6 @@
 use std::{
     cmp::Ordering,
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     hash::{Hash, Hasher},
     net::SocketAddr,
     sync::Arc,
@@ -19,8 +19,8 @@ use uuid::Uuid;
 
 use crate::{
     discovery::DiscoverySnapshot,
-    model::{NodeId, SeenOps, StampedOperation},
-    replication::{AntiEntropyState, BatchLimits, Codec, JsonV1Codec},
+    model::{NodeId, OpId, Operation, SeenOps, StampedOperation},
+    replication::{AntiEntropyState, BatchLimits, Codec, JsonV1Codec, OpLog},
     transfer::{TransferChunk, TransferId},
     transport::{Psk, authenticate_client, authenticate_server, mesh_endpoint},
 };
@@ -28,8 +28,8 @@ use crate::{
 use super::protocol::{
     ChunkStreamRequest, ChunkStreamResponse, IdentityHello, MAX_BATCH_OPERATIONS,
     MAX_CHUNK_CONTROL_BYTES, MAX_ENCRYPTED_CHUNK_BYTES, MAX_FRONTIER_BYTES, MAX_HOSTNAME_BYTES,
-    PROTOCOL_VERSION, ProtocolError, STREAM_KIND_CHUNK, STREAM_KIND_SYNC, SyncRequest,
-    SyncResponse, read_message, read_message_bounded, validate_batch, write_message,
+    MAX_MEMBERSHIP_BYTES, PROTOCOL_VERSION, ProtocolError, STREAM_KIND_CHUNK, STREAM_KIND_SYNC,
+    SyncRequest, SyncResponse, read_message, read_message_bounded, validate_batch, write_message,
 };
 
 const SERVER_NAME: &str = "clip-sync.mesh";
@@ -42,6 +42,7 @@ const MAX_CONCURRENT_CHUNK_STREAMS: usize = 4;
 const MAX_MISSING_CHUNKS_PER_ROUND: usize = 64;
 const CHUNK_BROKER_TIMEOUT: Duration = Duration::from_secs(30);
 const CLOSE_DUPLICATE: u32 = 0x201;
+const CLOSE_FORGOTTEN: u32 = 0x202;
 const CLOSE_SHUTDOWN: u32 = 0x203;
 
 /// Runtime tuning for one mesh member.
@@ -55,6 +56,11 @@ pub struct MeshRuntimeConfig {
     pub reconnect_max: Duration,
     pub batch_limits: BatchLimits,
     pub max_concurrent_chunk_streams: usize,
+    /// Durable seen summary, including operation IDs whose payload rows were
+    /// safely compacted.
+    pub initial_seen: SeenOps,
+    pub known_members: BTreeSet<NodeId>,
+    pub forgotten_devices: BTreeSet<NodeId>,
 }
 
 impl MeshRuntimeConfig {
@@ -72,6 +78,9 @@ impl MeshRuntimeConfig {
                 max_bytes: 4 * 1024 * 1024,
             },
             max_concurrent_chunk_streams: MAX_CONCURRENT_CHUNK_STREAMS,
+            initial_seen: SeenOps::default(),
+            known_members: BTreeSet::from([node_id]),
+            forgotten_devices: BTreeSet::new(),
         }
     }
 }
@@ -79,8 +88,11 @@ impl MeshRuntimeConfig {
 /// A batch which must become durable before the network peer is acknowledged.
 #[derive(Debug)]
 pub struct PersistBatch {
+    peer: NodeId,
+    peer_frontier: SeenOps,
+    known_members: BTreeSet<NodeId>,
     operations: Vec<Vec<u8>>,
-    reply: oneshot::Sender<Result<(), String>>,
+    reply: oneshot::Sender<Result<PersistResult, String>>,
 }
 
 /// Daemon-owned chunk-store work requested only by authenticated sessions.
@@ -109,12 +121,46 @@ type RuntimeSpawn = (
 
 impl PersistBatch {
     #[must_use]
+    pub const fn peer(&self) -> NodeId {
+        self.peer
+    }
+
+    #[must_use]
+    pub const fn peer_frontier(&self) -> &SeenOps {
+        &self.peer_frontier
+    }
+
+    #[must_use]
+    pub const fn known_members(&self) -> &BTreeSet<NodeId> {
+        &self.known_members
+    }
+
+    #[must_use]
     pub fn operations(&self) -> &[Vec<u8>] {
         &self.operations
     }
 
-    pub fn complete(self, result: Result<(), String>) {
+    pub fn complete(self, result: Result<PersistResult, String>) {
         let _ = self.reply.send(result);
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PersistResult {
+    compacted_operations: Vec<OpId>,
+}
+
+impl PersistResult {
+    #[must_use]
+    pub fn new(compacted_operations: Vec<OpId>) -> Self {
+        Self {
+            compacted_operations,
+        }
+    }
+
+    #[must_use]
+    pub fn compacted_operations(&self) -> &[OpId] {
+        &self.compacted_operations
     }
 }
 
@@ -124,6 +170,9 @@ pub struct MeshHandle {
     discovery: watch::Sender<Option<DiscoverySnapshot>>,
     revision: watch::Sender<u64>,
     state: Arc<RwLock<AntiEntropyState>>,
+    known_members: Arc<RwLock<BTreeSet<NodeId>>>,
+    forgotten_devices: Arc<RwLock<BTreeSet<NodeId>>>,
+    registry: Arc<Mutex<BTreeMap<NodeId, ActiveConnection>>>,
 }
 
 impl MeshHandle {
@@ -143,6 +192,13 @@ impl MeshHandle {
             .write()
             .await
             .record_local(operation, &JsonV1Codec)?;
+        self.known_members
+            .write()
+            .await
+            .insert(operation.id().node());
+        if let Operation::ForgetDevice { node_id } = operation.operation() {
+            self.forget_identity(*node_id).await;
+        }
         bump_revision(&self.revision);
         Ok(())
     }
@@ -155,6 +211,15 @@ impl MeshHandle {
     /// Wakes live authenticated sessions after transfer state changes.
     pub fn notify_transfers(&self) {
         bump_revision(&self.revision);
+    }
+
+    async fn forget_identity(&self, node_id: NodeId) {
+        self.forgotten_devices.write().await.insert(node_id);
+        if let Some(active) = self.registry.lock().await.remove(&node_id) {
+            active
+                .connection
+                .close(CLOSE_FORGOTTEN.into(), b"device identity forgotten");
+        }
     }
 }
 
@@ -217,12 +282,20 @@ impl MeshRuntime {
         transfers: bool,
     ) -> Result<RuntimeSpawn, MeshError> {
         validate_local_config(&config)?;
-        let mut state = AntiEntropyState::new();
+        let mut state = AntiEntropyState::restore(config.initial_seen.clone(), OpLog::default());
         for operation in persisted_operations {
             state.record_local(operation, &JsonV1Codec)?;
         }
 
         let state = Arc::new(RwLock::new(state));
+        let mut initial_members = config.known_members.clone();
+        initial_members.insert(config.node_id);
+        for operation in persisted_operations {
+            initial_members.insert(operation.id().node());
+        }
+        let known_members = Arc::new(RwLock::new(initial_members));
+        let forgotten_devices = Arc::new(RwLock::new(config.forgotten_devices.clone()));
+        let registry = Arc::new(Mutex::new(BTreeMap::new()));
         let (discovery, discovery_rx) = watch::channel(None);
         let (revision, _) = watch::channel(0_u64);
         let (persist_tx, persist_rx) = mpsc::channel(32);
@@ -236,6 +309,9 @@ impl MeshRuntime {
             discovery,
             revision: revision.clone(),
             state: state.clone(),
+            known_members: known_members.clone(),
+            forgotten_devices: forgotten_devices.clone(),
+            registry: registry.clone(),
         };
         let context = Arc::new(RuntimeContext {
             config,
@@ -244,7 +320,9 @@ impl MeshRuntime {
             revision,
             persist_tx,
             chunk_tx,
-            registry: Arc::new(Mutex::new(BTreeMap::new())),
+            registry,
+            known_members,
+            forgotten_devices,
         });
         let task = tokio::spawn(supervise(context, discovery_rx, shutdown));
         Ok((
@@ -278,6 +356,8 @@ struct RuntimeContext {
     persist_tx: mpsc::Sender<PersistBatch>,
     chunk_tx: Option<mpsc::Sender<MeshChunkCommand>>,
     registry: Arc<Mutex<BTreeMap<NodeId, ActiveConnection>>>,
+    known_members: Arc<RwLock<BTreeSet<NodeId>>>,
+    forgotten_devices: Arc<RwLock<BTreeSet<NodeId>>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -630,6 +710,37 @@ async fn run_connection(
         connection.close(CLOSE_DUPLICATE.into(), b"duplicate node identity");
         return Err(MeshError::DuplicateNodeIdentity(peer.node_id));
     }
+    if context
+        .forgotten_devices
+        .read()
+        .await
+        .contains(&peer.node_id)
+    {
+        connection.close(CLOSE_FORGOTTEN.into(), b"device identity forgotten");
+        return Err(MeshError::ForgottenNodeIdentity(peer.node_id));
+    }
+
+    persist_and_record(
+        &context,
+        peer.node_id,
+        peer.frontier.clone(),
+        peer.known_members.clone(),
+        Vec::new(),
+    )
+    .await?;
+
+    // A forget may become durable while this handshake is waiting on the
+    // daemon. Recheck before registering so that race cannot establish a
+    // session for the retired identity.
+    if context
+        .forgotten_devices
+        .read()
+        .await
+        .contains(&peer.node_id)
+    {
+        connection.close(CLOSE_FORGOTTEN.into(), b"device identity forgotten");
+        return Err(MeshError::ForgottenNodeIdentity(peer.node_id));
+    }
 
     let stable_id = connection.stable_id();
     if !register_connection(&context, peer.node_id, direction, &connection).await {
@@ -644,7 +755,7 @@ async fn run_connection(
         "authenticated mesh peer connected"
     );
     let peer_frontier = Arc::new(Mutex::new(peer.frontier));
-    let result = session_loop(&connection, &context, peer_frontier, shutdown).await;
+    let result = session_loop(&connection, &context, peer.node_id, peer_frontier, shutdown).await;
     remove_connection(&context, peer.node_id, stable_id).await;
     connection.close(CLOSE_SHUTDOWN.into(), b"mesh session ended");
     tracing::info!(peer_id = %peer.node_id, "mesh peer disconnected");
@@ -656,6 +767,7 @@ struct PeerIdentity {
     node_id: NodeId,
     hostname: String,
     frontier: SeenOps,
+    known_members: BTreeSet<NodeId>,
 }
 
 async fn exchange_identity(
@@ -685,11 +797,14 @@ async fn exchange_identity(
 
 async fn local_identity(context: &RuntimeContext) -> Result<IdentityHello, MeshError> {
     let frontier = encode_frontier(context.state.read().await.seen())?;
+    let members = context.known_members.read().await;
+    let known_members = encode_membership(&members)?;
     Ok(IdentityHello {
         protocol_version: PROTOCOL_VERSION,
         node_id: context.config.node_id.as_uuid().as_bytes().to_vec(),
         hostname: context.config.hostname.clone(),
         frontier,
+        known_members,
     })
 }
 
@@ -705,12 +820,19 @@ fn parse_identity(hello: IdentityHello) -> Result<PeerIdentity, MeshError> {
             hello.frontier.len(),
         )));
     }
+    if hello.known_members.len() > MAX_MEMBERSHIP_BYTES {
+        return Err(MeshError::Protocol(ProtocolError::MembershipTooLarge(
+            hello.known_members.len(),
+        )));
+    }
     let uuid = Uuid::from_slice(&hello.node_id).map_err(|_| MeshError::InvalidNodeId)?;
     let frontier = decode_frontier(&hello.frontier)?;
+    let known_members = decode_membership(&hello.known_members)?;
     Ok(PeerIdentity {
         node_id: NodeId::from_uuid(uuid),
         hostname: hello.hostname,
         frontier,
+        known_members,
     })
 }
 
@@ -761,12 +883,19 @@ fn preferred_direction(local: NodeId, peer: NodeId) -> Direction {
 async fn session_loop(
     connection: &Connection,
     context: &Arc<RuntimeContext>,
+    peer: NodeId,
     peer_frontier: Arc<Mutex<SeenOps>>,
     shutdown: CancellationToken,
 ) -> Result<(), MeshError> {
-    let inbound =
-        accept_session_streams(connection, context, peer_frontier.clone(), shutdown.clone());
-    let outbound = initiate_sync_streams(connection, context, peer_frontier, shutdown.clone());
+    let inbound = accept_session_streams(
+        connection,
+        context,
+        peer,
+        peer_frontier.clone(),
+        shutdown.clone(),
+    );
+    let outbound =
+        initiate_sync_streams(connection, context, peer, peer_frontier, shutdown.clone());
     let transfers = initiate_chunk_streams(connection, context, shutdown.clone());
     tokio::pin!(inbound);
     tokio::pin!(outbound);
@@ -784,6 +913,7 @@ async fn session_loop(
 async fn accept_session_streams(
     connection: &Connection,
     context: &Arc<RuntimeContext>,
+    peer: NodeId,
     peer_frontier: Arc<Mutex<SeenOps>>,
     shutdown: CancellationToken,
 ) -> Result<(), MeshError> {
@@ -794,7 +924,7 @@ async fn accept_session_streams(
         };
         timeout(
             EXCHANGE_TIMEOUT,
-            answer_session(streams, context, &peer_frontier),
+            answer_session(streams, context, peer, &peer_frontier),
         )
         .await
         .map_err(|_| MeshError::ExchangeTimeout)??;
@@ -804,12 +934,13 @@ async fn accept_session_streams(
 async fn answer_session(
     (mut send, mut recv): (quinn::SendStream, quinn::RecvStream),
     context: &RuntimeContext,
+    peer: NodeId,
     peer_frontier: &Mutex<SeenOps>,
 ) -> Result<(), MeshError> {
     let mut kind = [0_u8; 1];
     recv.read_exact(&mut kind).await?;
     match kind[0] {
-        STREAM_KIND_SYNC => answer_sync(&mut send, &mut recv, context, peer_frontier).await,
+        STREAM_KIND_SYNC => answer_sync(&mut send, &mut recv, context, peer, peer_frontier).await,
         STREAM_KIND_CHUNK => answer_chunk(&mut send, &mut recv, context).await,
         kind => Err(MeshError::UnknownStreamKind(kind)),
     }
@@ -819,23 +950,38 @@ async fn answer_sync(
     send: &mut quinn::SendStream,
     recv: &mut quinn::RecvStream,
     context: &RuntimeContext,
+    peer: NodeId,
     peer_frontier: &Mutex<SeenOps>,
 ) -> Result<(), MeshError> {
     let request: SyncRequest = read_message(recv).await?;
-    validate_batch(&request.frontier, &request.operations)?;
+    validate_batch(
+        &request.frontier,
+        &request.known_members,
+        &request.operations,
+    )?;
     tracing::debug!(
         received_operations = request.operations.len(),
         "answering mesh reconciliation request"
     );
     let advertised = decode_frontier(&request.frontier)?;
-    persist_and_record(context, request.operations).await?;
+    let known_members = decode_membership(&request.known_members)?;
+    persist_and_record(
+        context,
+        peer,
+        advertised.clone(),
+        known_members,
+        request.operations,
+    )
+    .await?;
     *peer_frontier.lock().await = advertised.clone();
 
-    let (frontier, operations, has_more) = batch_for_peer(context, &advertised).await?;
+    let (frontier, known_members, operations, has_more) =
+        batch_for_peer(context, &advertised).await?;
     let response = SyncResponse {
         frontier,
         operations,
         has_more,
+        known_members,
     };
     write_message(send, &response).await?;
     send.finish()?;
@@ -845,6 +991,7 @@ async fn answer_sync(
 async fn initiate_sync_streams(
     connection: &Connection,
     context: &Arc<RuntimeContext>,
+    peer: NodeId,
     peer_frontier: Arc<Mutex<SeenOps>>,
     shutdown: CancellationToken,
 ) -> Result<(), MeshError> {
@@ -866,7 +1013,7 @@ async fn initiate_sync_streams(
         for _ in 0..MAX_RECONCILE_ROUNDS {
             let more = timeout(
                 EXCHANGE_TIMEOUT,
-                initiate_sync(connection, context, &peer_frontier),
+                initiate_sync(connection, context, peer, &peer_frontier),
             )
             .await
             .map_err(|_| MeshError::ExchangeTimeout)??;
@@ -880,27 +1027,42 @@ async fn initiate_sync_streams(
 async fn initiate_sync(
     connection: &Connection,
     context: &RuntimeContext,
+    peer: NodeId,
     peer_frontier: &Mutex<SeenOps>,
 ) -> Result<bool, MeshError> {
     let advertised = peer_frontier.lock().await.clone();
-    let (frontier, operations, request_has_more) = batch_for_peer(context, &advertised).await?;
+    let (frontier, known_members, operations, request_has_more) =
+        batch_for_peer(context, &advertised).await?;
     let request = SyncRequest {
         frontier,
         operations,
         has_more: request_has_more,
+        known_members,
     };
     let (mut send, mut recv) = connection.open_bi().await?;
     send.write_all(&[STREAM_KIND_SYNC]).await?;
     write_message(&mut send, &request).await?;
     let response: SyncResponse = read_message(&mut recv).await?;
-    validate_batch(&response.frontier, &response.operations)?;
+    validate_batch(
+        &response.frontier,
+        &response.known_members,
+        &response.operations,
+    )?;
     tracing::debug!(
         pushed_operations = request.operations.len(),
         received_operations = response.operations.len(),
         "completed mesh reconciliation exchange"
     );
     let response_frontier = decode_frontier(&response.frontier)?;
-    persist_and_record(context, response.operations).await?;
+    let known_members = decode_membership(&response.known_members)?;
+    persist_and_record(
+        context,
+        peer,
+        response_frontier.clone(),
+        known_members,
+        response.operations,
+    )
+    .await?;
     *peer_frontier.lock().await = response_frontier;
     send.finish()?;
     Ok(request_has_more || response.has_more)
@@ -1040,49 +1202,84 @@ async fn answer_chunk(
 async fn batch_for_peer(
     context: &RuntimeContext,
     peer_frontier: &SeenOps,
-) -> Result<(Vec<u8>, Vec<Vec<u8>>, bool), MeshError> {
+) -> Result<(Vec<u8>, Vec<u8>, Vec<Vec<u8>>, bool), MeshError> {
     let state = context.state.read().await;
     let batch = state.compute_batch(peer_frontier, &context.config.batch_limits);
     let frontier = encode_frontier(state.seen())?;
-    Ok((frontier, batch.entries().to_vec(), batch.has_more()))
+    let members = context.known_members.read().await;
+    let known_members = encode_membership(&members)?;
+    Ok((
+        frontier,
+        known_members,
+        batch.entries().to_vec(),
+        batch.has_more(),
+    ))
 }
 
 async fn persist_and_record(
     context: &RuntimeContext,
+    peer: NodeId,
+    peer_frontier: SeenOps,
+    known_members: BTreeSet<NodeId>,
     operations: Vec<Vec<u8>>,
 ) -> Result<(), MeshError> {
-    if operations.is_empty() {
-        return Ok(());
-    }
     let codec = JsonV1Codec;
-    let operations = operations
+    let decoded = operations
         .into_iter()
         .map(|operation| {
             let decoded = codec.decode_op(&operation)?;
-            codec.encode_op(&decoded).map_err(Into::into)
+            let canonical = codec.encode_op(&decoded)?;
+            Ok((canonical, decoded))
         })
         .collect::<Result<Vec<_>, MeshError>>()?;
+    let operations = decoded
+        .iter()
+        .map(|(operation, _)| operation.clone())
+        .collect::<Vec<_>>();
 
     let (reply, completed) = oneshot::channel();
     context
         .persist_tx
         .send(PersistBatch {
+            peer,
+            peer_frontier,
+            known_members: known_members.clone(),
             operations: operations.clone(),
             reply,
         })
         .await
         .map_err(|_| MeshError::PersistenceUnavailable)?;
-    timeout(PERSIST_TIMEOUT, completed)
+    let persisted = timeout(PERSIST_TIMEOUT, completed)
         .await
         .map_err(|_| MeshError::PersistenceTimeout)?
         .map_err(|_| MeshError::PersistenceUnavailable)?
         .map_err(MeshError::PersistenceRejected)?;
 
     let mut state = context.state.write().await;
-    for operation in operations {
-        state.ingest_raw(&operation, &JsonV1Codec)?;
+    for operation in &operations {
+        state.ingest_raw(operation, &JsonV1Codec)?;
     }
+    state.compact_log(persisted.compacted_operations());
     drop(state);
+
+    let mut members = context.known_members.write().await;
+    members.insert(peer);
+    members.extend(known_members);
+    for (_, operation) in &decoded {
+        members.insert(operation.id().node());
+    }
+    drop(members);
+
+    for (_, operation) in decoded {
+        if let Operation::ForgetDevice { node_id } = operation.operation() {
+            context.forgotten_devices.write().await.insert(*node_id);
+            if let Some(active) = context.registry.lock().await.remove(node_id) {
+                active
+                    .connection
+                    .close(CLOSE_FORGOTTEN.into(), b"device identity forgotten");
+            }
+        }
+    }
     bump_revision(&context.revision);
     Ok(())
 }
@@ -1201,6 +1398,25 @@ fn decode_frontier(encoded: &[u8]) -> Result<SeenOps, MeshError> {
     serde_json::from_slice(encoded).map_err(MeshError::Frontier)
 }
 
+fn encode_membership(members: &BTreeSet<NodeId>) -> Result<Vec<u8>, MeshError> {
+    let encoded = serde_json::to_vec(members)?;
+    if encoded.len() > MAX_MEMBERSHIP_BYTES {
+        return Err(MeshError::Protocol(ProtocolError::MembershipTooLarge(
+            encoded.len(),
+        )));
+    }
+    Ok(encoded)
+}
+
+fn decode_membership(encoded: &[u8]) -> Result<BTreeSet<NodeId>, MeshError> {
+    if encoded.len() > MAX_MEMBERSHIP_BYTES {
+        return Err(MeshError::Protocol(ProtocolError::MembershipTooLarge(
+            encoded.len(),
+        )));
+    }
+    serde_json::from_slice(encoded).map_err(MeshError::Membership)
+}
+
 fn bump_revision(revision: &watch::Sender<u64>) {
     revision.send_modify(|value| *value = value.wrapping_add(1));
 }
@@ -1267,6 +1483,8 @@ pub enum MeshError {
     UnsupportedProtocol(u32),
     #[error("peer duplicated the local active node identity {0}")]
     DuplicateNodeIdentity(NodeId),
+    #[error("forgotten peer node identity {0} was rejected")]
+    ForgottenNodeIdentity(NodeId),
     #[error("peer {0} already has a canonical active connection")]
     DuplicateConnection(NodeId),
     #[error("identity handshake timed out")]
@@ -1297,6 +1515,8 @@ pub enum MeshError {
     Frontier(serde_json::Error),
     #[error("frontier serialization failed: {0}")]
     FrontierSerialization(#[from] serde_json::Error),
+    #[error("membership advertisement is malformed: {0}")]
+    Membership(serde_json::Error),
     #[error(transparent)]
     Protocol(#[from] ProtocolError),
     #[error(transparent)]
@@ -1311,4 +1531,41 @@ pub enum MeshError {
     StreamWrite(#[from] quinn::WriteError),
     #[error("could not read a QUIC stream: {0}")]
     StreamRead(#[from] quinn::ReadExactError),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hello(version: u32) -> IdentityHello {
+        IdentityHello {
+            protocol_version: version,
+            node_id: Uuid::from_u128(7).as_bytes().to_vec(),
+            hostname: "node".to_owned(),
+            frontier: serde_json::to_vec(&SeenOps::default()).unwrap(),
+            known_members: serde_json::to_vec(&BTreeSet::<NodeId>::new()).unwrap(),
+        }
+    }
+
+    #[test]
+    fn rolling_protocol_version_mismatch_is_rejected_before_session_state() {
+        assert!(matches!(
+            parse_identity(hello(PROTOCOL_VERSION - 1)),
+            Err(MeshError::UnsupportedProtocol(version)) if version == PROTOCOL_VERSION - 1
+        ));
+        assert!(matches!(
+            parse_identity(hello(PROTOCOL_VERSION + 1)),
+            Err(MeshError::UnsupportedProtocol(version)) if version == PROTOCOL_VERSION + 1
+        ));
+    }
+
+    #[test]
+    fn malformed_membership_advertisement_is_rejected() {
+        let mut malformed = hello(PROTOCOL_VERSION);
+        malformed.known_members = b"not-json".to_vec();
+        assert!(matches!(
+            parse_identity(malformed),
+            Err(MeshError::Membership(_))
+        ));
+    }
 }

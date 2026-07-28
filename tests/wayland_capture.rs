@@ -124,6 +124,16 @@ async fn setting_clipboard_without_watch_reports_not_running() {
     assert!(matches!(error, BackendError::WatchNotRunning));
 }
 
+#[test]
+fn replicated_capture_threshold_applies_without_restarting_backend() {
+    let backend = WaylandBackend::new();
+    assert_eq!(backend.capture_threshold(), MAX_CAPTURE_BYTES);
+    backend.set_capture_threshold(1_234).unwrap();
+    assert_eq!(backend.capture_threshold(), 1_234);
+    assert!(backend.set_capture_threshold(0).is_err());
+    assert_eq!(backend.capture_threshold(), 1_234);
+}
+
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "manual: requires a live Wayland compositor with data-control permission and mutates the clipboard"]
 async fn live_wayland_owned_set_emits_at_most_one_own_event() {

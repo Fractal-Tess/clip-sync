@@ -1,6 +1,6 @@
-use std::fmt::Write as _;
 use std::fs::{self, OpenOptions};
 use std::path::Path;
+use std::{collections::BTreeSet, fmt::Write as _};
 
 use hkdf::Hkdf;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior};
@@ -19,8 +19,9 @@ use crate::{
     transfer::TransferId,
 };
 
-const SCHEMA_VERSION: u32 = 3;
+const SCHEMA_VERSION: u32 = 4;
 const OPERATION_ENCODING_VERSION: i64 = 1;
+const COMPACTED_SEEN_ENCODING_VERSION: i64 = 1;
 const SQLCIPHER_KEY_BYTES: usize = 32;
 const SQLCIPHER_KEY_HEX_CHARS: usize = SQLCIPHER_KEY_BYTES * 2;
 const MAX_SQLITE_INTEGER: u64 = i64::MAX as u64;
@@ -72,6 +73,21 @@ const MIGRATION_3: &str = "
     ) STRICT, WITHOUT ROWID;
     UPDATE storage_meta SET value = '3' WHERE key = 'schema_version';
     PRAGMA user_version = 3;
+    COMMIT;
+";
+
+const MIGRATION_4: &str = "
+    BEGIN IMMEDIATE;
+    CREATE TABLE known_members (
+        node_id BLOB PRIMARY KEY NOT NULL CHECK (length(node_id) = 16)
+    ) STRICT, WITHOUT ROWID;
+    CREATE TABLE compacted_seen (
+        singleton INTEGER PRIMARY KEY NOT NULL CHECK (singleton = 1),
+        encoding_version INTEGER NOT NULL CHECK (encoding_version = 1),
+        payload BLOB NOT NULL
+    ) STRICT;
+    UPDATE storage_meta SET value = '4' WHERE key = 'schema_version';
+    PRAGMA user_version = 4;
     COMMIT;
 ";
 
@@ -156,6 +172,12 @@ pub enum StorageError {
 
     #[error("stored acknowledgement is invalid: {0}")]
     AcknowledgementDeserialization(#[source] serde_json::Error),
+
+    #[error("compacted seen summary serialization failed: {0}")]
+    CompactedSeenSerialization(#[source] serde_json::Error),
+
+    #[error("stored compacted seen summary is invalid: {0}")]
+    CompactedSeenDeserialization(#[source] serde_json::Error),
 
     #[error(transparent)]
     Projection(#[from] ProjectionError),
@@ -317,6 +339,52 @@ impl EncryptedStorage {
         self.replica_metadata()
     }
 
+    /// Resets this database to a new, empty replica identity.
+    ///
+    /// This is recovery after a device was forgotten, not mesh-key
+    /// revocation. The encrypted operation history and acknowledgement state
+    /// are cleared so the new identity can join and reconcile as a fresh
+    /// member without replaying operations attributed to the forgotten ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error without changing storage if the reset transaction
+    /// cannot commit.
+    pub fn reset_replica_identity(&mut self) -> Result<NodeId> {
+        let previous = read_replica_metadata(&self.connection)?;
+        let replacement = NodeId::new();
+        let replacement_bytes = *replacement.as_uuid().as_bytes();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute("DELETE FROM operations", [])?;
+        transaction.execute("DELETE FROM peer_acknowledgements", [])?;
+        transaction.execute("DELETE FROM known_members", [])?;
+        transaction.execute("DELETE FROM compacted_seen", [])?;
+        let physical = sqlite_integer(
+            "last_hlc.physical_millis",
+            previous.last_hlc.physical_millis(),
+        )?;
+        let logical = i64::from(previous.last_hlc.logical());
+        let changed = transaction.execute(
+            "UPDATE local_replica
+             SET node_id = ?1,
+                 next_operation_counter = 1,
+                 last_hlc_physical_millis = ?2,
+                 last_hlc_logical = ?3
+             WHERE singleton = 1",
+            (&replacement_bytes[..], physical, logical),
+        )?;
+        if changed != 1 {
+            return Err(StorageError::CorruptReplicaMetadata(
+                "singleton row disappeared during identity reset".to_owned(),
+            ));
+        }
+        record_known_member(&transaction, replacement)?;
+        transaction.commit()?;
+        Ok(replacement)
+    }
+
     /// Appends an immutable operation transactionally.
     ///
     /// An exact serialized replay is idempotent. Reusing an operation ID with
@@ -351,6 +419,7 @@ impl EncryptedStorage {
         operations: &[StampedOperation],
         observed_hlc: HlcTimestamp,
     ) -> Result<usize> {
+        let compacted_seen = self.load_compacted_seen()?.unwrap_or_default();
         let serialized = operations
             .iter()
             .map(serialize_operation)
@@ -361,7 +430,7 @@ impl EncryptedStorage {
         let metadata = read_replica_metadata(&transaction)?;
         let mut inserted = 0;
         for (operation, bytes) in operations.iter().zip(&serialized) {
-            if insert_serialized_operation(&transaction, operation, bytes)?
+            if insert_remote_operation(&transaction, operation, bytes, &compacted_seen)?
                 == AppendOutcome::Inserted
             {
                 if operation.id().node() == metadata.node_id {
@@ -397,6 +466,79 @@ impl EncryptedStorage {
             }
         }
 
+        transaction.commit()?;
+        Ok(inserted)
+    }
+
+    /// Atomically appends an authenticated peer batch, advances the observed
+    /// HLC, records the peer's monotonic acknowledgement frontier, and unions
+    /// its membership advertisement.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid operations/frontiers, identity conflicts,
+    /// serialization failures, or database failures. No part commits alone.
+    pub fn append_authenticated_peer_batch(
+        &mut self,
+        peer: NodeId,
+        peer_frontier: &SeenOps,
+        known_members: &BTreeSet<NodeId>,
+        operations: &[StampedOperation],
+        observed_hlc: HlcTimestamp,
+    ) -> Result<usize> {
+        let compacted_seen = self.load_compacted_seen()?.unwrap_or_default();
+        let serialized = operations
+            .iter()
+            .map(serialize_operation)
+            .collect::<Result<Vec<_>>>()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let metadata = read_replica_metadata(&transaction)?;
+        let mut inserted = 0;
+        for (operation, bytes) in operations.iter().zip(&serialized) {
+            if insert_remote_operation(&transaction, operation, bytes, &compacted_seen)?
+                == AppendOutcome::Inserted
+            {
+                if operation.id().node() == metadata.node_id {
+                    return Err(StorageError::RemoteOperationClaimsLocalIdentity(
+                        metadata.node_id,
+                    ));
+                }
+                inserted += 1;
+            }
+        }
+
+        if observed_hlc < metadata.last_hlc {
+            return Err(StorageError::HlcRegression {
+                operation: observed_hlc,
+                last: metadata.last_hlc,
+            });
+        }
+        if observed_hlc > metadata.last_hlc {
+            let physical =
+                sqlite_integer("last_hlc.physical_millis", observed_hlc.physical_millis())?;
+            let logical = i64::from(observed_hlc.logical());
+            let changed = transaction.execute(
+                "UPDATE local_replica
+                 SET last_hlc_physical_millis = ?1,
+                     last_hlc_logical = ?2
+                 WHERE singleton = 1",
+                (physical, logical),
+            )?;
+            if changed != 1 {
+                return Err(StorageError::CorruptReplicaMetadata(
+                    "singleton row disappeared during transaction".to_owned(),
+                ));
+            }
+        }
+
+        record_acknowledgement(&transaction, peer, peer_frontier)?;
+        record_known_member(&transaction, metadata.node_id)?;
+        record_known_member(&transaction, peer)?;
+        for member in known_members {
+            record_known_member(&transaction, *member)?;
+        }
         transaction.commit()?;
         Ok(inserted)
     }
@@ -583,8 +725,10 @@ impl EncryptedStorage {
     /// Returns an error for invalid persisted operations or model validation.
     pub fn rebuild_projection(&self) -> Result<Projection> {
         let operations = self.load_operations()?;
+        let compacted_seen = self.load_compacted_seen()?.unwrap_or_default();
         let mut projection = Projection::default();
         projection.apply_all(&operations)?;
+        projection.merge_compacted_seen(&compacted_seen);
         Ok(projection)
     }
 
@@ -597,8 +741,10 @@ impl EncryptedStorage {
     /// or a database failure while repairing an older database's persisted HLC.
     pub fn load_replica(&mut self) -> Result<Replica> {
         let operations = self.load_operations()?;
+        let compacted_seen = self.load_compacted_seen()?.unwrap_or_default();
         let mut projection = Projection::default();
         projection.apply_all(&operations)?;
+        projection.merge_compacted_seen(&compacted_seen);
         let mut metadata = self.replica_metadata()?;
         let last_counter = metadata
             .next_operation_counter
@@ -633,28 +779,42 @@ impl EncryptedStorage {
         ))
     }
 
+    fn load_compacted_seen(&self) -> Result<Option<SeenOps>> {
+        let row = self
+            .connection
+            .query_row(
+                "SELECT encoding_version, payload
+                 FROM compacted_seen WHERE singleton = 1",
+                [],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?)),
+            )
+            .optional()?;
+        let Some((encoding_version, payload)) = row else {
+            return Ok(None);
+        };
+        if encoding_version != COMPACTED_SEEN_ENCODING_VERSION {
+            return Err(StorageError::IncompatibleSchema(format!(
+                "unsupported compacted seen encoding {encoding_version}"
+            )));
+        }
+        let payload = Zeroizing::new(payload);
+        serde_json::from_slice(payload.as_slice())
+            .map(Some)
+            .map_err(StorageError::CompactedSeenDeserialization)
+    }
+
     /// Monotonically records the anti-entropy frontier acknowledged by a peer.
     ///
     /// # Errors
     ///
     /// Returns an error for malformed existing data, serialization, or SQL.
     pub fn record_peer_acknowledgement(&mut self, peer: NodeId, seen: &SeenOps) -> Result<()> {
-        let mut acknowledgements = self.acknowledgements()?;
-        acknowledgements.record(peer, seen);
-        let merged = acknowledgements.peer(peer).ok_or_else(|| {
-            StorageError::CorruptReplicaMetadata(
-                "peer acknowledgement disappeared during merge".to_owned(),
-            )
-        })?;
-        let encoded =
-            serde_json::to_vec(merged).map_err(StorageError::AcknowledgementSerialization)?;
-        let peer_bytes = *peer.as_uuid().as_bytes();
-        self.connection.execute(
-            "INSERT INTO peer_acknowledgements (peer_node, frontier)
-             VALUES (?1, ?2)
-             ON CONFLICT(peer_node) DO UPDATE SET frontier = excluded.frontier",
-            (&peer_bytes[..], encoded),
-        )?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        record_acknowledgement(&transaction, peer, seen)?;
+        record_known_member(&transaction, peer)?;
+        transaction.commit()?;
         Ok(())
     }
 
@@ -683,7 +843,84 @@ impl EncryptedStorage {
                 .map_err(StorageError::AcknowledgementDeserialization)?;
             acknowledgements.record(peer, &seen);
         }
+        drop(rows);
+        drop(statement);
+
+        let mut statement = self
+            .connection
+            .prepare("SELECT node_id FROM known_members ORDER BY node_id")?;
+        let members = statement.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
+        for member in members {
+            let member = member?;
+            let member = Uuid::from_slice(&member)
+                .map(NodeId::from_uuid)
+                .map_err(|_| {
+                    StorageError::CorruptReplicaMetadata("known member ID is not a UUID".to_owned())
+                })?;
+            acknowledgements.record_known(member);
+        }
         Ok(acknowledgements)
+    }
+
+    /// Persists the compacted-operation seen summary, deletes every operation
+    /// whose content record was compacted, and drops acknowledgements
+    /// belonging to stably forgotten members in one transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error without changing storage if snapshot encoding,
+    /// operation decoding, or any database mutation fails.
+    pub fn compact_tombstones(
+        &mut self,
+        projection: &Projection,
+        content_ids: &BTreeSet<ContentId>,
+        forgotten_members: &BTreeSet<NodeId>,
+    ) -> Result<Vec<OpId>> {
+        if content_ids.is_empty() && forgotten_members.is_empty() {
+            return Ok(Vec::new());
+        }
+        let snapshot = serde_json::to_vec(projection.seen_ops())
+            .map_err(StorageError::CompactedSeenSerialization)?;
+        let operations = self.load_operations()?;
+        let compacted = operations
+            .iter()
+            .filter(|operation| {
+                operation
+                    .operation()
+                    .content_id()
+                    .is_some_and(|content_id| content_ids.contains(&content_id))
+            })
+            .map(StampedOperation::id)
+            .collect::<Vec<_>>();
+
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute(
+            "INSERT INTO compacted_seen (singleton, encoding_version, payload)
+             VALUES (1, ?1, ?2)
+             ON CONFLICT(singleton) DO UPDATE SET
+                 encoding_version = excluded.encoding_version,
+                 payload = excluded.payload",
+            (COMPACTED_SEEN_ENCODING_VERSION, snapshot),
+        )?;
+        for operation in &compacted {
+            let node = *operation.node().as_uuid().as_bytes();
+            let counter = sqlite_integer("operation counter", operation.counter())?;
+            transaction.execute(
+                "DELETE FROM operations WHERE origin_node = ?1 AND counter = ?2",
+                (&node[..], counter),
+            )?;
+        }
+        for member in forgotten_members {
+            let node = *member.as_uuid().as_bytes();
+            transaction.execute(
+                "DELETE FROM peer_acknowledgements WHERE peer_node = ?1",
+                [&node[..]],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(compacted)
     }
 
     /// Sets a metadata value. This compatibility API is retained for the
@@ -749,6 +986,37 @@ pub struct HistoryStore {
     replica: Replica,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CompactionReport {
+    compacted_tombstones: Vec<ContentId>,
+    compacted_operations: Vec<OpId>,
+    removed_acknowledgements: Vec<NodeId>,
+}
+
+impl CompactionReport {
+    #[must_use]
+    pub fn tombstones(&self) -> &[ContentId] {
+        &self.compacted_tombstones
+    }
+
+    #[must_use]
+    pub fn operations(&self) -> &[OpId] {
+        &self.compacted_operations
+    }
+
+    #[must_use]
+    pub fn removed_acknowledgements(&self) -> &[NodeId] {
+        &self.removed_acknowledgements
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.compacted_tombstones.is_empty()
+            && self.compacted_operations.is_empty()
+            && self.removed_acknowledgements.is_empty()
+    }
+}
+
 impl HistoryStore {
     /// Opens storage and reconstructs the replica from the operation log.
     ///
@@ -787,6 +1055,22 @@ impl HistoryStore {
     #[must_use]
     pub fn into_storage(self) -> EncryptedStorage {
         self.storage
+    }
+
+    /// Resets the local replica as a new empty device identity.
+    ///
+    /// This maintenance action does not rotate or revoke the shared mesh key.
+    /// It is the supported way for a forgotten machine to join again.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error without changing live state when the encrypted reset
+    /// transaction fails.
+    pub fn reset_identity(&mut self) -> std::result::Result<NodeId, HistoryError> {
+        let last_hlc = self.replica.last_timestamp();
+        let node_id = self.storage.reset_replica_identity()?;
+        self.replica = Replica::restore(node_id, 0, last_hlc, Projection::default());
+        Ok(node_id)
     }
 
     /// Adds locally captured payload or touches an exact visible duplicate.
@@ -1098,6 +1382,57 @@ impl HistoryStore {
         Ok(outcomes)
     }
 
+    /// Ingests operations and the frontier/membership advertisement from the
+    /// authenticated session peer in one durable transaction.
+    ///
+    /// New operations authored by an already-forgotten identity are rejected;
+    /// forwarding operations from other active members remains allowed.
+    ///
+    /// # Errors
+    ///
+    /// Returns a model, identity, serialization, or storage error without
+    /// changing live state or acknowledgement metadata.
+    pub fn ingest_authenticated_batch(
+        &mut self,
+        peer: NodeId,
+        peer_frontier: &SeenOps,
+        known_members: &BTreeSet<NodeId>,
+        operations: &[StampedOperation],
+        now_millis: u64,
+    ) -> std::result::Result<Vec<ApplyOutcome>, HistoryError> {
+        for operation in operations {
+            if self
+                .replica
+                .projection()
+                .is_device_forgotten(operation.id().node())
+                && !self
+                    .replica
+                    .projection()
+                    .seen_ops()
+                    .contains(operation.id())
+            {
+                return Err(HistoryError::ForgottenOperationOrigin(
+                    operation.id().node(),
+                ));
+            }
+        }
+
+        let mut next = self.replica.clone();
+        let outcomes = operations
+            .iter()
+            .map(|operation| next.ingest(operation, now_millis))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        self.storage.append_authenticated_peer_batch(
+            peer,
+            peer_frontier,
+            known_members,
+            operations,
+            next.last_timestamp(),
+        )?;
+        self.replica = next;
+        Ok(outcomes)
+    }
+
     /// Monotonically persists a peer's anti-entropy acknowledgement.
     ///
     /// # Errors
@@ -1119,6 +1454,61 @@ impl HistoryStore {
     /// Returns deserialization, corruption, or database errors.
     pub fn acknowledgements(&self) -> std::result::Result<Acknowledgements, HistoryError> {
         self.storage.acknowledgements().map_err(Into::into)
+    }
+
+    /// Compacts only currently-deleted content whose tombstone is covered by
+    /// every active known member's durable acknowledgement. The compacted seen
+    /// summary, operation deletion, and forgotten-peer acknowledgement cleanup
+    /// commit atomically.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error without changing live state when acknowledgement
+    /// loading, seen-summary serialization, or storage mutation fails.
+    pub fn compact_acknowledged_tombstones(
+        &mut self,
+    ) -> std::result::Result<CompactionReport, HistoryError> {
+        let acknowledgements = self.storage.acknowledgements()?;
+        let local = self.replica.node_id();
+        let compacted_tombstones = self
+            .replica
+            .projection()
+            .collectable_tombstones(local, &acknowledgements)
+            .into_iter()
+            .map(crate::model::TombstoneView::content_id)
+            .collect::<Vec<_>>();
+        let content_ids = compacted_tombstones
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let forgotten_members = self
+            .replica
+            .projection()
+            .stably_forgotten_devices(local, &acknowledgements)
+            .into_iter()
+            .filter(|member| acknowledgements.peer(*member).is_some())
+            .collect::<BTreeSet<_>>();
+
+        if content_ids.is_empty() && forgotten_members.is_empty() {
+            return Ok(CompactionReport::default());
+        }
+
+        let mut projection = self.replica.projection().clone();
+        projection.remove_compacted_tombstones(&content_ids);
+        let compacted_operations =
+            self.storage
+                .compact_tombstones(&projection, &content_ids, &forgotten_members)?;
+        self.replica = Replica::restore(
+            self.replica.node_id(),
+            self.replica.last_counter(),
+            self.replica.last_timestamp(),
+            projection,
+        );
+        Ok(CompactionReport {
+            compacted_tombstones,
+            compacted_operations,
+            removed_acknowledgements: forgotten_members.into_iter().collect(),
+        })
     }
 
     fn commit_one(
@@ -1148,6 +1538,8 @@ impl HistoryStore {
 pub enum HistoryError {
     #[error("content ID is invalid: {0}")]
     InvalidContentId(String),
+    #[error("new operation from forgotten device identity {0} was rejected")]
+    ForgottenOperationOrigin(NodeId),
     #[error(transparent)]
     Replica(#[from] ReplicaError),
     #[error(transparent)]
@@ -1218,6 +1610,76 @@ fn insert_serialized_operation(
     }
 }
 
+fn insert_remote_operation(
+    transaction: &Transaction<'_>,
+    operation: &StampedOperation,
+    serialized: &[u8],
+    compacted_seen: &SeenOps,
+) -> Result<AppendOutcome> {
+    if !compacted_seen.contains(operation.id()) {
+        return insert_serialized_operation(transaction, operation, serialized);
+    }
+
+    let node_bytes = *operation.id().node().as_uuid().as_bytes();
+    let counter = sqlite_integer("operation counter", operation.id().counter())?;
+    let existing = transaction
+        .query_row(
+            "SELECT payload FROM operations WHERE origin_node = ?1 AND counter = ?2",
+            (&node_bytes[..], counter),
+            |row| row.get::<_, Vec<u8>>(0),
+        )
+        .optional()?;
+    let Some(existing) = existing else {
+        return Ok(AppendOutcome::AlreadyPresent);
+    };
+    let existing = Zeroizing::new(existing);
+    if existing.as_slice() == serialized {
+        Ok(AppendOutcome::AlreadyPresent)
+    } else {
+        Err(StorageError::OperationConflict(operation.id()))
+    }
+}
+
+fn record_acknowledgement(
+    transaction: &Transaction<'_>,
+    peer: NodeId,
+    seen: &SeenOps,
+) -> Result<()> {
+    let peer_bytes = *peer.as_uuid().as_bytes();
+    let existing = transaction
+        .query_row(
+            "SELECT frontier FROM peer_acknowledgements WHERE peer_node = ?1",
+            [&peer_bytes[..]],
+            |row| row.get::<_, Vec<u8>>(0),
+        )
+        .optional()?;
+    let mut merged = match existing {
+        Some(encoded) => serde_json::from_slice(&encoded)
+            .map_err(StorageError::AcknowledgementDeserialization)?,
+        None => SeenOps::default(),
+    };
+    merged.merge(seen);
+    let encoded =
+        serde_json::to_vec(&merged).map_err(StorageError::AcknowledgementSerialization)?;
+    transaction.execute(
+        "INSERT INTO peer_acknowledgements (peer_node, frontier)
+         VALUES (?1, ?2)
+         ON CONFLICT(peer_node) DO UPDATE SET frontier = excluded.frontier",
+        (&peer_bytes[..], encoded),
+    )?;
+    Ok(())
+}
+
+fn record_known_member(transaction: &Transaction<'_>, member: NodeId) -> Result<()> {
+    let node = *member.as_uuid().as_bytes();
+    transaction.execute(
+        "INSERT INTO known_members (node_id) VALUES (?1)
+         ON CONFLICT(node_id) DO NOTHING",
+        [&node[..]],
+    )?;
+    Ok(())
+}
+
 fn validate_operation_row(
     operation: &StampedOperation,
     origin_node: &[u8],
@@ -1263,7 +1725,14 @@ fn ensure_local_replica(connection: &Connection) -> Result<()> {
          ON CONFLICT(singleton) DO NOTHING",
         [&node_bytes[..]],
     )?;
-    read_replica_metadata(connection).map(|_| ())
+    let metadata = read_replica_metadata(connection)?;
+    let node = *metadata.node_id.as_uuid().as_bytes();
+    connection.execute(
+        "INSERT INTO known_members (node_id) VALUES (?1)
+         ON CONFLICT(node_id) DO NOTHING",
+        [&node[..]],
+    )?;
+    Ok(())
 }
 
 fn read_replica_metadata(connection: &Connection) -> Result<ReplicaMetadata> {
@@ -1507,6 +1976,9 @@ fn apply_migrations(connection: &Connection, current_version: u32) -> Result<()>
     if current_version < 3 {
         connection.execute_batch(MIGRATION_3)?;
     }
+    if current_version < 4 {
+        connection.execute_batch(MIGRATION_4)?;
+    }
     Ok(())
 }
 
@@ -1518,7 +1990,13 @@ fn verify_current_schema(connection: &Connection) -> Result<()> {
         )));
     }
 
-    for table in ["operations", "local_replica", "peer_acknowledgements"] {
+    for table in [
+        "operations",
+        "local_replica",
+        "peer_acknowledgements",
+        "known_members",
+        "compacted_seen",
+    ] {
         let exists = connection.query_row(
             "SELECT EXISTS(
                  SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1
