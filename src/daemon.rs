@@ -210,24 +210,19 @@ async fn handle_daemon_command(
             let result = update_history_item(
                 &content_id,
                 HistoryMutation::SetPinned(pinned),
-                replica,
-                storage,
+                history,
                 state,
+                mesh,
             )
             .await
             .map_err(|error| error.to_string());
             let _ = reply.send(result);
         }
         DaemonCommand::Delete { content_id, reply } => {
-            let result = update_history_item(
-                &content_id,
-                HistoryMutation::Delete,
-                replica,
-                storage,
-                state,
-            )
-            .await
-            .map_err(|error| error.to_string());
+            let result =
+                update_history_item(&content_id, HistoryMutation::Delete, history, state, mesh)
+                    .await
+                    .map_err(|error| error.to_string());
             let _ = reply.send(result);
         }
     }
@@ -242,27 +237,26 @@ enum HistoryMutation {
 async fn update_history_item(
     encoded_content_id: &str,
     mutation: HistoryMutation,
-    replica: &mut Replica,
-    storage: &mut EncryptedStorage,
+    history: &mut HistoryStore,
     state: &DaemonState,
+    mesh: &MeshHandle,
 ) -> anyhow::Result<()> {
-    let content_id = encoded_content_id
-        .parse()
-        .context("content ID is invalid")?;
-    let mut next = replica.clone();
+    let now_millis = unix_time_millis()?;
     let operation = match mutation {
-        HistoryMutation::SetPinned(pinned) => next
-            .set_pinned(content_id, pinned, unix_time_millis()?)
-            .context("author clipboard history pin update")?,
-        HistoryMutation::Delete => next
-            .delete(content_id, unix_time_millis()?)
-            .context("author clipboard history deletion")?,
+        HistoryMutation::SetPinned(true) => history
+            .pin_by_id(encoded_content_id, now_millis)
+            .context("persist clipboard history pin")?,
+        HistoryMutation::SetPinned(false) => history
+            .unpin_by_id(encoded_content_id, now_millis)
+            .context("persist clipboard history unpin")?,
+        HistoryMutation::Delete => history
+            .delete_by_id(encoded_content_id, now_millis)
+            .context("persist clipboard history deletion")?,
     };
-    storage
-        .append_local_operation(&operation)
-        .context("persist clipboard history update")?;
-    *replica = next;
-    state.set_history(history_items(replica)).await;
+    mesh.record_local(&operation)
+        .await
+        .context("publish clipboard history update to mesh")?;
+    state.set_history(history_items(history.replica())).await;
     Ok(())
 }
 
