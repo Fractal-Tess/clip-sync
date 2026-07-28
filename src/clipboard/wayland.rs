@@ -133,7 +133,7 @@ impl ClipboardBackend for WaylandBackend {
 
         let (done_tx, done_rx) = oneshot::channel();
         let capture_threshold = self.capture_threshold.clone();
-        std::thread::Builder::new()
+        let spawned = std::thread::Builder::new()
             .name("clip-sync-wayland".to_owned())
             .spawn(move || {
                 let result = tokio::runtime::Builder::new_current_thread()
@@ -149,12 +149,20 @@ impl ClipboardBackend for WaylandBackend {
                         ))
                     });
                 let _ = done_tx.send(result);
-            })
-            .map_err(|error| BackendError::Connection(error.to_string()))?;
+            });
+        if let Err(error) = spawned {
+            if let Ok(mut active) = self.commands.lock() {
+                *active = None;
+            }
+            return Err(BackendError::Connection(error.to_string()));
+        }
 
-        let result = done_rx.await.map_err(|_| {
-            BackendError::Connection("Wayland event thread stopped unexpectedly".to_owned())
-        })?;
+        let result = match done_rx.await {
+            Ok(result) => result,
+            Err(_) => Err(BackendError::Connection(
+                "Wayland event thread stopped unexpectedly".to_owned(),
+            )),
+        };
 
         if let Ok(mut active) = self.commands.lock() {
             *active = None;

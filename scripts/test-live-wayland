@@ -85,6 +85,25 @@ done
   cat "$root/daemon.log" >&2
   exit 1
 }
+for _ in $(seq 1 100); do
+  if target/debug/clip-sync doctor --json 2>/dev/null | python3 -c '
+import json, sys
+checks = json.load(sys.stdin).get("checks", [])
+raise SystemExit(not any(c.get("name") == "clipboard" and c.get("ok") for c in checks))
+' 2>/dev/null; then
+    break
+  fi
+  sleep 0.05
+done
+if ! target/debug/clip-sync doctor --json 2>/dev/null | python3 -c '
+import json, sys
+checks = json.load(sys.stdin).get("checks", [])
+raise SystemExit(not any(c.get("name") == "clipboard" and c.get("ok") for c in checks))
+' 2>/dev/null; then
+  echo "Wayland clipboard watcher did not become ready" >&2
+  cat "$root/daemon.log" >&2
+  exit 1
+fi
 
 marker="clip-sync-live-$(date +%s%N)"
 printf %s "$marker" | wl-copy --foreground --type text/plain &
@@ -96,6 +115,11 @@ for _ in $(seq 1 100); do
   [[ "$history" != '[]' ]] && break
   sleep 0.05
 done
+if [[ "$history" == '[]' ]]; then
+  echo "daemon did not capture the live clipboard marker" >&2
+  cat "$root/daemon.log" >&2
+  exit 1
+fi
 content_id=$(printf %s "$history" | python3 -c \
   'import json,sys; items=json.load(sys.stdin); assert len(items)==1, items; print(items[0]["content_id"])')
 

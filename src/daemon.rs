@@ -1333,10 +1333,13 @@ where
                         if matches!(event, ClipboardEvent::Ready) {
                             callback_ready.store(true, std::sync::atomic::Ordering::SeqCst);
                         }
-                        // The Wayland watcher owns a dedicated thread. Bounded
-                        // blocking backpressure preserves capture ordering
-                        // without allowing suspend/resume storms to grow RAM.
-                        let _ = callback_events.blocking_send(event);
+                        // Keep compositor callbacks non-blocking: this callback
+                        // runs inside the dedicated current-thread Tokio runtime,
+                        // where `blocking_send` would panic. A bounded queue
+                        // prevents suspend/resume storms from growing memory.
+                        if callback_events.try_send(event).is_err() {
+                            tracing::warn!("dropping Wayland clipboard event because the daemon queue is full or closed");
+                        }
                     }),
                 )
                 .await;
