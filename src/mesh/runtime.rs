@@ -1,0 +1,959 @@
+use std::{
+    cmp::Ordering,
+    collections::BTreeMap,
+    hash::{Hash, Hasher},
+    net::SocketAddr,
+    sync::Arc,
+    time::Duration,
+};
+
+use quinn::{Connection, Endpoint};
+use thiserror::Error;
+use tokio::{
+    sync::{Mutex, RwLock, Semaphore, mpsc, oneshot, watch},
+    task::{JoinHandle, JoinSet},
+    time::{MissedTickBehavior, timeout},
+};
+use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
+
+use crate::{
+    discovery::DiscoverySnapshot,
+    model::{NodeId, SeenOps, StampedOperation},
+    replication::{AntiEntropyState, BatchLimits, Codec, JsonV1Codec},
+    transport::{Psk, authenticate_client, authenticate_server, mesh_endpoint},
+};
+
+use super::protocol::{
+    IdentityHello, MAX_BATCH_OPERATIONS, MAX_FRONTIER_BYTES, MAX_HOSTNAME_BYTES, PROTOCOL_VERSION,
+    ProtocolError, SyncRequest, SyncResponse, read_message, validate_batch, write_message,
+};
+
+const SERVER_NAME: &str = "clip-sync.mesh";
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(30);
+const PERSIST_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_RECONCILE_ROUNDS: usize = 1024;
+const MAX_CONCURRENT_HANDSHAKES: usize = 32;
+const CLOSE_DUPLICATE: u32 = 0x201;
+const CLOSE_SHUTDOWN: u32 = 0x203;
+
+/// Runtime tuning for one mesh member.
+#[derive(Clone, Debug)]
+pub struct MeshRuntimeConfig {
+    pub node_id: NodeId,
+    pub hostname: String,
+    pub listen_port: u16,
+    pub reconcile_interval: Duration,
+    pub reconnect_min: Duration,
+    pub reconnect_max: Duration,
+    pub batch_limits: BatchLimits,
+}
+
+impl MeshRuntimeConfig {
+    #[must_use]
+    pub fn new(node_id: NodeId, hostname: impl Into<String>, listen_port: u16) -> Self {
+        Self {
+            node_id,
+            hostname: hostname.into(),
+            listen_port,
+            reconcile_interval: Duration::from_secs(5),
+            reconnect_min: Duration::from_secs(1),
+            reconnect_max: Duration::from_mins(1),
+            batch_limits: BatchLimits {
+                max_ops: MAX_BATCH_OPERATIONS,
+                max_bytes: 4 * 1024 * 1024,
+            },
+        }
+    }
+}
+
+/// A batch which must become durable before the network peer is acknowledged.
+#[derive(Debug)]
+pub struct PersistBatch {
+    operations: Vec<Vec<u8>>,
+    reply: oneshot::Sender<Result<(), String>>,
+}
+
+impl PersistBatch {
+    #[must_use]
+    pub fn operations(&self) -> &[Vec<u8>] {
+        &self.operations
+    }
+
+    pub fn complete(self, result: Result<(), String>) {
+        let _ = self.reply.send(result);
+    }
+}
+
+/// Cloneable daemon-facing control surface.
+#[derive(Clone, Debug)]
+pub struct MeshHandle {
+    discovery: watch::Sender<Option<DiscoverySnapshot>>,
+    revision: watch::Sender<u64>,
+    state: Arc<RwLock<AntiEntropyState>>,
+}
+
+impl MeshHandle {
+    /// Updates the `NetBird` bind address and dial set.
+    pub fn update_discovery(&self, snapshot: DiscoverySnapshot) {
+        self.discovery.send_replace(Some(snapshot));
+    }
+
+    /// Records an already-durable local operation and wakes every live session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if deterministic operation encoding or log insertion
+    /// fails.
+    pub async fn record_local(&self, operation: &StampedOperation) -> Result<(), MeshError> {
+        self.state
+            .write()
+            .await
+            .record_local(operation, &JsonV1Codec)?;
+        bump_revision(&self.revision);
+        Ok(())
+    }
+
+    #[must_use]
+    pub async fn frontier(&self) -> SeenOps {
+        self.state.read().await.seen().clone()
+    }
+}
+
+/// Owned background mesh supervisor.
+#[derive(Debug)]
+pub struct MeshRuntime {
+    handle: MeshHandle,
+    task: JoinHandle<()>,
+}
+
+impl MeshRuntime {
+    /// Creates an initially unbound runtime. Call [`MeshHandle::update_discovery`]
+    /// when a `NetBird` snapshot is available.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the hostname is invalid or persisted operations
+    /// cannot initialize the forwarding log.
+    pub fn spawn(
+        config: MeshRuntimeConfig,
+        psk: Psk,
+        persisted_operations: &[StampedOperation],
+        shutdown: CancellationToken,
+    ) -> Result<(Self, mpsc::Receiver<PersistBatch>), MeshError> {
+        validate_local_config(&config)?;
+        let mut state = AntiEntropyState::new();
+        for operation in persisted_operations {
+            state.record_local(operation, &JsonV1Codec)?;
+        }
+
+        let state = Arc::new(RwLock::new(state));
+        let (discovery, discovery_rx) = watch::channel(None);
+        let (revision, _) = watch::channel(0_u64);
+        let (persist_tx, persist_rx) = mpsc::channel(32);
+        let handle = MeshHandle {
+            discovery,
+            revision: revision.clone(),
+            state: state.clone(),
+        };
+        let context = Arc::new(RuntimeContext {
+            config,
+            psk: Arc::new(psk),
+            state,
+            revision,
+            persist_tx,
+            registry: Arc::new(Mutex::new(BTreeMap::new())),
+        });
+        let task = tokio::spawn(supervise(context, discovery_rx, shutdown));
+        Ok((
+            Self {
+                handle: handle.clone(),
+                task,
+            },
+            persist_rx,
+        ))
+    }
+
+    #[must_use]
+    pub fn handle(&self) -> MeshHandle {
+        self.handle.clone()
+    }
+
+    pub async fn wait(self) {
+        if let Err(error) = self.task.await {
+            tracing::warn!(%error, "mesh supervisor did not stop cleanly");
+        }
+    }
+}
+
+#[derive(Debug)]
+struct RuntimeContext {
+    config: MeshRuntimeConfig,
+    psk: Arc<Psk>,
+    state: Arc<RwLock<AntiEntropyState>>,
+    revision: watch::Sender<u64>,
+    persist_tx: mpsc::Sender<PersistBatch>,
+    registry: Arc<Mutex<BTreeMap<NodeId, ActiveConnection>>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Direction {
+    Outbound,
+    Inbound,
+}
+
+#[derive(Debug)]
+struct ActiveConnection {
+    stable_id: usize,
+    preferred: bool,
+    connection: Connection,
+}
+
+async fn supervise(
+    context: Arc<RuntimeContext>,
+    mut discovery: watch::Receiver<Option<DiscoverySnapshot>>,
+    shutdown: CancellationToken,
+) {
+    let mut generation: Option<ListenerGeneration> = None;
+
+    loop {
+        let next = discovery.borrow_and_update().clone();
+        let generation_stopped = generation
+            .as_ref()
+            .is_some_and(|generation| generation.task.is_finished());
+        if let Some(snapshot) = next {
+            let bind = SocketAddr::new(snapshot.local_address, context.config.listen_port);
+            let must_restart = generation_stopped
+                || generation
+                    .as_ref()
+                    .is_none_or(|generation| generation.bind != bind);
+            if must_restart {
+                stop_generation(&mut generation).await;
+                match mesh_endpoint(bind) {
+                    Ok(endpoint) => {
+                        let generation_shutdown = shutdown.child_token();
+                        let (peers, peer_updates) = watch::channel(discovered_addresses(
+                            &snapshot,
+                            context.config.listen_port,
+                        ));
+                        let task = tokio::spawn(run_generation(
+                            endpoint,
+                            peer_updates,
+                            context.clone(),
+                            generation_shutdown.clone(),
+                        ));
+                        generation = Some(ListenerGeneration {
+                            bind,
+                            shutdown: generation_shutdown,
+                            peers,
+                            task,
+                        });
+                        tracing::info!(%bind, "mesh QUIC listener active");
+                    }
+                    Err(error) => {
+                        tracing::warn!(%bind, %error, "could not bind mesh QUIC listener");
+                    }
+                }
+            } else if let Some(generation) = &generation {
+                generation
+                    .peers
+                    .send_replace(discovered_addresses(&snapshot, context.config.listen_port));
+            }
+        }
+
+        tokio::select! {
+            () = shutdown.cancelled() => break,
+            result = discovery.changed() => {
+                if result.is_err() {
+                    break;
+                }
+            }
+            () = tokio::time::sleep(context.config.reconnect_min),
+                if generation.is_none() && discovery.borrow().is_some() => {}
+        }
+    }
+
+    stop_generation(&mut generation).await;
+}
+
+#[derive(Debug)]
+struct ListenerGeneration {
+    bind: SocketAddr,
+    shutdown: CancellationToken,
+    peers: watch::Sender<Vec<SocketAddr>>,
+    task: JoinHandle<()>,
+}
+
+async fn stop_generation(generation: &mut Option<ListenerGeneration>) {
+    if let Some(generation) = generation.take() {
+        generation.shutdown.cancel();
+        if let Err(error) = generation.task.await {
+            tracing::warn!(%error, "mesh listener generation did not stop cleanly");
+        }
+    }
+}
+
+fn discovered_addresses(snapshot: &DiscoverySnapshot, port: u16) -> Vec<SocketAddr> {
+    snapshot
+        .peers
+        .iter()
+        .filter(|peer| peer.connected && peer.address != snapshot.local_address)
+        .map(|peer| SocketAddr::new(peer.address, port))
+        .collect()
+}
+
+async fn run_generation(
+    endpoint: Endpoint,
+    mut peer_updates: watch::Receiver<Vec<SocketAddr>>,
+    context: Arc<RuntimeContext>,
+    shutdown: CancellationToken,
+) {
+    let handshakes = Arc::new(Semaphore::new(MAX_CONCURRENT_HANDSHAKES));
+    let mut tasks = JoinSet::new();
+    let mut dialers = BTreeMap::<SocketAddr, CancellationToken>::new();
+    update_dialers(
+        &endpoint,
+        &context,
+        &shutdown,
+        &mut tasks,
+        &mut dialers,
+        &peer_updates.borrow_and_update(),
+    );
+
+    loop {
+        tokio::select! {
+            () = shutdown.cancelled() => break,
+            result = peer_updates.changed() => {
+                if result.is_err() {
+                    break;
+                }
+                update_dialers(
+                    &endpoint,
+                    &context,
+                    &shutdown,
+                    &mut tasks,
+                    &mut dialers,
+                    &peer_updates.borrow_and_update(),
+                );
+            }
+            incoming = endpoint.accept() => {
+                let Some(incoming) = incoming else {
+                    break;
+                };
+                let Ok(permit) = handshakes.clone().try_acquire_owned() else {
+                    incoming.refuse();
+                    continue;
+                };
+                spawn_incoming(
+                    &mut tasks,
+                    incoming,
+                    permit,
+                    context.clone(),
+                    shutdown.clone(),
+                );
+            }
+            completed = tasks.join_next(), if !tasks.is_empty() => {
+                if let Some(Err(error)) = completed {
+                    tracing::warn!(%error, "mesh connection task panicked");
+                }
+            }
+        }
+    }
+
+    endpoint.close(CLOSE_SHUTDOWN.into(), b"mesh listener stopping");
+    shutdown.cancel();
+    for dialer in dialers.into_values() {
+        dialer.cancel();
+    }
+    while let Some(result) = tasks.join_next().await {
+        if let Err(error) = result {
+            tracing::warn!(%error, "mesh connection task did not stop cleanly");
+        }
+    }
+    let registered = {
+        let mut registry = context.registry.lock().await;
+        std::mem::take(&mut *registry)
+    };
+    for active in registered.into_values() {
+        active
+            .connection
+            .close(CLOSE_SHUTDOWN.into(), b"mesh listener stopping");
+    }
+    if timeout(Duration::from_secs(5), endpoint.wait_idle())
+        .await
+        .is_err()
+    {
+        tracing::debug!("QUIC endpoint still had draining connections at shutdown");
+    }
+}
+
+fn spawn_incoming(
+    tasks: &mut JoinSet<()>,
+    incoming: quinn::Incoming,
+    permit: tokio::sync::OwnedSemaphorePermit,
+    context: Arc<RuntimeContext>,
+    shutdown: CancellationToken,
+) {
+    tasks.spawn(async move {
+        let connection = tokio::select! {
+            () = shutdown.cancelled() => return,
+            result = incoming => match result {
+                Ok(connection) => connection,
+                Err(error) => {
+                    tracing::debug!(%error, "incoming QUIC handshake failed");
+                    return;
+                }
+            }
+        };
+        let authenticated = tokio::select! {
+            () = shutdown.cancelled() => return,
+            result = authenticate_server(connection, &context.psk) => match result {
+                Ok(connection) => connection,
+                Err(error) => {
+                    tracing::debug!(%error, "incoming mesh authentication failed");
+                    return;
+                }
+            }
+        };
+        drop(permit);
+        if let Err(error) = run_connection(
+            authenticated.into_inner(),
+            Direction::Inbound,
+            context,
+            shutdown,
+        )
+        .await
+        {
+            tracing::debug!(%error, "incoming mesh session ended");
+        }
+    });
+}
+
+fn update_dialers(
+    endpoint: &Endpoint,
+    context: &Arc<RuntimeContext>,
+    shutdown: &CancellationToken,
+    tasks: &mut JoinSet<()>,
+    dialers: &mut BTreeMap<SocketAddr, CancellationToken>,
+    addresses: &[SocketAddr],
+) {
+    dialers.retain(|address, cancellation| {
+        if addresses.contains(address) {
+            true
+        } else {
+            cancellation.cancel();
+            false
+        }
+    });
+    for address in addresses {
+        if dialers.contains_key(address) {
+            continue;
+        }
+        let cancellation = shutdown.child_token();
+        dialers.insert(*address, cancellation.clone());
+        tasks.spawn(dial_peer(
+            endpoint.clone(),
+            *address,
+            context.clone(),
+            cancellation,
+        ));
+    }
+}
+
+async fn dial_peer(
+    endpoint: Endpoint,
+    address: SocketAddr,
+    context: Arc<RuntimeContext>,
+    shutdown: CancellationToken,
+) {
+    let mut attempt = 0_u32;
+    loop {
+        let connecting = match endpoint.connect(address, SERVER_NAME) {
+            Ok(connecting) => connecting,
+            Err(error) => {
+                tracing::debug!(%address, %error, "could not start mesh connection");
+                if wait_backoff(&context.config, address, attempt, &shutdown).await {
+                    return;
+                }
+                attempt = attempt.saturating_add(1);
+                continue;
+            }
+        };
+        let connection = tokio::select! {
+            () = shutdown.cancelled() => return,
+            result = connecting => match result {
+                Ok(connection) => connection,
+                Err(error) => {
+                    tracing::debug!(%address, %error, "mesh peer is unreachable");
+                    if wait_backoff(&context.config, address, attempt, &shutdown).await {
+                        return;
+                    }
+                    attempt = attempt.saturating_add(1);
+                    continue;
+                }
+            }
+        };
+        let authenticated = tokio::select! {
+            () = shutdown.cancelled() => return,
+            result = authenticate_client(connection, &context.psk) => match result {
+                Ok(connection) => connection,
+                Err(error) => {
+                    tracing::debug!(%address, %error, "outgoing mesh authentication failed");
+                    if wait_backoff(&context.config, address, attempt, &shutdown).await {
+                        return;
+                    }
+                    attempt = attempt.saturating_add(1);
+                    continue;
+                }
+            }
+        };
+
+        attempt = 0;
+        let mut duplicate = false;
+        if let Err(error) = run_connection(
+            authenticated.into_inner(),
+            Direction::Outbound,
+            context.clone(),
+            shutdown.clone(),
+        )
+        .await
+        {
+            duplicate = matches!(&error, MeshError::DuplicateConnection(_));
+            tracing::debug!(%address, %error, "outgoing mesh session ended");
+        }
+        let backoff_attempt = if duplicate { u32::MAX } else { attempt };
+        if wait_backoff(&context.config, address, backoff_attempt, &shutdown).await {
+            return;
+        }
+        attempt = attempt.saturating_add(1);
+    }
+}
+
+async fn run_connection(
+    connection: Connection,
+    direction: Direction,
+    context: Arc<RuntimeContext>,
+    shutdown: CancellationToken,
+) -> Result<(), MeshError> {
+    let peer = timeout(
+        HANDSHAKE_TIMEOUT,
+        exchange_identity(&connection, direction, &context),
+    )
+    .await
+    .map_err(|_| MeshError::HandshakeTimeout)??;
+
+    if peer.node_id == context.config.node_id {
+        connection.close(CLOSE_DUPLICATE.into(), b"duplicate node identity");
+        return Err(MeshError::DuplicateNodeIdentity(peer.node_id));
+    }
+
+    let stable_id = connection.stable_id();
+    if !register_connection(&context, peer.node_id, direction, &connection).await {
+        connection.close(CLOSE_DUPLICATE.into(), b"duplicate connection");
+        return Err(MeshError::DuplicateConnection(peer.node_id));
+    }
+
+    tracing::info!(
+        peer_id = %peer.node_id,
+        peer_hostname = %peer.hostname,
+        ?direction,
+        "authenticated mesh peer connected"
+    );
+    let peer_frontier = Arc::new(Mutex::new(peer.frontier));
+    let result = session_loop(&connection, &context, peer_frontier, shutdown).await;
+    remove_connection(&context, peer.node_id, stable_id).await;
+    connection.close(CLOSE_SHUTDOWN.into(), b"mesh session ended");
+    tracing::info!(peer_id = %peer.node_id, "mesh peer disconnected");
+    result
+}
+
+#[derive(Debug)]
+struct PeerIdentity {
+    node_id: NodeId,
+    hostname: String,
+    frontier: SeenOps,
+}
+
+async fn exchange_identity(
+    connection: &Connection,
+    direction: Direction,
+    context: &RuntimeContext,
+) -> Result<PeerIdentity, MeshError> {
+    let local = local_identity(context).await?;
+    let peer = match direction {
+        Direction::Outbound => {
+            let (mut send, mut recv) = connection.open_bi().await?;
+            write_message(&mut send, &local).await?;
+            let peer = read_message(&mut recv).await?;
+            send.finish()?;
+            peer
+        }
+        Direction::Inbound => {
+            let (mut send, mut recv) = connection.accept_bi().await?;
+            let peer = read_message(&mut recv).await?;
+            write_message(&mut send, &local).await?;
+            send.finish()?;
+            peer
+        }
+    };
+    parse_identity(peer)
+}
+
+async fn local_identity(context: &RuntimeContext) -> Result<IdentityHello, MeshError> {
+    let frontier = encode_frontier(context.state.read().await.seen())?;
+    Ok(IdentityHello {
+        protocol_version: PROTOCOL_VERSION,
+        node_id: context.config.node_id.as_uuid().as_bytes().to_vec(),
+        hostname: context.config.hostname.clone(),
+        frontier,
+    })
+}
+
+fn parse_identity(hello: IdentityHello) -> Result<PeerIdentity, MeshError> {
+    if hello.protocol_version != PROTOCOL_VERSION {
+        return Err(MeshError::UnsupportedProtocol(hello.protocol_version));
+    }
+    if hello.hostname.is_empty() || hello.hostname.len() > MAX_HOSTNAME_BYTES {
+        return Err(MeshError::InvalidHostname);
+    }
+    if hello.frontier.len() > MAX_FRONTIER_BYTES {
+        return Err(MeshError::Protocol(ProtocolError::FrontierTooLarge(
+            hello.frontier.len(),
+        )));
+    }
+    let uuid = Uuid::from_slice(&hello.node_id).map_err(|_| MeshError::InvalidNodeId)?;
+    let frontier = decode_frontier(&hello.frontier)?;
+    Ok(PeerIdentity {
+        node_id: NodeId::from_uuid(uuid),
+        hostname: hello.hostname,
+        frontier,
+    })
+}
+
+async fn register_connection(
+    context: &RuntimeContext,
+    peer: NodeId,
+    direction: Direction,
+    connection: &Connection,
+) -> bool {
+    let preferred = preferred_direction(context.config.node_id, peer) == direction;
+    let mut registry = context.registry.lock().await;
+    if let Some(existing) = registry.get(&peer) {
+        if existing.preferred || !preferred {
+            return false;
+        }
+        existing
+            .connection
+            .close(CLOSE_DUPLICATE.into(), b"replaced by canonical connection");
+    }
+    registry.insert(
+        peer,
+        ActiveConnection {
+            stable_id: connection.stable_id(),
+            preferred,
+            connection: connection.clone(),
+        },
+    );
+    true
+}
+
+async fn remove_connection(context: &RuntimeContext, peer: NodeId, stable_id: usize) {
+    let mut registry = context.registry.lock().await;
+    if registry
+        .get(&peer)
+        .is_some_and(|active| active.stable_id == stable_id)
+    {
+        registry.remove(&peer);
+    }
+}
+
+fn preferred_direction(local: NodeId, peer: NodeId) -> Direction {
+    match local.cmp(&peer) {
+        Ordering::Less => Direction::Outbound,
+        Ordering::Equal | Ordering::Greater => Direction::Inbound,
+    }
+}
+
+async fn session_loop(
+    connection: &Connection,
+    context: &Arc<RuntimeContext>,
+    peer_frontier: Arc<Mutex<SeenOps>>,
+    shutdown: CancellationToken,
+) -> Result<(), MeshError> {
+    let inbound = accept_sync_streams(connection, context, peer_frontier.clone(), shutdown.clone());
+    let outbound = initiate_sync_streams(connection, context, peer_frontier, shutdown.clone());
+    tokio::pin!(inbound);
+    tokio::pin!(outbound);
+
+    tokio::select! {
+        result = &mut inbound => result,
+        result = &mut outbound => result,
+        error = connection.closed() => Err(MeshError::Connection(error)),
+        () = shutdown.cancelled() => Ok(()),
+    }
+}
+
+async fn accept_sync_streams(
+    connection: &Connection,
+    context: &Arc<RuntimeContext>,
+    peer_frontier: Arc<Mutex<SeenOps>>,
+    shutdown: CancellationToken,
+) -> Result<(), MeshError> {
+    loop {
+        let streams = tokio::select! {
+            () = shutdown.cancelled() => return Ok(()),
+            streams = connection.accept_bi() => streams?,
+        };
+        timeout(
+            EXCHANGE_TIMEOUT,
+            answer_sync(streams, context, &peer_frontier),
+        )
+        .await
+        .map_err(|_| MeshError::ExchangeTimeout)??;
+    }
+}
+
+async fn answer_sync(
+    (mut send, mut recv): (quinn::SendStream, quinn::RecvStream),
+    context: &RuntimeContext,
+    peer_frontier: &Mutex<SeenOps>,
+) -> Result<(), MeshError> {
+    let request: SyncRequest = read_message(&mut recv).await?;
+    validate_batch(&request.frontier, &request.operations)?;
+    tracing::debug!(
+        received_operations = request.operations.len(),
+        "answering mesh reconciliation request"
+    );
+    let advertised = decode_frontier(&request.frontier)?;
+    persist_and_record(context, request.operations).await?;
+    *peer_frontier.lock().await = advertised.clone();
+
+    let (frontier, operations, has_more) = batch_for_peer(context, &advertised).await?;
+    let response = SyncResponse {
+        frontier,
+        operations,
+        has_more,
+    };
+    write_message(&mut send, &response).await?;
+    send.finish()?;
+    Ok(())
+}
+
+async fn initiate_sync_streams(
+    connection: &Connection,
+    context: &Arc<RuntimeContext>,
+    peer_frontier: Arc<Mutex<SeenOps>>,
+    shutdown: CancellationToken,
+) -> Result<(), MeshError> {
+    let mut interval = tokio::time::interval(context.config.reconcile_interval);
+    interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut revision = context.revision.subscribe();
+
+    loop {
+        tokio::select! {
+            () = shutdown.cancelled() => return Ok(()),
+            _ = interval.tick() => {}
+            result = revision.changed() => {
+                if result.is_err() {
+                    return Ok(());
+                }
+            }
+        }
+
+        for _ in 0..MAX_RECONCILE_ROUNDS {
+            let more = timeout(
+                EXCHANGE_TIMEOUT,
+                initiate_sync(connection, context, &peer_frontier),
+            )
+            .await
+            .map_err(|_| MeshError::ExchangeTimeout)??;
+            if !more {
+                break;
+            }
+        }
+    }
+}
+
+async fn initiate_sync(
+    connection: &Connection,
+    context: &RuntimeContext,
+    peer_frontier: &Mutex<SeenOps>,
+) -> Result<bool, MeshError> {
+    let advertised = peer_frontier.lock().await.clone();
+    let (frontier, operations, request_has_more) = batch_for_peer(context, &advertised).await?;
+    let request = SyncRequest {
+        frontier,
+        operations,
+        has_more: request_has_more,
+    };
+    let (mut send, mut recv) = connection.open_bi().await?;
+    write_message(&mut send, &request).await?;
+    let response: SyncResponse = read_message(&mut recv).await?;
+    validate_batch(&response.frontier, &response.operations)?;
+    tracing::debug!(
+        pushed_operations = request.operations.len(),
+        received_operations = response.operations.len(),
+        "completed mesh reconciliation exchange"
+    );
+    let response_frontier = decode_frontier(&response.frontier)?;
+    persist_and_record(context, response.operations).await?;
+    *peer_frontier.lock().await = response_frontier;
+    send.finish()?;
+    Ok(request_has_more || response.has_more)
+}
+
+async fn batch_for_peer(
+    context: &RuntimeContext,
+    peer_frontier: &SeenOps,
+) -> Result<(Vec<u8>, Vec<Vec<u8>>, bool), MeshError> {
+    let state = context.state.read().await;
+    let batch = state.compute_batch(peer_frontier, &context.config.batch_limits);
+    let frontier = encode_frontier(state.seen())?;
+    Ok((frontier, batch.entries().to_vec(), batch.has_more()))
+}
+
+async fn persist_and_record(
+    context: &RuntimeContext,
+    operations: Vec<Vec<u8>>,
+) -> Result<(), MeshError> {
+    if operations.is_empty() {
+        return Ok(());
+    }
+    let codec = JsonV1Codec;
+    let operations = operations
+        .into_iter()
+        .map(|operation| {
+            let decoded = codec.decode_op(&operation)?;
+            codec.encode_op(&decoded).map_err(Into::into)
+        })
+        .collect::<Result<Vec<_>, MeshError>>()?;
+
+    let (reply, completed) = oneshot::channel();
+    context
+        .persist_tx
+        .send(PersistBatch {
+            operations: operations.clone(),
+            reply,
+        })
+        .await
+        .map_err(|_| MeshError::PersistenceUnavailable)?;
+    timeout(PERSIST_TIMEOUT, completed)
+        .await
+        .map_err(|_| MeshError::PersistenceTimeout)?
+        .map_err(|_| MeshError::PersistenceUnavailable)?
+        .map_err(MeshError::PersistenceRejected)?;
+
+    let mut state = context.state.write().await;
+    for operation in operations {
+        state.ingest_raw(&operation, &JsonV1Codec)?;
+    }
+    drop(state);
+    bump_revision(&context.revision);
+    Ok(())
+}
+
+fn encode_frontier(frontier: &SeenOps) -> Result<Vec<u8>, MeshError> {
+    let encoded = serde_json::to_vec(frontier)?;
+    if encoded.len() > MAX_FRONTIER_BYTES {
+        return Err(MeshError::Protocol(ProtocolError::FrontierTooLarge(
+            encoded.len(),
+        )));
+    }
+    Ok(encoded)
+}
+
+fn decode_frontier(encoded: &[u8]) -> Result<SeenOps, MeshError> {
+    if encoded.len() > MAX_FRONTIER_BYTES {
+        return Err(MeshError::Protocol(ProtocolError::FrontierTooLarge(
+            encoded.len(),
+        )));
+    }
+    serde_json::from_slice(encoded).map_err(MeshError::Frontier)
+}
+
+fn bump_revision(revision: &watch::Sender<u64>) {
+    revision.send_modify(|value| *value = value.wrapping_add(1));
+}
+
+async fn wait_backoff(
+    config: &MeshRuntimeConfig,
+    address: SocketAddr,
+    attempt: u32,
+    shutdown: &CancellationToken,
+) -> bool {
+    let shift = attempt.min(20);
+    let multiplier = 1_u32 << shift;
+    let base = config
+        .reconnect_min
+        .saturating_mul(multiplier)
+        .min(config.reconnect_max);
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    address.hash(&mut hasher);
+    attempt.hash(&mut hasher);
+    let jitter_limit = (base.as_millis() / 4).max(1);
+    let jitter = u64::try_from(u128::from(hasher.finish()) % jitter_limit).unwrap_or(0);
+    let delay = base.saturating_add(Duration::from_millis(jitter));
+    tokio::select! {
+        () = shutdown.cancelled() => true,
+        () = tokio::time::sleep(delay) => false,
+    }
+}
+
+fn validate_local_config(config: &MeshRuntimeConfig) -> Result<(), MeshError> {
+    if config.hostname.is_empty() || config.hostname.len() > MAX_HOSTNAME_BYTES {
+        return Err(MeshError::InvalidHostname);
+    }
+    if config.reconcile_interval.is_zero()
+        || config.reconnect_min.is_zero()
+        || config.reconnect_max < config.reconnect_min
+        || config.listen_port == 0
+        || config.batch_limits.max_ops == 0
+        || config.batch_limits.max_ops > MAX_BATCH_OPERATIONS
+        || config.batch_limits.max_bytes == 0
+        || config.batch_limits.max_bytes > super::protocol::MAX_CONTROL_FRAME_BYTES
+    {
+        return Err(MeshError::InvalidConfig);
+    }
+    Ok(())
+}
+
+#[derive(Debug, Error)]
+pub enum MeshError {
+    #[error("mesh runtime configuration is invalid")]
+    InvalidConfig,
+    #[error("mesh hostname is invalid")]
+    InvalidHostname,
+    #[error("peer node identity is invalid")]
+    InvalidNodeId,
+    #[error("peer uses unsupported protocol version {0}")]
+    UnsupportedProtocol(u32),
+    #[error("peer duplicated the local active node identity {0}")]
+    DuplicateNodeIdentity(NodeId),
+    #[error("peer {0} already has a canonical active connection")]
+    DuplicateConnection(NodeId),
+    #[error("identity handshake timed out")]
+    HandshakeTimeout,
+    #[error("replication exchange timed out")]
+    ExchangeTimeout,
+    #[error("daemon persistence timed out")]
+    PersistenceTimeout,
+    #[error("daemon persistence service is unavailable")]
+    PersistenceUnavailable,
+    #[error("daemon rejected a remote operation batch: {0}")]
+    PersistenceRejected(String),
+    #[error("frontier is malformed: {0}")]
+    Frontier(serde_json::Error),
+    #[error("frontier serialization failed: {0}")]
+    FrontierSerialization(#[from] serde_json::Error),
+    #[error(transparent)]
+    Protocol(#[from] ProtocolError),
+    #[error(transparent)]
+    Codec(#[from] crate::replication::CodecError),
+    #[error(transparent)]
+    Replication(#[from] crate::replication::AntiEntropyError),
+    #[error("QUIC connection failed: {0}")]
+    Connection(#[from] quinn::ConnectionError),
+    #[error("could not finish a QUIC stream: {0}")]
+    Finish(#[from] quinn::ClosedStream),
+}

@@ -262,3 +262,91 @@ fn operations_outside_sqlite_integer_bounds_are_rejected() {
     ));
     assert!(storage.load_operations().unwrap().is_empty());
 }
+
+#[test]
+fn remote_batch_is_atomic_on_operation_conflict() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let path = temp_dir.path().join("remote-batch-atomic.db");
+    let key = storage_key();
+    let node = NodeId::from_uuid(Uuid::from_u128(700));
+    let original = setting_operation(node, 1, HlcTimestamp::new(10, 0), "value", 1);
+    let new_operation = setting_operation(node, 2, HlcTimestamp::new(11, 0), "next", 2);
+    let conflict = setting_operation(node, 1, HlcTimestamp::new(10, 0), "value", 99);
+
+    let mut storage = EncryptedStorage::open(&path, &key).unwrap();
+    storage.append_operation(&original).unwrap();
+    let metadata_before = storage.local_replica_metadata().unwrap();
+    assert!(matches!(
+        storage.append_remote_operations(
+            &[new_operation.clone(), conflict],
+            HlcTimestamp::new(20, 0),
+        ),
+        Err(StorageError::OperationConflict(id)) if id == original.id()
+    ));
+
+    assert_eq!(storage.load_operations().unwrap(), vec![original]);
+    assert_eq!(storage.local_replica_metadata().unwrap(), metadata_before);
+}
+
+#[test]
+fn remote_batch_persists_observed_clock_without_advancing_local_counter() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let path = temp_dir.path().join("remote-clock.db");
+    let key = storage_key();
+    let remote = NodeId::from_uuid(Uuid::from_u128(701));
+    let operation = setting_operation(remote, 1, HlcTimestamp::new(500, 3), "remote", 1);
+
+    {
+        let mut storage = EncryptedStorage::open(&path, &key).unwrap();
+        let initial = storage.local_replica_metadata().unwrap();
+        assert_eq!(
+            storage
+                .append_remote_operations(
+                    std::slice::from_ref(&operation),
+                    HlcTimestamp::new(500, 4),
+                )
+                .unwrap(),
+            1
+        );
+        let advanced = storage.local_replica_metadata().unwrap();
+        assert_eq!(
+            advanced.next_operation_counter(),
+            initial.next_operation_counter()
+        );
+        assert_eq!(advanced.last_hlc(), HlcTimestamp::new(500, 4));
+    }
+
+    let storage = EncryptedStorage::open(&path, &key).unwrap();
+    assert_eq!(
+        storage.local_replica_metadata().unwrap().last_hlc(),
+        HlcTimestamp::new(500, 4)
+    );
+    assert_eq!(storage.load_operations().unwrap(), vec![operation]);
+}
+
+#[test]
+fn remote_batch_cannot_claim_a_new_local_operation_id() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let path = temp_dir.path().join("remote-local-id.db");
+    let key = storage_key();
+    let mut storage = EncryptedStorage::open(&path, &key).unwrap();
+    let metadata = storage.local_replica_metadata().unwrap();
+    let forged = setting_operation(
+        metadata.node_id(),
+        metadata.next_operation_counter(),
+        HlcTimestamp::new(100, 0),
+        "forged",
+        1,
+    );
+
+    assert!(matches!(
+        storage.append_remote_operations(
+            std::slice::from_ref(&forged),
+            HlcTimestamp::new(100, 1),
+        ),
+        Err(StorageError::RemoteOperationClaimsLocalIdentity(node))
+            if node == metadata.node_id()
+    ));
+    assert!(storage.load_operations().unwrap().is_empty());
+    assert_eq!(storage.local_replica_metadata().unwrap(), metadata);
+}

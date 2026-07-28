@@ -107,6 +107,9 @@ pub enum StorageError {
     #[error("local operation belongs to node {operation}, not local node {local}")]
     ReplicaNodeMismatch { operation: NodeId, local: NodeId },
 
+    #[error("new remote operation claims the local node identity {0}")]
+    RemoteOperationClaimsLocalIdentity(NodeId),
+
     #[error("local operation counter must be {expected}, got {actual}")]
     UnexpectedOperationCounter { expected: u64, actual: u64 },
 
@@ -324,6 +327,72 @@ impl EncryptedStorage {
         let outcome = insert_serialized_operation(&transaction, operation, &serialized)?;
         transaction.commit()?;
         Ok(outcome)
+    }
+
+    /// Appends a remote batch and advances the durable observed HLC atomically.
+    ///
+    /// Every operation is inserted in one immediate transaction. A conflict or
+    /// malformed bound rolls the complete batch back. Exact replays are
+    /// idempotent, but the supplied observed clock may still advance the local
+    /// durable HLC so a restart cannot author an event behind a remote event.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for operation conflicts, invalid integer bounds, an HLC
+    /// regression, serialization failures, or database failures.
+    pub fn append_remote_operations(
+        &mut self,
+        operations: &[StampedOperation],
+        observed_hlc: HlcTimestamp,
+    ) -> Result<usize> {
+        let serialized = operations
+            .iter()
+            .map(serialize_operation)
+            .collect::<Result<Vec<_>>>()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let metadata = read_replica_metadata(&transaction)?;
+        let mut inserted = 0;
+        for (operation, bytes) in operations.iter().zip(&serialized) {
+            if insert_serialized_operation(&transaction, operation, bytes)?
+                == AppendOutcome::Inserted
+            {
+                if operation.id().node() == metadata.node_id {
+                    return Err(StorageError::RemoteOperationClaimsLocalIdentity(
+                        metadata.node_id,
+                    ));
+                }
+                inserted += 1;
+            }
+        }
+
+        if observed_hlc < metadata.last_hlc {
+            return Err(StorageError::HlcRegression {
+                operation: observed_hlc,
+                last: metadata.last_hlc,
+            });
+        }
+        if observed_hlc > metadata.last_hlc {
+            let physical =
+                sqlite_integer("last_hlc.physical_millis", observed_hlc.physical_millis())?;
+            let logical = i64::from(observed_hlc.logical());
+            let changed = transaction.execute(
+                "UPDATE local_replica
+                 SET last_hlc_physical_millis = ?1,
+                     last_hlc_logical = ?2
+                 WHERE singleton = 1",
+                (physical, logical),
+            )?;
+            if changed != 1 {
+                return Err(StorageError::CorruptReplicaMetadata(
+                    "singleton row disappeared during transaction".to_owned(),
+                ));
+            }
+        }
+
+        transaction.commit()?;
+        Ok(inserted)
     }
 
     /// Appends an operation created by this replica and atomically advances the

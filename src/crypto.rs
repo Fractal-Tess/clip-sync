@@ -9,6 +9,7 @@ use crate::{storage::StorageKey, transport::Psk};
 
 const SECRET_BYTES: usize = 32;
 const CONTENT_KEY_INFO: &[u8] = b"clip-sync/content-id-key/v1";
+const TRANSPORT_KEY_INFO: &[u8] = b"clip-sync/transport-auth-key/v1";
 const STORAGE_SALT: &[u8] = b"clip-sync/storage-salt/v1";
 
 /// High-entropy shared mesh secret loaded from an owner-only file.
@@ -71,9 +72,13 @@ impl MeshSecret {
     ///
     /// # Errors
     ///
-    /// Returns an error only if the fixed-size PSK construction fails.
+    /// Returns an error if HKDF expansion or fixed-size PSK construction fails.
     pub fn transport_psk(&self) -> Result<Psk, SecretError> {
-        Psk::new(self.bytes.as_ref()).map_err(|_| SecretError::Derivation)
+        let hkdf = Hkdf::<Sha256>::new(None, self.bytes.as_ref());
+        let mut key = Zeroizing::new([0; SECRET_BYTES]);
+        hkdf.expand(TRANSPORT_KEY_INFO, key.as_mut())
+            .map_err(|_| SecretError::Derivation)?;
+        Psk::new(key.as_ref()).map_err(|_| SecretError::Derivation)
     }
 
     /// Derives the `SQLCipher` spike key with domain separation.

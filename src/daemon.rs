@@ -14,8 +14,10 @@ use crate::{
     crypto::MeshSecret,
     discovery::{NetbirdDiscovery, PeerDiscovery},
     ipc::{self, DaemonCommand, DaemonState, protocol::HistoryItem},
-    model::{Payload, Representation},
+    mesh::{MeshHandle, MeshRuntime, MeshRuntimeConfig, PersistBatch},
+    model::{Operation, Payload, Representation, StampedOperation},
     replica::Replica,
+    replication::{Codec, JsonV1Codec},
     storage::EncryptedStorage,
 };
 
@@ -41,6 +43,9 @@ pub async fn run(paths: AppPaths, config: Config) -> anyhow::Result<()> {
     let projection = storage
         .rebuild_projection()
         .context("rebuild history projection")?;
+    let persisted_operations = storage
+        .load_operations()
+        .context("load mesh operation log")?;
     let mut replica = Replica::restore(
         metadata.node_id(),
         metadata.next_operation_counter().saturating_sub(1),
@@ -51,16 +56,40 @@ pub async fn run(paths: AppPaths, config: Config) -> anyhow::Result<()> {
     let content_key = mesh_secret
         .content_key()
         .context("derive content identity key")?;
+    let transport_psk = mesh_secret
+        .transport_psk()
+        .context("derive mesh transport key")?;
 
     let hostname = hostname::get()
         .context("read system hostname")?
         .to_string_lossy()
         .into_owned();
     let (command_tx, mut command_rx) = tokio::sync::mpsc::unbounded_channel();
-    let state = DaemonState::new(hostname, paths.config.clone(), config.clone(), command_tx);
+    let state = DaemonState::new(
+        hostname.clone(),
+        paths.config.clone(),
+        config.clone(),
+        command_tx,
+    );
     state.set_history(history_items(&replica)).await;
     let shutdown = CancellationToken::new();
-    let discovery = spawn_discovery(config, state.clone(), shutdown.clone());
+    let mut mesh_config = MeshRuntimeConfig::new(
+        replica.node_id(),
+        hostname.clone(),
+        config.local.listen_port,
+    );
+    mesh_config.reconcile_interval = Duration::from_secs(config.local.reconcile_interval_seconds);
+    mesh_config.reconnect_min = Duration::from_secs(config.local.reconnect_min_seconds);
+    mesh_config.reconnect_max = Duration::from_secs(config.local.reconnect_max_seconds);
+    let (mesh, mut mesh_rx) = MeshRuntime::spawn(
+        mesh_config,
+        transport_psk,
+        &persisted_operations,
+        shutdown.clone(),
+    )
+    .context("start mesh runtime")?;
+    let mesh_handle = mesh.handle();
+    let discovery = spawn_discovery(config, state.clone(), mesh_handle.clone(), shutdown.clone());
 
     let clipboard = WaylandBackend::new();
     let (clipboard_tx, mut clipboard_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -109,6 +138,7 @@ pub async fn run(paths: AppPaths, config: Config) -> anyhow::Result<()> {
                         &mut replica,
                         &mut storage,
                         &state,
+                        &mesh_handle,
                     ).await;
                 }
             }
@@ -120,7 +150,19 @@ pub async fn run(paths: AppPaths, config: Config) -> anyhow::Result<()> {
                         &mut storage,
                         &state,
                         &content_key,
+                        &mesh_handle,
                     ).await?;
+                }
+            }
+            batch = mesh_rx.recv() => {
+                if let Some(batch) = batch {
+                    handle_mesh_batch(
+                        batch,
+                        &mut replica,
+                        &mut storage,
+                        &state,
+                        &content_key,
+                    ).await;
                 }
             }
             result = &mut termination => {
@@ -142,6 +184,7 @@ pub async fn run(paths: AppPaths, config: Config) -> anyhow::Result<()> {
         }
     }
     finish_task(discovery).await;
+    mesh.wait().await;
     tracing::info!("clip-sync daemon stopped");
     Ok(())
 }
@@ -152,12 +195,14 @@ async fn handle_daemon_command(
     replica: &mut Replica,
     storage: &mut EncryptedStorage,
     state: &DaemonState,
+    mesh: &MeshHandle,
 ) {
     match command {
         DaemonCommand::Activate { content_id, reply } => {
-            let result = activate_history_item(&content_id, clipboard, replica, storage, state)
-                .await
-                .map_err(|error| error.to_string());
+            let result =
+                activate_history_item(&content_id, clipboard, replica, storage, state, mesh)
+                    .await
+                    .map_err(|error| error.to_string());
             let _ = reply.send(result);
         }
     }
@@ -169,6 +214,7 @@ async fn activate_history_item(
     replica: &mut Replica,
     storage: &mut EncryptedStorage,
     state: &DaemonState,
+    mesh: &MeshHandle,
 ) -> anyhow::Result<()> {
     let content_id = encoded_content_id
         .parse()
@@ -206,6 +252,9 @@ async fn activate_history_item(
         .append_local_operation(&operation)
         .context("persist clipboard activation")?;
     *replica = next;
+    mesh.record_local(&operation)
+        .await
+        .context("publish clipboard activation to mesh")?;
     state.set_history(history_items(replica)).await;
     Ok(())
 }
@@ -275,6 +324,7 @@ async fn handle_clipboard_event(
     storage: &mut EncryptedStorage,
     state: &DaemonState,
     content_key: &[u8; 32],
+    mesh: &MeshHandle,
 ) -> anyhow::Result<()> {
     match event {
         ClipboardEvent::Captured { content, .. } => {
@@ -295,6 +345,9 @@ async fn handle_clipboard_event(
                 .append_local_operation(&operation)
                 .context("persist clipboard history operation")?;
             *replica = next;
+            mesh.record_local(&operation)
+                .await
+                .context("publish clipboard history operation to mesh")?;
             state.set_history(history_items(replica)).await;
             tracing::debug!(
                 history_entries = replica.projection().visible_items().len(),
@@ -314,6 +367,52 @@ async fn handle_clipboard_event(
     Ok(())
 }
 
+async fn handle_mesh_batch(
+    batch: PersistBatch,
+    replica: &mut Replica,
+    storage: &mut EncryptedStorage,
+    state: &DaemonState,
+    content_key: &[u8; 32],
+) {
+    let result = persist_mesh_batch(batch.operations(), replica, storage, content_key);
+    if result.is_ok() {
+        state.set_history(history_items(replica)).await;
+    }
+    batch.complete(result.map_err(|error| error.to_string()));
+}
+
+fn persist_mesh_batch(
+    raw_operations: &[Vec<u8>],
+    replica: &mut Replica,
+    storage: &mut EncryptedStorage,
+    content_key: &[u8; 32],
+) -> anyhow::Result<()> {
+    let codec = JsonV1Codec;
+    let operations = raw_operations
+        .iter()
+        .map(|raw| codec.decode_op(raw).context("decode remote operation"))
+        .collect::<anyhow::Result<Vec<StampedOperation>>>()?;
+    for operation in &operations {
+        if let Operation::Add { payload, .. } = operation.operation() {
+            payload
+                .validate(content_key)
+                .context("validate remote clipboard payload identity")?;
+        }
+    }
+
+    let now_millis = unix_time_millis()?;
+    let mut next = replica.clone();
+    for operation in &operations {
+        next.ingest(operation, now_millis)
+            .context("apply remote history operation")?;
+    }
+    storage
+        .append_remote_operations(&operations, next.last_timestamp())
+        .context("persist remote operation batch")?;
+    *replica = next;
+    Ok(())
+}
+
 fn unix_time_millis() -> anyhow::Result<u64> {
     let millis = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -325,6 +424,7 @@ fn unix_time_millis() -> anyhow::Result<u64> {
 fn spawn_discovery(
     config: Config,
     state: DaemonState,
+    mesh: MeshHandle,
     shutdown: CancellationToken,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -338,6 +438,7 @@ fn spawn_discovery(
                         peer_count = snapshot.peers.len(),
                         "NetBird discovery updated"
                     );
+                    mesh.update_discovery(snapshot.clone());
                     state.set_discovery(snapshot).await;
                 }
                 Err(error) => tracing::warn!(%error, "NetBird discovery is unavailable"),

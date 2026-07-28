@@ -26,4 +26,4 @@ mod state;
 
 pub use codec::{Codec, CodecError, Envelope, JsonV1Codec};
 pub use op_log::{OpLog, OpLogError};
-pub use state::{AntiEntropyState, BatchLimits, IngestOutcome, OpBatch};
+pub use state::{AntiEntropyError, AntiEntropyState, BatchLimits, IngestOutcome, OpBatch};

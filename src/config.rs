@@ -80,6 +80,23 @@ impl Config {
                 "local.discovery_interval_seconds must be greater than zero",
             ));
         }
+        if self.local.listen_port == 0 {
+            return Err(ConfigError::Invalid(
+                "local.listen_port must be greater than zero",
+            ));
+        }
+        if self.local.reconcile_interval_seconds == 0 {
+            return Err(ConfigError::Invalid(
+                "local.reconcile_interval_seconds must be greater than zero",
+            ));
+        }
+        if self.local.reconnect_max_seconds < self.local.reconnect_min_seconds
+            || self.local.reconnect_min_seconds == 0
+        {
+            return Err(ConfigError::Invalid(
+                "local reconnect bounds must be nonzero and ordered",
+            ));
+        }
         if self.local.mesh_key_file.as_os_str().is_empty() {
             return Err(ConfigError::Invalid(
                 "local.mesh_key_file must not be empty",
@@ -120,6 +137,9 @@ pub struct LocalConfig {
     pub mesh_key_file: PathBuf,
     pub listen_port: u16,
     pub discovery_interval_seconds: u64,
+    pub reconcile_interval_seconds: u64,
+    pub reconnect_min_seconds: u64,
+    pub reconnect_max_seconds: u64,
     pub netbird_command: PathBuf,
 }
 
@@ -129,6 +149,9 @@ impl Default for LocalConfig {
             mesh_key_file: PathBuf::from("/run/secrets/clip-sync-mesh-key"),
             listen_port: DEFAULT_LISTEN_PORT,
             discovery_interval_seconds: 15,
+            reconcile_interval_seconds: 5,
+            reconnect_min_seconds: 1,
+            reconnect_max_seconds: 60,
             netbird_command: PathBuf::from("netbird"),
         }
     }
