@@ -95,6 +95,9 @@ pub async fn run(paths: AppPaths, config: Config) -> anyhow::Result<()> {
             )
             .await
     });
+    state
+        .set_clipboard_status(true, "Wayland clipboard monitoring is active")
+        .await;
 
     tracing::info!(socket = %paths.socket.display(), "clip-sync daemon started");
     let server = ipc::serve(&paths.socket, state.clone(), shutdown.clone());
@@ -114,9 +117,19 @@ pub async fn run(paths: AppPaths, config: Config) -> anyhow::Result<()> {
             result = &mut clipboard_watch, if !clipboard_finished => {
                 clipboard_finished = true;
                 match result {
-                    Ok(Ok(())) => {}
-                    Ok(Err(error)) => tracing::warn!(%error, "Wayland clipboard monitoring stopped"),
-                    Err(error) => tracing::warn!(%error, "Wayland clipboard task failed"),
+                    Ok(Ok(())) => {
+                        state
+                            .set_clipboard_status(false, "Wayland clipboard monitoring stopped")
+                            .await;
+                    }
+                    Ok(Err(error)) => {
+                        state.set_clipboard_status(false, error.to_string()).await;
+                        tracing::warn!(%error, "Wayland clipboard monitoring stopped");
+                    }
+                    Err(error) => {
+                        state.set_clipboard_status(false, error.to_string()).await;
+                        tracing::warn!(%error, "Wayland clipboard task failed");
+                    }
                 }
             }
             command = command_rx.recv() => {
@@ -189,7 +202,68 @@ async fn handle_daemon_command(
                 .map_err(|error| error.to_string());
             let _ = reply.send(result);
         }
+        DaemonCommand::SetPinned {
+            content_id,
+            pinned,
+            reply,
+        } => {
+            let result = update_history_item(
+                &content_id,
+                HistoryMutation::SetPinned(pinned),
+                replica,
+                storage,
+                state,
+            )
+            .await
+            .map_err(|error| error.to_string());
+            let _ = reply.send(result);
+        }
+        DaemonCommand::Delete { content_id, reply } => {
+            let result = update_history_item(
+                &content_id,
+                HistoryMutation::Delete,
+                replica,
+                storage,
+                state,
+            )
+            .await
+            .map_err(|error| error.to_string());
+            let _ = reply.send(result);
+        }
     }
+}
+
+#[derive(Clone, Copy)]
+enum HistoryMutation {
+    SetPinned(bool),
+    Delete,
+}
+
+async fn update_history_item(
+    encoded_content_id: &str,
+    mutation: HistoryMutation,
+    replica: &mut Replica,
+    storage: &mut EncryptedStorage,
+    state: &DaemonState,
+) -> anyhow::Result<()> {
+    let content_id = encoded_content_id
+        .parse()
+        .context("content ID is invalid")?;
+    let mut next = replica.clone();
+    let operation = match mutation {
+        HistoryMutation::SetPinned(pinned) => next
+            .set_pinned(content_id, pinned, unix_time_millis()?)
+            .context("author clipboard history pin update")?,
+        HistoryMutation::Delete => next
+            .delete(content_id, unix_time_millis()?)
+            .context("author clipboard history deletion")?,
+    };
+    storage
+        .append_local_operation(&operation)
+        .context("persist clipboard history update")?;
+    *replica = next;
+    state.set_history(history_items(replica)).await;
+    Ok(())
 }
 
 async fn activate_history_item(
@@ -408,7 +482,10 @@ fn spawn_discovery(
                     mesh.update_discovery(snapshot.clone());
                     state.set_discovery(snapshot).await;
                 }
-                Err(error) => tracing::warn!(%error, "NetBird discovery is unavailable"),
+                Err(error) => {
+                    state.set_discovery_error(error.to_string()).await;
+                    tracing::warn!(%error, "NetBird discovery is unavailable");
+                }
             }
 
             tokio::select! {

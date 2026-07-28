@@ -24,8 +24,9 @@ use crate::{
     config::Config,
     discovery::DiscoverySnapshot,
     ipc::protocol::{
-        ConfigResponse, ErrorResponse, HistoryItem, HistoryResponse, IPC_PROTOCOL_VERSION,
-        MutationResponse, Request, Response, StatusResponse, request, response,
+        ConfigResponse, DiagnosticCheck, DiagnosticsResponse, ErrorResponse, HistoryItem,
+        HistoryResponse, HistoryUpdateAction, IPC_PROTOCOL_VERSION, MutationResponse, PeerItem,
+        PeersResponse, Request, Response, StatusResponse, request, response,
     },
 };
 
@@ -42,12 +43,29 @@ struct DaemonStateInner {
     config_path: PathBuf,
     config: Config,
     discovery: RwLock<Option<DiscoverySnapshot>>,
+    discovery_error: RwLock<Option<String>>,
+    clipboard_status: RwLock<DiagnosticStatus>,
     history: RwLock<Vec<HistoryItem>>,
     commands: mpsc::UnboundedSender<DaemonCommand>,
 }
 
+#[derive(Clone)]
+struct DiagnosticStatus {
+    ok: bool,
+    detail: String,
+}
+
 pub enum DaemonCommand {
     Activate {
+        content_id: String,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+    SetPinned {
+        content_id: String,
+        pinned: bool,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+    Delete {
         content_id: String,
         reply: oneshot::Sender<Result<(), String>>,
     },
@@ -68,6 +86,11 @@ impl DaemonState {
                 config_path,
                 config,
                 discovery: RwLock::new(None),
+                discovery_error: RwLock::new(None),
+                clipboard_status: RwLock::new(DiagnosticStatus {
+                    ok: true,
+                    detail: "clipboard monitoring is starting".to_owned(),
+                }),
                 history: RwLock::new(Vec::new()),
                 commands,
             }),
@@ -76,6 +99,18 @@ impl DaemonState {
 
     pub async fn set_discovery(&self, discovery: DiscoverySnapshot) {
         *self.inner.discovery.write().await = Some(discovery);
+        *self.inner.discovery_error.write().await = None;
+    }
+
+    pub async fn set_discovery_error(&self, error: impl Into<String>) {
+        *self.inner.discovery_error.write().await = Some(error.into());
+    }
+
+    pub async fn set_clipboard_status(&self, ok: bool, detail: impl Into<String>) {
+        *self.inner.clipboard_status.write().await = DiagnosticStatus {
+            ok,
+            detail: detail.into(),
+        };
     }
 
     pub async fn set_history(&self, history: Vec<HistoryItem>) {
@@ -114,32 +149,46 @@ impl DaemonState {
             }
             Some(request::Body::Config(_)) => {
                 #[derive(Serialize)]
-                struct RedactedConfig<'a> {
-                    shared: &'a crate::config::SharedConfig,
+                struct RedactedLocal<'a> {
                     listen_port: u16,
                     discovery_interval_seconds: u64,
                     netbird_command: String,
                     mesh_key_file_configured: bool,
+                    config_path: &'a str,
                 }
 
+                #[derive(Serialize)]
+                struct RedactedConfig<'a> {
+                    shared: &'a crate::config::SharedConfig,
+                    local: RedactedLocal<'a>,
+                }
+
+                let config_path = self.inner.config_path.to_string_lossy();
                 let redacted = RedactedConfig {
                     shared: &self.inner.config.shared,
-                    listen_port: self.inner.config.local.listen_port,
-                    discovery_interval_seconds: self.inner.config.local.discovery_interval_seconds,
-                    netbird_command: self
-                        .inner
-                        .config
-                        .local
-                        .netbird_command
-                        .display()
-                        .to_string(),
-                    mesh_key_file_configured: !self
-                        .inner
-                        .config
-                        .local
-                        .mesh_key_file
-                        .as_os_str()
-                        .is_empty(),
+                    local: RedactedLocal {
+                        listen_port: self.inner.config.local.listen_port,
+                        discovery_interval_seconds: self
+                            .inner
+                            .config
+                            .local
+                            .discovery_interval_seconds,
+                        netbird_command: self
+                            .inner
+                            .config
+                            .local
+                            .netbird_command
+                            .display()
+                            .to_string(),
+                        mesh_key_file_configured: !self
+                            .inner
+                            .config
+                            .local
+                            .mesh_key_file
+                            .as_os_str()
+                            .is_empty(),
+                        config_path: &config_path,
+                    },
                 };
                 match serde_json::to_vec(&redacted) {
                     Ok(redacted_json) => response::Body::Config(ConfigResponse { redacted_json }),
@@ -182,12 +231,13 @@ impl DaemonState {
                 response::Body::History(HistoryResponse { items })
             }
             Some(request::Body::Activate(activate)) => {
+                let content_id = activate.content_id;
                 let (reply, result) = oneshot::channel();
                 if self
                     .inner
                     .commands
                     .send(DaemonCommand::Activate {
-                        content_id: activate.content_id,
+                        content_id: content_id.clone(),
                         reply,
                     })
                     .is_err()
@@ -199,7 +249,11 @@ impl DaemonState {
                     );
                 }
                 match result.await {
-                    Ok(Ok(())) => response::Body::Mutation(MutationResponse { ok: true }),
+                    Ok(Ok(())) => response::Body::Mutation(MutationResponse {
+                        ok: true,
+                        message: "clipboard activated".to_owned(),
+                        resource_id: Some(content_id),
+                    }),
                     Ok(Err(message)) => {
                         return error_response(request_id, "activation_failed", message);
                     }
@@ -211,6 +265,179 @@ impl DaemonState {
                         );
                     }
                 }
+            }
+            Some(request::Body::Peers(_)) => {
+                let discovery = self.inner.discovery.read().await;
+                let discovery_error = self.inner.discovery_error.read().await.clone();
+                let peers = discovery.as_ref().map_or_else(Vec::new, |snapshot| {
+                    snapshot
+                        .peers
+                        .iter()
+                        .map(|peer| PeerItem {
+                            hostname: peer.hostname.clone(),
+                            address: peer.address.to_string(),
+                            connected: peer.connected,
+                        })
+                        .collect()
+                });
+                response::Body::Peers(PeersResponse {
+                    local_hostname: discovery.as_ref().map_or_else(
+                        || self.inner.hostname.clone(),
+                        |snapshot| snapshot.local_hostname.clone(),
+                    ),
+                    local_address: discovery
+                        .as_ref()
+                        .map(|snapshot| snapshot.local_address.to_string()),
+                    peers,
+                    discovery_error,
+                })
+            }
+            Some(request::Body::HistoryUpdate(update)) => {
+                let action = match HistoryUpdateAction::try_from(update.action) {
+                    Ok(HistoryUpdateAction::Pin) => HistoryUpdateAction::Pin,
+                    Ok(HistoryUpdateAction::Unpin) => HistoryUpdateAction::Unpin,
+                    Ok(HistoryUpdateAction::Delete) => HistoryUpdateAction::Delete,
+                    Ok(HistoryUpdateAction::Unspecified) | Err(_) => {
+                        return error_response(
+                            request_id,
+                            "invalid_request",
+                            "history update action is missing or unknown",
+                        );
+                    }
+                };
+                let content_id = update.content_id;
+                let (reply, result) = oneshot::channel();
+                let command = match action {
+                    HistoryUpdateAction::Pin => DaemonCommand::SetPinned {
+                        content_id: content_id.clone(),
+                        pinned: true,
+                        reply,
+                    },
+                    HistoryUpdateAction::Unpin => DaemonCommand::SetPinned {
+                        content_id: content_id.clone(),
+                        pinned: false,
+                        reply,
+                    },
+                    HistoryUpdateAction::Delete => DaemonCommand::Delete {
+                        content_id: content_id.clone(),
+                        reply,
+                    },
+                    HistoryUpdateAction::Unspecified => unreachable!(),
+                };
+                if self.inner.commands.send(command).is_err() {
+                    return error_response(
+                        request_id,
+                        "daemon_unavailable",
+                        "daemon command processor is unavailable",
+                    );
+                }
+                match result.await {
+                    Ok(Ok(())) => response::Body::Mutation(MutationResponse {
+                        ok: true,
+                        message: match action {
+                            HistoryUpdateAction::Pin => "history item pinned",
+                            HistoryUpdateAction::Unpin => "history item unpinned",
+                            HistoryUpdateAction::Delete => "history item deleted",
+                            HistoryUpdateAction::Unspecified => unreachable!(),
+                        }
+                        .to_owned(),
+                        resource_id: Some(content_id),
+                    }),
+                    Ok(Err(message)) => {
+                        return error_response(request_id, "history_update_failed", message);
+                    }
+                    Err(_) => {
+                        return error_response(
+                            request_id,
+                            "daemon_unavailable",
+                            "daemon command processor stopped",
+                        );
+                    }
+                }
+            }
+            Some(request::Body::Diagnostics(_)) => {
+                let discovery = self.inner.discovery.read().await;
+                let discovery_error = self.inner.discovery_error.read().await;
+                let clipboard = self.inner.clipboard_status.read().await.clone();
+                let discovery_ok = discovery.is_some() && discovery_error.is_none();
+                let discovery_detail = if let Some(error) = discovery_error.as_deref() {
+                    error.to_owned()
+                } else if let Some(snapshot) = discovery.as_ref() {
+                    format!("{} peers visible", snapshot.peers.len())
+                } else {
+                    "waiting for the first NetBird discovery result".to_owned()
+                };
+                response::Body::Diagnostics(DiagnosticsResponse {
+                    checks: vec![
+                        DiagnosticCheck {
+                            name: "daemon".to_owned(),
+                            ok: true,
+                            detail: format!(
+                                "running for {} seconds",
+                                self.inner.started.elapsed().as_secs()
+                            ),
+                        },
+                        DiagnosticCheck {
+                            name: "config".to_owned(),
+                            ok: true,
+                            detail: self.inner.config_path.display().to_string(),
+                        },
+                        DiagnosticCheck {
+                            name: "encrypted_storage".to_owned(),
+                            ok: true,
+                            detail: "open and ready".to_owned(),
+                        },
+                        DiagnosticCheck {
+                            name: "mesh_secret".to_owned(),
+                            ok: true,
+                            detail: "loaded from an owner-only key file".to_owned(),
+                        },
+                        DiagnosticCheck {
+                            name: "clipboard".to_owned(),
+                            ok: clipboard.ok,
+                            detail: clipboard.detail,
+                        },
+                        DiagnosticCheck {
+                            name: "netbird".to_owned(),
+                            ok: discovery_ok,
+                            detail: discovery_detail,
+                        },
+                    ],
+                })
+            }
+            Some(request::Body::ShareClipboard(_)) => {
+                return error_response(
+                    request_id,
+                    "unsupported",
+                    "explicit sharing is unavailable because this clipboard backend cannot inspect the current offer on demand",
+                );
+            }
+            Some(request::Body::Transfers(_)) => {
+                return error_response(
+                    request_id,
+                    "unsupported",
+                    "transfer tracking is not available in this daemon build",
+                );
+            }
+            Some(request::Body::TransferCancel(cancel)) => {
+                return error_response(
+                    request_id,
+                    "unsupported",
+                    format!(
+                        "transfer cancellation is not available in this daemon build (requested {})",
+                        cancel.transfer_id
+                    ),
+                );
+            }
+            Some(request::Body::ForgetDevice(forget)) => {
+                return error_response(
+                    request_id,
+                    "unsupported",
+                    format!(
+                        "device forgetting is not exposed by the replica backend in this build (requested {})",
+                        forget.device_id
+                    ),
+                );
             }
             None => {
                 return error_response(request_id, "missing_request", "request body is missing");
@@ -298,6 +525,7 @@ fn codec() -> LengthDelimitedCodec {
 async fn prepare_socket(socket: &Path) -> Result<(), IpcError> {
     let parent = socket.parent().ok_or(IpcError::MissingSocketParent)?;
     tokio::fs::create_dir_all(parent).await?;
+    set_directory_permissions(parent)?;
 
     match UnixStream::connect(socket).await {
         Ok(_) => Err(IpcError::AlreadyRunning),
@@ -321,6 +549,14 @@ fn set_socket_permissions(socket: &Path) -> Result<(), IpcError> {
     use std::os::unix::fs::PermissionsExt;
 
     std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o600))?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_directory_permissions(directory: &Path) -> Result<(), IpcError> {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))?;
     Ok(())
 }
 
@@ -358,7 +594,10 @@ pub enum IpcError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use protocol::{StatusRequest, request};
+    use protocol::{
+        HistoryRequest, HistoryUpdateAction, HistoryUpdateRequest, ShareClipboardRequest,
+        StatusRequest, request,
+    };
 
     #[tokio::test]
     async fn status_round_trip_over_unix_socket() {
@@ -404,7 +643,147 @@ mod tests {
         };
         assert_eq!(status.hostname, "test-node");
 
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            assert_eq!(
+                std::fs::metadata(temporary.path())
+                    .expect("runtime directory metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+            assert_eq!(
+                std::fs::metadata(&socket)
+                    .expect("socket metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+
         shutdown.cancel();
         server.await.expect("server task");
+    }
+
+    #[tokio::test]
+    async fn history_search_is_bounded_and_case_insensitive() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let (commands, _command_rx) = mpsc::unbounded_channel();
+        let state = DaemonState::new(
+            "test-node".to_owned(),
+            temporary.path().join("config.toml"),
+            Config::default(),
+            commands,
+        );
+        state
+            .set_history(vec![
+                HistoryItem {
+                    content_id: "alpha".to_owned(),
+                    preview: "Build Finished".to_owned(),
+                    mime_types: vec!["text/plain".to_owned()],
+                    logical_size: 14,
+                    source_node: "kiwi".to_owned(),
+                    pinned: false,
+                    physical_millis: 2,
+                },
+                HistoryItem {
+                    content_id: "beta".to_owned(),
+                    preview: "unrelated".to_owned(),
+                    mime_types: vec!["image/png".to_owned()],
+                    logical_size: 20,
+                    source_node: "vd".to_owned(),
+                    pinned: false,
+                    physical_millis: 1,
+                },
+            ])
+            .await;
+
+        let response = state
+            .handle(Request {
+                protocol_version: IPC_PROTOCOL_VERSION,
+                request_id: 8,
+                body: Some(request::Body::History(HistoryRequest {
+                    query: "FINISHED".to_owned(),
+                    limit: 1,
+                })),
+            })
+            .await;
+        let Some(response::Body::History(history)) = response.body else {
+            panic!("expected history response");
+        };
+        assert_eq!(history.items.len(), 1);
+        assert_eq!(history.items[0].content_id, "alpha");
+    }
+
+    #[tokio::test]
+    async fn history_mutation_reaches_daemon_command_processor() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let (commands, mut command_rx) = mpsc::unbounded_channel();
+        let state = DaemonState::new(
+            "test-node".to_owned(),
+            temporary.path().join("config.toml"),
+            Config::default(),
+            commands,
+        );
+        let handler = tokio::spawn(async move {
+            state
+                .handle(Request {
+                    protocol_version: IPC_PROTOCOL_VERSION,
+                    request_id: 9,
+                    body: Some(request::Body::HistoryUpdate(HistoryUpdateRequest {
+                        content_id: "content-id".to_owned(),
+                        action: HistoryUpdateAction::Pin as i32,
+                    })),
+                })
+                .await
+        });
+
+        let command = command_rx.recv().await.expect("daemon command");
+        let DaemonCommand::SetPinned {
+            content_id,
+            pinned,
+            reply,
+        } = command
+        else {
+            panic!("expected pin command");
+        };
+        assert_eq!(content_id, "content-id");
+        assert!(pinned);
+        reply.send(Ok(())).expect("mutation reply");
+
+        let response = handler.await.expect("handler task");
+        let Some(response::Body::Mutation(mutation)) = response.body else {
+            panic!("expected mutation response");
+        };
+        assert!(mutation.ok);
+        assert_eq!(mutation.resource_id.as_deref(), Some("content-id"));
+    }
+
+    #[tokio::test]
+    async fn unavailable_backends_return_explicit_unsupported_error() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let (commands, _command_rx) = mpsc::unbounded_channel();
+        let state = DaemonState::new(
+            "test-node".to_owned(),
+            temporary.path().join("config.toml"),
+            Config::default(),
+            commands,
+        );
+        let response = state
+            .handle(Request {
+                protocol_version: IPC_PROTOCOL_VERSION,
+                request_id: 10,
+                body: Some(request::Body::ShareClipboard(ShareClipboardRequest {})),
+            })
+            .await;
+        let Some(response::Body::Error(error)) = response.body else {
+            panic!("expected error response");
+        };
+        assert_eq!(error.code, "unsupported");
+        assert!(error.message.contains("current offer"));
     }
 }

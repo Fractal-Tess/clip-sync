@@ -1,20 +1,19 @@
-use std::{path::PathBuf, time::Duration};
+use std::path::PathBuf;
 
 use anyhow::{Context, bail};
 use clap::{Args, Parser, Subcommand};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::{
-    clipboard::{backend::ClipboardBackend, wayland::WaylandBackend},
     config::{AppPaths, Config},
-    crypto::MeshSecret,
     daemon,
-    discovery::{NetbirdDiscovery, PeerDiscovery},
     ipc::{
         self,
         protocol::{
-            ActivateRequest, HistoryRequest, IPC_PROTOCOL_VERSION, Request, StatusRequest, request,
-            response,
+            ActivateRequest, ConfigRequest, DiagnosticsRequest, ForgetDeviceRequest,
+            HistoryRequest, HistoryUpdateAction, HistoryUpdateRequest, IPC_PROTOCOL_VERSION,
+            PeersRequest, Request, ShareClipboardRequest, StatusRequest, TransferCancelRequest,
+            TransfersRequest, request, response,
         },
     },
 };
@@ -35,18 +34,32 @@ enum Command {
     Daemon,
     /// Query the running daemon.
     Status(OutputArgs),
+    /// List peers currently visible through `NetBird` discovery.
+    Peers(OutputArgs),
     /// Inspect or initialize configuration.
     Config {
         #[command(subcommand)]
         command: ConfigCommand,
     },
-    /// Search and activate retained clipboard history.
+    /// Search and manage retained clipboard history.
     History {
         #[command(subcommand)]
         command: HistoryCommand,
     },
-    /// Check local configuration, secret provisioning, and `NetBird` discovery.
+    /// Report live daemon, storage, clipboard, and discovery diagnostics.
     Doctor(OutputArgs),
+    /// Explicitly add the current clipboard even when it exceeds capture policy.
+    ShareClipboard(OutputArgs),
+    /// Inspect or cancel resumable transfers.
+    Transfer {
+        #[command(subcommand)]
+        command: TransferCommand,
+    },
+    /// Manage remembered mesh devices.
+    Device {
+        #[command(subcommand)]
+        command: DeviceCommand,
+    },
     /// Open the optional egui interface.
     #[cfg(feature = "ui")]
     Ui {
@@ -55,7 +68,7 @@ enum Command {
     },
 }
 
-#[derive(Debug, Clone, Args)]
+#[derive(Debug, Clone, Copy, Args)]
 struct OutputArgs {
     /// Emit stable machine-readable JSON.
     #[arg(long)]
@@ -67,7 +80,7 @@ struct OutputArgs {
 enum UiCommand {
     /// Open the compact keyboard-first history switcher.
     Switcher,
-    /// Open the full control-center shell.
+    /// Open the full control center.
     Control,
 }
 
@@ -81,23 +94,62 @@ enum HistoryCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Set one retained item as the active clipboard and move it to the top.
-    Activate {
-        content_id: String,
+    /// Search retained history.
+    Search {
+        query: String,
+        #[arg(long, default_value_t = 100)]
+        limit: u32,
         #[arg(long)]
         json: bool,
     },
+    /// Set one retained item as the active clipboard and move it to the top.
+    Activate(MutationArgs),
+    /// Replicate a pin for one retained item.
+    Pin(MutationArgs),
+    /// Replicate removal of a pin from one retained item.
+    Unpin(MutationArgs),
+    /// Replicate deletion of one retained item.
+    Delete(MutationArgs),
+}
+
+#[derive(Debug, Args)]
+struct MutationArgs {
+    content_id: String,
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Debug, Subcommand)]
 enum ConfigCommand {
-    /// Show the effective local configuration with the secret path redacted.
+    /// Show the daemon's effective configuration with secret paths redacted.
     Show(OutputArgs),
     /// Write a documented default config file.
     Init {
         /// Replace an existing config file.
         #[arg(long)]
         force: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum TransferCommand {
+    /// List active, queued, and interrupted transfers.
+    List(OutputArgs),
+    /// Cancel a transfer and its partial data.
+    Cancel {
+        transfer_id: String,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum DeviceCommand {
+    /// Replicate rejection of a previously trusted device identity.
+    Forget {
+        device_id: String,
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -111,34 +163,19 @@ struct StatusOutput<'a> {
     discovered_peers: u32,
 }
 
-#[derive(Serialize)]
-struct SafeLocal<'a> {
+#[derive(Debug, Deserialize, Serialize)]
+struct SafeConfig {
+    shared: crate::config::SharedConfig,
+    local: SafeLocal,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct SafeLocal {
     listen_port: u16,
     discovery_interval_seconds: u64,
     netbird_command: String,
     mesh_key_file_configured: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    config_path: Option<&'a str>,
-}
-
-#[derive(Serialize)]
-struct SafeConfig<'a> {
-    shared: &'a crate::config::SharedConfig,
-    local: SafeLocal<'a>,
-}
-
-#[derive(Serialize)]
-struct Check {
-    ok: bool,
-    detail: String,
-}
-
-#[derive(Serialize)]
-struct DoctorOutput {
-    config: Check,
-    mesh_key_file: Check,
-    netbird: Check,
-    wayland: Check,
+    config_path: String,
 }
 
 impl Cli {
@@ -146,7 +183,7 @@ impl Cli {
     ///
     /// # Errors
     ///
-    /// Returns an error when configuration, local IPC, discovery, or daemon startup fails.
+    /// Returns an error when configuration, local IPC, or daemon startup fails.
     pub async fn run(self) -> anyhow::Result<()> {
         let paths = AppPaths::discover(self.config)?;
         match self.command {
@@ -155,33 +192,33 @@ impl Cli {
                 daemon::run(paths, config).await
             }
             Command::Status(output) => status(&paths, output).await,
-            Command::Config { command } => config_command(&paths, command),
+            Command::Peers(output) => peers(&paths, output).await,
+            Command::Config { command } => config_command(&paths, command).await,
             Command::History { command } => history_command(&paths, command).await,
             Command::Doctor(output) => doctor(&paths, output).await,
+            Command::ShareClipboard(output) => share_clipboard(&paths, output).await,
+            Command::Transfer { command } => transfer_command(&paths, command).await,
+            Command::Device { command } => device_command(&paths, command).await,
             #[cfg(feature = "ui")]
             Command::Ui { command } => {
                 let mode = match command {
                     UiCommand::Switcher => crate::ui::UiMode::Switcher,
                     UiCommand::Control => crate::ui::UiMode::Control,
                 };
-                crate::ui::run(mode).map_err(anyhow::Error::msg)
+                crate::ui::run(mode, paths).map_err(anyhow::Error::msg)
             }
         }
     }
 }
 
 async fn status(paths: &AppPaths, output: OutputArgs) -> anyhow::Result<()> {
-    let response = ipc::request(
-        &paths.socket,
-        Request {
-            protocol_version: IPC_PROTOCOL_VERSION,
-            request_id: 1,
-            body: Some(request::Body::Status(StatusRequest {})),
-        },
+    let response = daemon_request(
+        paths,
+        1,
+        request::Body::Status(StatusRequest {}),
+        output.json,
     )
-    .await
-    .with_context(|| format!("connect to daemon at {}", paths.socket.display()))?;
-
+    .await?;
     match response.body {
         Some(response::Body::Status(status)) => {
             let value = StatusOutput {
@@ -193,7 +230,7 @@ async fn status(paths: &AppPaths, output: OutputArgs) -> anyhow::Result<()> {
                 discovered_peers: status.discovered_peers,
             };
             if output.json {
-                println!("{}", serde_json::to_string_pretty(&value)?);
+                print_json(&value)?;
             } else {
                 println!("clip-sync {} on {}", value.version, value.hostname);
                 println!("uptime: {}s", value.uptime_seconds);
@@ -206,112 +243,186 @@ async fn status(paths: &AppPaths, output: OutputArgs) -> anyhow::Result<()> {
             }
             Ok(())
         }
-        Some(response::Body::Error(error)) => bail!("{}: {}", error.code, error.message),
-        _ => bail!("daemon returned an unexpected response"),
+        Some(response::Body::Error(error)) => Err(daemon_response_error(&error, output.json)),
+        _ => bail!("daemon returned an unexpected response to status"),
+    }
+}
+
+async fn peers(paths: &AppPaths, output: OutputArgs) -> anyhow::Result<()> {
+    let response =
+        daemon_request(paths, 2, request::Body::Peers(PeersRequest {}), output.json).await?;
+    match response.body {
+        Some(response::Body::Peers(peers)) if output.json => {
+            let peer_items = peers
+                .peers
+                .into_iter()
+                .map(|peer| {
+                    serde_json::json!({
+                        "hostname": peer.hostname,
+                        "address": peer.address,
+                        "connected": peer.connected,
+                    })
+                })
+                .collect::<Vec<_>>();
+            print_json(&serde_json::json!({
+                "local_hostname": peers.local_hostname,
+                "local_address": peers.local_address,
+                "peers": peer_items,
+                "discovery_error": peers.discovery_error,
+            }))
+        }
+        Some(response::Body::Peers(peers)) => {
+            println!(
+                "local: {} ({})",
+                peers.local_hostname,
+                peers
+                    .local_address
+                    .as_deref()
+                    .unwrap_or("address unavailable")
+            );
+            if let Some(error) = peers.discovery_error {
+                println!("discovery: unavailable ({error})");
+            }
+            if peers.peers.is_empty() {
+                println!("no peers discovered");
+            }
+            for peer in peers.peers {
+                let status = if peer.connected {
+                    "connected"
+                } else {
+                    "offline"
+                };
+                println!("{}  {}  {status}", peer.hostname, peer.address);
+            }
+            Ok(())
+        }
+        Some(response::Body::Error(error)) => Err(daemon_response_error(&error, output.json)),
+        _ => bail!("daemon returned an unexpected response to peers"),
     }
 }
 
 async fn history_command(paths: &AppPaths, command: HistoryCommand) -> anyhow::Result<()> {
     match command {
         HistoryCommand::List { query, limit, json } => {
-            let response = ipc::request(
-                &paths.socket,
-                Request {
-                    protocol_version: IPC_PROTOCOL_VERSION,
-                    request_id: 3,
-                    body: Some(request::Body::History(HistoryRequest {
-                        query: query.unwrap_or_default(),
-                        limit,
-                    })),
-                },
-            )
-            .await
-            .with_context(|| format!("connect to daemon at {}", paths.socket.display()))?;
-
-            match response.body {
-                Some(response::Body::History(history)) if json => {
-                    let items = history
-                        .items
-                        .into_iter()
-                        .map(|item| {
-                            serde_json::json!({
-                                "content_id": item.content_id,
-                                "preview": item.preview,
-                                "mime_types": item.mime_types,
-                                "logical_size": item.logical_size,
-                                "source_node": item.source_node,
-                                "pinned": item.pinned,
-                                "physical_millis": item.physical_millis,
-                            })
-                        })
-                        .collect::<Vec<_>>();
-                    println!("{}", serde_json::to_string_pretty(&items)?);
-                    Ok(())
-                }
-                Some(response::Body::History(history)) => {
-                    for item in history.items {
-                        let short_id = item.content_id.chars().take(12).collect::<String>();
-                        println!("{short_id}  {:>8} B  {}", item.logical_size, item.preview);
-                    }
-                    Ok(())
-                }
-                Some(response::Body::Error(error)) => {
-                    bail!("{}: {}", error.code, error.message)
-                }
-                _ => bail!("daemon returned an unexpected response"),
-            }
+            history_query(paths, query.unwrap_or_default(), limit, json).await
         }
-        HistoryCommand::Activate { content_id, json } => {
-            let response = ipc::request(
-                &paths.socket,
-                Request {
-                    protocol_version: IPC_PROTOCOL_VERSION,
-                    request_id: 4,
-                    body: Some(request::Body::Activate(ActivateRequest { content_id })),
-                },
+        HistoryCommand::Search { query, limit, json } => {
+            history_query(paths, query, limit, json).await
+        }
+        HistoryCommand::Activate(args) => {
+            let response = daemon_request(
+                paths,
+                4,
+                request::Body::Activate(ActivateRequest {
+                    content_id: args.content_id,
+                }),
+                args.json,
             )
-            .await
-            .with_context(|| format!("connect to daemon at {}", paths.socket.display()))?;
-
-            match response.body {
-                Some(response::Body::Mutation(result)) if result.ok => {
-                    if json {
-                        println!("{{\"ok\":true}}");
-                    } else {
-                        println!("clipboard activated");
-                    }
-                    Ok(())
-                }
-                Some(response::Body::Error(error)) => {
-                    bail!("{}: {}", error.code, error.message)
-                }
-                _ => bail!("daemon returned an unexpected response"),
-            }
+            .await?;
+            mutation_response(response, args.json, "clipboard activated")
+        }
+        HistoryCommand::Pin(args) => history_update(paths, args, HistoryUpdateAction::Pin).await,
+        HistoryCommand::Unpin(args) => {
+            history_update(paths, args, HistoryUpdateAction::Unpin).await
+        }
+        HistoryCommand::Delete(args) => {
+            history_update(paths, args, HistoryUpdateAction::Delete).await
         }
     }
 }
 
-fn config_command(paths: &AppPaths, command: ConfigCommand) -> anyhow::Result<()> {
-    match command {
-        ConfigCommand::Show(output) => {
-            let config = Config::load(&paths.config)?;
-            let display_path = paths.config.to_str();
-            let safe = SafeConfig {
-                shared: &config.shared,
-                local: SafeLocal {
-                    listen_port: config.local.listen_port,
-                    discovery_interval_seconds: config.local.discovery_interval_seconds,
-                    netbird_command: config.local.netbird_command.display().to_string(),
-                    mesh_key_file_configured: !config.local.mesh_key_file.as_os_str().is_empty(),
-                    config_path: display_path,
-                },
-            };
-            if output.json {
-                println!("{}", serde_json::to_string_pretty(&safe)?);
-            } else {
-                println!("{}", toml::to_string_pretty(&safe)?);
+async fn history_query(
+    paths: &AppPaths,
+    query: String,
+    limit: u32,
+    json: bool,
+) -> anyhow::Result<()> {
+    let response = daemon_request(
+        paths,
+        3,
+        request::Body::History(HistoryRequest { query, limit }),
+        json,
+    )
+    .await?;
+    match response.body {
+        Some(response::Body::History(history)) if json => {
+            let items = history
+                .items
+                .into_iter()
+                .map(|item| {
+                    serde_json::json!({
+                        "content_id": item.content_id,
+                        "preview": item.preview,
+                        "mime_types": item.mime_types,
+                        "logical_size": item.logical_size,
+                        "source_node": item.source_node,
+                        "pinned": item.pinned,
+                        "physical_millis": item.physical_millis,
+                    })
+                })
+                .collect::<Vec<_>>();
+            print_json(&items)
+        }
+        Some(response::Body::History(history)) => {
+            for item in history.items {
+                let short_id = item.content_id.chars().take(12).collect::<String>();
+                let pin = if item.pinned { "pin" } else { "   " };
+                println!(
+                    "{short_id}  {pin}  {:>8} B  {}",
+                    item.logical_size, item.preview
+                );
             }
             Ok(())
+        }
+        Some(response::Body::Error(error)) => Err(daemon_response_error(&error, json)),
+        _ => bail!("daemon returned an unexpected response to history query"),
+    }
+}
+
+async fn history_update(
+    paths: &AppPaths,
+    args: MutationArgs,
+    action: HistoryUpdateAction,
+) -> anyhow::Result<()> {
+    let response = daemon_request(
+        paths,
+        5,
+        request::Body::HistoryUpdate(HistoryUpdateRequest {
+            content_id: args.content_id,
+            action: action as i32,
+        }),
+        args.json,
+    )
+    .await?;
+    mutation_response(response, args.json, "history updated")
+}
+
+async fn config_command(paths: &AppPaths, command: ConfigCommand) -> anyhow::Result<()> {
+    match command {
+        ConfigCommand::Show(output) => {
+            let response = daemon_request(
+                paths,
+                6,
+                request::Body::Config(ConfigRequest {}),
+                output.json,
+            )
+            .await?;
+            match response.body {
+                Some(response::Body::Config(config)) => {
+                    let config: SafeConfig = serde_json::from_slice(&config.redacted_json)
+                        .context("decode daemon config response")?;
+                    if output.json {
+                        print_json(&config)?;
+                    } else {
+                        println!("{}", toml::to_string_pretty(&config)?);
+                    }
+                    Ok(())
+                }
+                Some(response::Body::Error(error)) => {
+                    Err(daemon_response_error(&error, output.json))
+                }
+                _ => bail!("daemon returned an unexpected response to config show"),
+            }
         }
         ConfigCommand::Init { force } => {
             if paths.config.exists() && !force {
@@ -328,90 +439,237 @@ fn config_command(paths: &AppPaths, command: ConfigCommand) -> anyhow::Result<()
 }
 
 async fn doctor(paths: &AppPaths, output: OutputArgs) -> anyhow::Result<()> {
-    let config = Config::load(&paths.config)?;
-    let mesh_secret = MeshSecret::load(&config.local.mesh_key_file);
-    let discovery = NetbirdDiscovery::new(&config.local.netbird_command)
-        .with_timeout(Duration::from_secs(5))
-        .discover()
-        .await;
-    let wayland = WaylandBackend::new().probe().await;
-
-    let report = DoctorOutput {
-        config: Check {
-            ok: true,
-            detail: paths.config.display().to_string(),
-        },
-        mesh_key_file: match mesh_secret {
-            Ok(_) => Check {
-                ok: true,
-                detail: "valid and private".to_owned(),
-            },
-            Err(error) => Check {
-                ok: false,
-                detail: error.to_string(),
-            },
-        },
-        netbird: match discovery {
-            Ok(snapshot) => Check {
-                ok: true,
-                detail: format!("connected; {} peers visible", snapshot.peers.len()),
-            },
-            Err(error) => Check {
-                ok: false,
-                detail: error.to_string(),
-            },
-        },
-        wayland: match wayland {
-            Ok(probe) if probe.is_usable() => Check {
-                ok: true,
-                detail: format!(
-                    "{} data-control with seat",
-                    probe.protocol.expect("usable probe has protocol")
-                ),
-            },
-            Ok(probe) => Check {
-                ok: false,
-                detail: format!("data-control={:?}, seat={}", probe.protocol, probe.has_seat),
-            },
-            Err(error) => Check {
-                ok: false,
-                detail: error.to_string(),
-            },
-        },
-    };
-
-    if output.json {
-        println!("{}", serde_json::to_string_pretty(&report)?);
-    } else {
-        println!(
-            "config: {} ({})",
-            check_mark(report.config.ok),
-            report.config.detail
-        );
-        println!(
-            "mesh key: {} ({})",
-            check_mark(report.mesh_key_file.ok),
-            report.mesh_key_file.detail
-        );
-        println!(
-            "NetBird: {} ({})",
-            check_mark(report.netbird.ok),
-            report.netbird.detail
-        );
-        println!(
-            "Wayland: {} ({})",
-            check_mark(report.wayland.ok),
-            report.wayland.detail
-        );
-    }
-
-    if report.config.ok && report.mesh_key_file.ok && report.netbird.ok && report.wayland.ok {
-        Ok(())
-    } else {
-        bail!("one or more checks failed")
+    let response = daemon_request(
+        paths,
+        7,
+        request::Body::Diagnostics(DiagnosticsRequest {}),
+        output.json,
+    )
+    .await?;
+    match response.body {
+        Some(response::Body::Diagnostics(diagnostics)) => {
+            let ok = diagnostics.checks.iter().all(|check| check.ok);
+            if output.json {
+                let checks = diagnostics
+                    .checks
+                    .iter()
+                    .map(|check| {
+                        serde_json::json!({
+                            "name": check.name,
+                            "ok": check.ok,
+                            "detail": check.detail,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                print_json(&serde_json::json!({ "ok": ok, "checks": checks }))?;
+            } else {
+                for check in diagnostics.checks {
+                    println!(
+                        "{}: {} ({})",
+                        check.name,
+                        if check.ok { "ok" } else { "failed" },
+                        check.detail
+                    );
+                }
+            }
+            if ok {
+                Ok(())
+            } else {
+                bail!("one or more daemon checks failed")
+            }
+        }
+        Some(response::Body::Error(error)) => Err(daemon_response_error(&error, output.json)),
+        _ => bail!("daemon returned an unexpected response to diagnostics"),
     }
 }
 
-fn check_mark(ok: bool) -> &'static str {
-    if ok { "ok" } else { "failed" }
+async fn share_clipboard(paths: &AppPaths, output: OutputArgs) -> anyhow::Result<()> {
+    let response = daemon_request(
+        paths,
+        8,
+        request::Body::ShareClipboard(ShareClipboardRequest {}),
+        output.json,
+    )
+    .await?;
+    mutation_response(response, output.json, "clipboard shared")
+}
+
+async fn transfer_command(paths: &AppPaths, command: TransferCommand) -> anyhow::Result<()> {
+    match command {
+        TransferCommand::List(output) => {
+            let response = daemon_request(
+                paths,
+                9,
+                request::Body::Transfers(TransfersRequest {}),
+                output.json,
+            )
+            .await?;
+            match response.body {
+                Some(response::Body::Transfers(transfers)) if output.json => {
+                    let transfers = transfers
+                        .transfers
+                        .into_iter()
+                        .map(|transfer| {
+                            serde_json::json!({
+                                "transfer_id": transfer.transfer_id,
+                                "content_id": transfer.content_id,
+                                "peer": transfer.peer,
+                                "state": transfer.state,
+                                "completed_bytes": transfer.completed_bytes,
+                                "total_bytes": transfer.total_bytes,
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    print_json(&transfers)
+                }
+                Some(response::Body::Transfers(transfers)) => {
+                    if transfers.transfers.is_empty() {
+                        println!("no transfers");
+                    }
+                    for transfer in transfers.transfers {
+                        println!(
+                            "{}  {}  {}/{} B  {}",
+                            transfer.transfer_id,
+                            transfer.state,
+                            transfer.completed_bytes,
+                            transfer.total_bytes,
+                            transfer.peer
+                        );
+                    }
+                    Ok(())
+                }
+                Some(response::Body::Error(error)) => {
+                    Err(daemon_response_error(&error, output.json))
+                }
+                _ => bail!("daemon returned an unexpected response to transfers"),
+            }
+        }
+        TransferCommand::Cancel { transfer_id, json } => {
+            let response = daemon_request(
+                paths,
+                10,
+                request::Body::TransferCancel(TransferCancelRequest { transfer_id }),
+                json,
+            )
+            .await?;
+            mutation_response(response, json, "transfer cancelled")
+        }
+    }
+}
+
+async fn device_command(paths: &AppPaths, command: DeviceCommand) -> anyhow::Result<()> {
+    match command {
+        DeviceCommand::Forget { device_id, json } => {
+            let response = daemon_request(
+                paths,
+                11,
+                request::Body::ForgetDevice(ForgetDeviceRequest { device_id }),
+                json,
+            )
+            .await?;
+            mutation_response(response, json, "device forgotten")
+        }
+    }
+}
+
+async fn daemon_request(
+    paths: &AppPaths,
+    request_id: u64,
+    body: request::Body,
+    json: bool,
+) -> anyhow::Result<crate::ipc::protocol::Response> {
+    let result = ipc::request(
+        &paths.socket,
+        Request {
+            protocol_version: IPC_PROTOCOL_VERSION,
+            request_id,
+            body: Some(body),
+        },
+    )
+    .await;
+    match result {
+        Ok(response) => Ok(response),
+        Err(error) => {
+            let message = format!(
+                "clip-sync daemon is unavailable at {}; start clip-sync.service or run `clip-sync daemon`",
+                paths.socket.display()
+            );
+            if json {
+                print_json(&serde_json::json!({
+                    "ok": false,
+                    "error": {
+                        "code": "daemon_unavailable",
+                        "message": message,
+                    }
+                }))?;
+            }
+            Err(anyhow::Error::new(error).context(message))
+        }
+    }
+}
+
+fn mutation_response(
+    response: crate::ipc::protocol::Response,
+    json: bool,
+    fallback_message: &str,
+) -> anyhow::Result<()> {
+    match response.body {
+        Some(response::Body::Mutation(result)) if result.ok => {
+            if json {
+                print_json(&serde_json::json!({
+                    "ok": true,
+                    "message": result.message,
+                    "resource_id": result.resource_id,
+                }))?;
+            } else if result.message.is_empty() {
+                println!("{fallback_message}");
+            } else {
+                println!("{}", result.message);
+            }
+            Ok(())
+        }
+        Some(response::Body::Mutation(_)) => bail!("daemon reported an unsuccessful mutation"),
+        Some(response::Body::Error(error)) => Err(daemon_response_error(&error, json)),
+        _ => bail!("daemon returned an unexpected mutation response"),
+    }
+}
+
+fn daemon_response_error(error: &crate::ipc::protocol::ErrorResponse, json: bool) -> anyhow::Error {
+    if json {
+        let value = serde_json::json!({
+            "ok": false,
+            "error": {
+                "code": error.code,
+                "message": error.message,
+            }
+        });
+        if let Err(serialization_error) = print_json(&value) {
+            return serialization_error;
+        }
+    }
+    anyhow::anyhow!("{}: {}", error.code, error.message)
+}
+
+fn print_json(value: &impl Serialize) -> anyhow::Result<()> {
+    println!("{}", serde_json::to_string_pretty(value)?);
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cli_exposes_history_search_and_mutations() {
+        for arguments in [
+            vec!["clip-sync", "history", "search", "needle", "--json"],
+            vec!["clip-sync", "history", "pin", "content", "--json"],
+            vec!["clip-sync", "history", "unpin", "content"],
+            vec!["clip-sync", "history", "delete", "content"],
+            vec!["clip-sync", "transfer", "cancel", "transfer-id", "--json"],
+            vec!["clip-sync", "device", "forget", "device-id", "--json"],
+        ] {
+            Cli::try_parse_from(arguments).expect("command should parse");
+        }
+    }
 }
