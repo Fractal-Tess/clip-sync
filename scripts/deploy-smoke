@@ -51,7 +51,13 @@ if timeout 3 wl-paste --no-newline --type text/plain >"$local_original" 2>/dev/n
   local_had_text=1
 fi
 
-remote() { ssh -o BatchMode=yes "$host" "$@"; }
+remote() {
+  if [[ $# -ne 1 ]]; then
+    echo "internal error: remote expects one shell program" >&2
+    return 2
+  fi
+  printf '%s\n' "$1" | ssh -o BatchMode=yes "$host" /run/current-system/sw/bin/bash -s
+}
 
 cleanup() {
   set +e
