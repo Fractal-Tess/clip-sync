@@ -42,6 +42,8 @@ in
   };
 
   config = lib.mkIf cfg.enable {
+    environment.systemPackages = [ cfg.package ];
+
     systemd.user.services.clip-sync = {
       description = "Masterless encrypted clipboard-history mesh";
       documentation = [ "https://github.com/Fractal-Tess/clip-sync" ];
