@@ -8,8 +8,8 @@ use directories::BaseDirs;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub const DEFAULT_MESH_QUOTA_BYTES: u64 = 1024 * 1024 * 1024;
-pub const DEFAULT_CAPTURE_THRESHOLD_BYTES: u64 = 20 * 1024 * 1024;
+use crate::model::EffectiveSharedSettings;
+pub use crate::model::{DEFAULT_CAPTURE_THRESHOLD_BYTES, DEFAULT_MESH_QUOTA_BYTES};
 pub const DEFAULT_LISTEN_PORT: u16 = 24_892;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -101,6 +101,15 @@ impl Default for SharedConfig {
         Self {
             mesh_quota_bytes: DEFAULT_MESH_QUOTA_BYTES,
             capture_threshold_bytes: DEFAULT_CAPTURE_THRESHOLD_BYTES,
+        }
+    }
+}
+
+impl From<EffectiveSharedSettings> for SharedConfig {
+    fn from(settings: EffectiveSharedSettings) -> Self {
+        Self {
+            mesh_quota_bytes: settings.mesh_quota_bytes,
+            capture_threshold_bytes: settings.capture_threshold_bytes,
         }
     }
 }

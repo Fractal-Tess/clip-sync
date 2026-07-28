@@ -56,7 +56,7 @@ fn version_one_database_migrates_and_keeps_its_new_replica_identity() {
         let storage = EncryptedStorage::open(&path, &key).unwrap();
         assert_eq!(
             storage.meta_value("schema_version").unwrap().as_deref(),
-            Some("2")
+            Some("3")
         );
         assert!(storage.load_operations().unwrap().is_empty());
         storage.replica_metadata().unwrap()

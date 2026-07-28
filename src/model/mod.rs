@@ -8,6 +8,7 @@ mod content;
 mod identity;
 mod operation;
 mod projection;
+mod retention;
 mod seen_ops;
 
 pub use clock::{EventKey, HlcError, HlcTimestamp, HybridLogicalClock};
@@ -16,6 +17,12 @@ pub use content::{
     RepresentationDescriptor,
 };
 pub use identity::{NodeId, OpId, OpIdError};
-pub use operation::{Operation, SettingValue, StampedOperation};
-pub use projection::{ApplyOutcome, ContentView, Projection, ProjectionError};
+pub use operation::{
+    DEFAULT_CAPTURE_THRESHOLD_BYTES, DEFAULT_MESH_QUOTA_BYTES, EffectiveSharedSettings, Operation,
+    SettingValue, SharedSetting, StampedOperation,
+};
+pub use projection::{
+    ApplyOutcome, ContentView, Projection, ProjectionError, QuotaPlan, TombstoneView,
+};
+pub use retention::Acknowledgements;
 pub use seen_ops::SeenOps;

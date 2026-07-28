@@ -2,6 +2,9 @@ use serde::{Deserialize, Serialize};
 
 use super::{ContentId, EventKey, HlcTimestamp, NodeId, OpId, Payload};
 
+pub const DEFAULT_MESH_QUOTA_BYTES: u64 = 1024 * 1024 * 1024;
+pub const DEFAULT_CAPTURE_THRESHOLD_BYTES: u64 = 20 * 1024 * 1024;
+
 /// Replicated shared-setting value. Text is intended for non-secret policy
 /// values only; local paths, keys, and other bootstrap settings are not shared.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -13,12 +16,63 @@ pub enum SettingValue {
     Text(String),
 }
 
+/// Type-safe names for shared settings understood by this protocol version.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SharedSetting {
+    MeshQuotaBytes,
+    CaptureThresholdBytes,
+}
+
+impl SharedSetting {
+    pub const MESH_QUOTA_KEY: &'static str = "mesh_quota_bytes";
+    pub const CAPTURE_THRESHOLD_KEY: &'static str = "capture_threshold_bytes";
+
+    #[must_use]
+    pub const fn key(self) -> &'static str {
+        match self {
+            Self::MeshQuotaBytes => Self::MESH_QUOTA_KEY,
+            Self::CaptureThresholdBytes => Self::CAPTURE_THRESHOLD_KEY,
+        }
+    }
+
+    #[must_use]
+    pub fn from_key(key: &str) -> Option<Self> {
+        match key {
+            Self::MESH_QUOTA_KEY => Some(Self::MeshQuotaBytes),
+            Self::CAPTURE_THRESHOLD_KEY => Some(Self::CaptureThresholdBytes),
+            _ => None,
+        }
+    }
+}
+
+/// Effective shared settings after applying replicated LWW registers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EffectiveSharedSettings {
+    pub mesh_quota_bytes: u64,
+    pub capture_threshold_bytes: u64,
+}
+
+impl Default for EffectiveSharedSettings {
+    fn default() -> Self {
+        Self {
+            mesh_quota_bytes: DEFAULT_MESH_QUOTA_BYTES,
+            capture_threshold_bytes: DEFAULT_CAPTURE_THRESHOLD_BYTES,
+        }
+    }
+}
+
 /// Immutable operation body. There is deliberately no operation that embeds
 /// an active local clipboard action: remote replication only changes history.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Operation {
     Add {
+        content_id: ContentId,
+        payload: Payload,
+    },
+    /// Explicit share whose payload was larger than the effective mesh quota
+    /// when authored. It remains quota-exempt until explicitly deleted.
+    AddQuotaExempt {
         content_id: ContentId,
         payload: Payload,
     },
@@ -46,6 +100,7 @@ impl Operation {
     pub const fn content_id(&self) -> Option<ContentId> {
         match self {
             Self::Add { content_id, .. }
+            | Self::AddQuotaExempt { content_id, .. }
             | Self::Touch { content_id }
             | Self::Delete { content_id }
             | Self::SetPin { content_id, .. } => Some(*content_id),

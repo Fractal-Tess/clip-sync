@@ -9,9 +9,15 @@ use thiserror::Error;
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
-use crate::model::{HlcTimestamp, NodeId, OpId, Projection, ProjectionError, StampedOperation};
+use crate::{
+    model::{
+        Acknowledgements, ApplyOutcome, ContentId, HlcTimestamp, NodeId, OpId, Payload, Projection,
+        ProjectionError, SeenOps, SharedSetting, StampedOperation,
+    },
+    replica::{Replica, ReplicaError},
+};
 
-const SCHEMA_VERSION: u32 = 2;
+const SCHEMA_VERSION: u32 = 3;
 const OPERATION_ENCODING_VERSION: i64 = 1;
 const SQLCIPHER_KEY_BYTES: usize = 32;
 const SQLCIPHER_KEY_HEX_CHARS: usize = SQLCIPHER_KEY_BYTES * 2;
@@ -53,6 +59,17 @@ const MIGRATION_2: &str = "
     ) STRICT;
     UPDATE storage_meta SET value = '2' WHERE key = 'schema_version';
     PRAGMA user_version = 2;
+    COMMIT;
+";
+
+const MIGRATION_3: &str = "
+    BEGIN IMMEDIATE;
+    CREATE TABLE peer_acknowledgements (
+        peer_node BLOB PRIMARY KEY NOT NULL CHECK (length(peer_node) = 16),
+        frontier BLOB NOT NULL
+    ) STRICT, WITHOUT ROWID;
+    UPDATE storage_meta SET value = '3' WHERE key = 'schema_version';
+    PRAGMA user_version = 3;
     COMMIT;
 ";
 
@@ -99,6 +116,21 @@ pub enum StorageError {
         last: HlcTimestamp,
     },
 
+    #[error(
+        "observed HLC {observed:?} must advance past operation {operation:?} and persisted HLC {last:?}"
+    )]
+    InvalidObservedHlc {
+        observed: HlcTimestamp,
+        operation: HlcTimestamp,
+        last: HlcTimestamp,
+    },
+
+    #[error("received a new peer operation claiming the local node identity {0}")]
+    LocalOriginIngest(NodeId),
+
+    #[error("persisted local operation log does not match replica metadata: {0}")]
+    LocalOperationLogMismatch(String),
+
     #[error("serialized operation is invalid: {0}")]
     OperationDeserialization(#[source] serde_json::Error),
 
@@ -110,6 +142,12 @@ pub enum StorageError {
 
     #[error("operation serialization failed: {0}")]
     OperationSerialization(#[source] serde_json::Error),
+
+    #[error("acknowledgement serialization failed: {0}")]
+    AcknowledgementSerialization(#[source] serde_json::Error),
+
+    #[error("stored acknowledgement is invalid: {0}")]
+    AcknowledgementDeserialization(#[source] serde_json::Error),
 
     #[error(transparent)]
     Projection(#[from] ProjectionError),
@@ -302,62 +340,122 @@ impl EncryptedStorage {
         &mut self,
         operation: &StampedOperation,
     ) -> Result<AppendOutcome> {
+        let outcomes = self.append_local_operations(std::slice::from_ref(operation))?;
+        Ok(outcomes[0])
+    }
+
+    /// Appends a sequence of locally authored operations and advances replica
+    /// metadata in one transaction.
+    ///
+    /// This is used for quota enforcement, where a setting change and several
+    /// deterministic delete operations must either all survive a restart or
+    /// none of them may.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same validation errors as [`Self::append_local_operation`].
+    pub fn append_local_operations(
+        &mut self,
+        operations: &[StampedOperation],
+    ) -> Result<Vec<AppendOutcome>> {
+        if operations.is_empty() {
+            return Ok(Vec::new());
+        }
+        let serialized = operations
+            .iter()
+            .map(serialize_operation)
+            .collect::<Result<Vec<_>>>()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut metadata = read_replica_metadata(&transaction)?;
+        let mut outcomes = Vec::with_capacity(operations.len());
+        let mut metadata_changed = false;
+
+        for (operation, serialized) in operations.iter().zip(&serialized) {
+            if operation.id().node() != metadata.node_id {
+                return Err(StorageError::ReplicaNodeMismatch {
+                    operation: operation.id().node(),
+                    local: metadata.node_id,
+                });
+            }
+            let outcome =
+                insert_serialized_operation(&transaction, operation, serialized.as_slice())?;
+            match outcome {
+                AppendOutcome::Inserted => {
+                    if operation.id().counter() != metadata.next_operation_counter {
+                        return Err(StorageError::UnexpectedOperationCounter {
+                            expected: metadata.next_operation_counter,
+                            actual: operation.id().counter(),
+                        });
+                    }
+                    if operation.timestamp() <= metadata.last_hlc {
+                        return Err(StorageError::HlcRegression {
+                            operation: operation.timestamp(),
+                            last: metadata.last_hlc,
+                        });
+                    }
+                    metadata.next_operation_counter = metadata
+                        .next_operation_counter
+                        .checked_add(1)
+                        .filter(|counter| *counter <= MAX_SQLITE_INTEGER)
+                        .ok_or(StorageError::CounterExhausted)?;
+                    metadata.last_hlc = operation.timestamp();
+                    metadata_changed = true;
+                }
+                AppendOutcome::AlreadyPresent => {
+                    if operation.id().counter() >= metadata.next_operation_counter {
+                        return Err(StorageError::LocalOperationLogMismatch(format!(
+                            "operation {} exists but next counter is {}",
+                            operation.id(),
+                            metadata.next_operation_counter
+                        )));
+                    }
+                }
+            }
+            outcomes.push(outcome);
+        }
+
+        if metadata_changed {
+            update_replica_metadata(&transaction, metadata)?;
+        }
+        transaction.commit()?;
+        Ok(outcomes)
+    }
+
+    /// Persists a newly ingested peer operation together with the HLC produced
+    /// by observing it. This prevents a restart from authoring operations that
+    /// sort before already observed remote events.
+    ///
+    /// # Errors
+    ///
+    /// Rejects local-origin spoofing, invalid HLC advancement, conflicts, and
+    /// database failures.
+    pub fn append_ingested_operation(
+        &mut self,
+        operation: &StampedOperation,
+        observed_hlc: HlcTimestamp,
+    ) -> Result<AppendOutcome> {
         let serialized = serialize_operation(operation)?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut metadata = read_replica_metadata(&transaction)?;
+        if operation.id().node() == metadata.node_id {
+            return Err(StorageError::LocalOriginIngest(metadata.node_id));
+        }
         let outcome = insert_serialized_operation(&transaction, operation, &serialized)?;
-
-        if outcome == AppendOutcome::AlreadyPresent {
-            transaction.commit()?;
-            return Ok(outcome);
+        if outcome == AppendOutcome::Inserted {
+            if observed_hlc <= operation.timestamp() || observed_hlc <= metadata.last_hlc {
+                return Err(StorageError::InvalidObservedHlc {
+                    observed: observed_hlc,
+                    operation: operation.timestamp(),
+                    last: metadata.last_hlc,
+                });
+            }
+            metadata.last_hlc = observed_hlc;
+            update_replica_metadata(&transaction, metadata)?;
         }
-
-        let metadata = read_replica_metadata(&transaction)?;
-        if operation.id().node() != metadata.node_id {
-            return Err(StorageError::ReplicaNodeMismatch {
-                operation: operation.id().node(),
-                local: metadata.node_id,
-            });
-        }
-        if operation.id().counter() != metadata.next_operation_counter {
-            return Err(StorageError::UnexpectedOperationCounter {
-                expected: metadata.next_operation_counter,
-                actual: operation.id().counter(),
-            });
-        }
-        if operation.timestamp() <= metadata.last_hlc {
-            return Err(StorageError::HlcRegression {
-                operation: operation.timestamp(),
-                last: metadata.last_hlc,
-            });
-        }
-
-        let next_counter = metadata
-            .next_operation_counter
-            .checked_add(1)
-            .filter(|counter| *counter <= MAX_SQLITE_INTEGER)
-            .ok_or(StorageError::CounterExhausted)?;
-        let next_counter = sqlite_integer("next operation counter", next_counter)?;
-        let physical = sqlite_integer(
-            "last_hlc.physical_millis",
-            operation.timestamp().physical_millis(),
-        )?;
-        let logical = i64::from(operation.timestamp().logical());
-        let changed = transaction.execute(
-            "UPDATE local_replica
-             SET next_operation_counter = ?1,
-                 last_hlc_physical_millis = ?2,
-                 last_hlc_logical = ?3
-             WHERE singleton = 1",
-            (next_counter, physical, logical),
-        )?;
-        if changed != 1 {
-            return Err(StorageError::CorruptReplicaMetadata(
-                "singleton row disappeared during transaction".to_owned(),
-            ));
-        }
-
         transaction.commit()?;
         Ok(outcome)
     }
@@ -415,6 +513,104 @@ impl EncryptedStorage {
         Ok(projection)
     }
 
+    /// Reconstructs the complete in-memory replica from the immutable log and
+    /// durable authoring metadata, validating local counter continuity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for corrupt operations, inconsistent local metadata,
+    /// or a database failure while repairing an older database's persisted HLC.
+    pub fn load_replica(&mut self) -> Result<Replica> {
+        let operations = self.load_operations()?;
+        let mut projection = Projection::default();
+        projection.apply_all(&operations)?;
+        let mut metadata = self.replica_metadata()?;
+        let last_counter = metadata
+            .next_operation_counter
+            .checked_sub(1)
+            .ok_or_else(|| {
+                StorageError::CorruptReplicaMetadata("next counter is zero".to_owned())
+            })?;
+        let local_frontier = projection.seen_ops().frontier(metadata.node_id);
+        let local_has_gaps = projection
+            .seen_ops()
+            .gaps(metadata.node_id)
+            .next()
+            .is_some();
+        if local_frontier != last_counter || local_has_gaps {
+            return Err(StorageError::LocalOperationLogMismatch(format!(
+                "metadata last counter is {last_counter}, log frontier is {local_frontier}"
+            )));
+        }
+
+        if let Some(max_timestamp) = operations.iter().map(StampedOperation::timestamp).max()
+            && max_timestamp > metadata.last_hlc
+        {
+            metadata.last_hlc = max_timestamp;
+            update_replica_metadata(&self.connection, metadata)?;
+        }
+
+        Ok(Replica::restore(
+            metadata.node_id,
+            last_counter,
+            metadata.last_hlc,
+            projection,
+        ))
+    }
+
+    /// Monotonically records the anti-entropy frontier acknowledged by a peer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for malformed existing data, serialization, or SQL.
+    pub fn record_peer_acknowledgement(&mut self, peer: NodeId, seen: &SeenOps) -> Result<()> {
+        let mut acknowledgements = self.acknowledgements()?;
+        acknowledgements.record(peer, seen);
+        let merged = acknowledgements.peer(peer).ok_or_else(|| {
+            StorageError::CorruptReplicaMetadata(
+                "peer acknowledgement disappeared during merge".to_owned(),
+            )
+        })?;
+        let encoded =
+            serde_json::to_vec(merged).map_err(StorageError::AcknowledgementSerialization)?;
+        let peer_bytes = *peer.as_uuid().as_bytes();
+        self.connection.execute(
+            "INSERT INTO peer_acknowledgements (peer_node, frontier)
+             VALUES (?1, ?2)
+             ON CONFLICT(peer_node) DO UPDATE SET frontier = excluded.frontier",
+            (&peer_bytes[..], encoded),
+        )?;
+        Ok(())
+    }
+
+    /// Loads all persisted peer acknowledgement frontiers.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for malformed node IDs/frontiers or SQL.
+    pub fn acknowledgements(&self) -> Result<Acknowledgements> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT peer_node, frontier FROM peer_acknowledgements ORDER BY peer_node")?;
+        let mut rows = statement.query([])?;
+        let mut acknowledgements = Acknowledgements::default();
+        while let Some(row) = rows.next()? {
+            let peer_bytes: Vec<u8> = row.get(0)?;
+            let peer = Uuid::from_slice(&peer_bytes)
+                .map(NodeId::from_uuid)
+                .map_err(|_| {
+                    StorageError::CorruptReplicaMetadata(
+                        "acknowledgement peer ID is not a UUID".to_owned(),
+                    )
+                })?;
+            let encoded = Zeroizing::new(row.get::<_, Vec<u8>>(1)?);
+            let seen: SeenOps = serde_json::from_slice(&encoded)
+                .map_err(StorageError::AcknowledgementDeserialization)?;
+            acknowledgements.record(peer, &seen);
+        }
+        Ok(acknowledgements)
+    }
+
     /// Sets a metadata value. This compatibility API is retained for the
     /// `SQLCipher` at-rest validation probe.
     ///
@@ -466,6 +662,354 @@ impl EncryptedStorage {
     pub fn close(self) -> Result<()> {
         self.connection.close().map_err(|(_, error)| error.into())
     }
+}
+
+/// Crash-consistent owner of encrypted storage and its in-memory replica.
+///
+/// Local mutations are authored against a clone, persisted transactionally,
+/// and only then published to the live in-memory state. Peer ingest similarly
+/// persists the HLC merge alongside the operation.
+pub struct HistoryStore {
+    storage: EncryptedStorage,
+    replica: Replica,
+}
+
+impl HistoryStore {
+    /// Opens storage and reconstructs the replica from the operation log.
+    ///
+    /// # Errors
+    ///
+    /// Returns storage validation, encryption, migration, or I/O errors.
+    pub fn open(path: impl AsRef<Path>, key: &StorageKey) -> Result<Self> {
+        Self::from_storage(EncryptedStorage::open(path, key)?)
+    }
+
+    /// Reconstructs a history owner from already-open storage.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the log and durable replica metadata disagree.
+    pub fn from_storage(mut storage: EncryptedStorage) -> Result<Self> {
+        let replica = storage.load_replica()?;
+        Ok(Self { storage, replica })
+    }
+
+    #[must_use]
+    pub const fn replica(&self) -> &Replica {
+        &self.replica
+    }
+
+    #[must_use]
+    pub const fn projection(&self) -> &Projection {
+        self.replica.projection()
+    }
+
+    #[must_use]
+    pub const fn storage(&self) -> &EncryptedStorage {
+        &self.storage
+    }
+
+    #[must_use]
+    pub fn into_storage(self) -> EncryptedStorage {
+        self.storage
+    }
+
+    /// Adds locally captured payload or touches an exact visible duplicate.
+    ///
+    /// # Errors
+    ///
+    /// Returns authoring or durable-storage errors without changing live state.
+    pub fn copy(
+        &mut self,
+        payload: Payload,
+        now_millis: u64,
+    ) -> std::result::Result<StampedOperation, HistoryError> {
+        self.commit_one(|replica| replica.copy(payload, now_millis))
+    }
+
+    /// Explicitly shares payload, applying replicated oversized exemption.
+    ///
+    /// # Errors
+    ///
+    /// Returns authoring or durable-storage errors without changing live state.
+    pub fn share_explicit(
+        &mut self,
+        payload: Payload,
+        now_millis: u64,
+    ) -> std::result::Result<StampedOperation, HistoryError> {
+        self.commit_one(|replica| replica.share_explicit(payload, now_millis))
+    }
+
+    /// Captures payload and atomically persists its deterministic quota
+    /// evictions in the same local operation transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns authoring, incomplete quota-state, or storage errors without
+    /// changing live state.
+    pub fn copy_and_enforce(
+        &mut self,
+        payload: Payload,
+        now_millis: u64,
+    ) -> std::result::Result<Vec<StampedOperation>, HistoryError> {
+        self.commit_many(|replica| replica.copy_and_enforce(payload, now_millis))
+    }
+
+    /// Explicitly shares payload and atomically persists quota evictions for
+    /// all other chargeable entries.
+    ///
+    /// # Errors
+    ///
+    /// Returns authoring, incomplete quota-state, or storage errors without
+    /// changing live state.
+    pub fn share_explicit_and_enforce(
+        &mut self,
+        payload: Payload,
+        now_millis: u64,
+    ) -> std::result::Result<Vec<StampedOperation>, HistoryError> {
+        self.commit_many(|replica| replica.share_explicit_and_enforce(payload, now_millis))
+    }
+
+    /// Touches a visible history entry after activation.
+    ///
+    /// # Errors
+    ///
+    /// Returns visibility, authoring, or durable-storage errors.
+    pub fn activate(
+        &mut self,
+        content_id: ContentId,
+        now_millis: u64,
+    ) -> std::result::Result<StampedOperation, HistoryError> {
+        self.commit_one(|replica| replica.activate(content_id, now_millis))
+    }
+
+    /// Parses and activates an externally supplied content ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed invalid-ID, visibility, authoring, or storage error.
+    pub fn activate_by_id(
+        &mut self,
+        content_id: &str,
+        now_millis: u64,
+    ) -> std::result::Result<StampedOperation, HistoryError> {
+        self.activate(parse_history_content_id(content_id)?, now_millis)
+    }
+
+    /// Pins a visible item mesh-wide.
+    ///
+    /// # Errors
+    ///
+    /// Returns visibility, authoring, or durable-storage errors.
+    pub fn pin(
+        &mut self,
+        content_id: ContentId,
+        now_millis: u64,
+    ) -> std::result::Result<StampedOperation, HistoryError> {
+        self.commit_one(|replica| replica.pin(content_id, now_millis))
+    }
+
+    /// Parses and pins an externally supplied content ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed invalid-ID, visibility, authoring, or storage error.
+    pub fn pin_by_id(
+        &mut self,
+        content_id: &str,
+        now_millis: u64,
+    ) -> std::result::Result<StampedOperation, HistoryError> {
+        self.pin(parse_history_content_id(content_id)?, now_millis)
+    }
+
+    /// Unpins a visible item mesh-wide.
+    ///
+    /// # Errors
+    ///
+    /// Returns visibility, authoring, or durable-storage errors.
+    pub fn unpin(
+        &mut self,
+        content_id: ContentId,
+        now_millis: u64,
+    ) -> std::result::Result<StampedOperation, HistoryError> {
+        self.commit_one(|replica| replica.unpin(content_id, now_millis))
+    }
+
+    /// Parses and unpins an externally supplied content ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed invalid-ID, visibility, authoring, or storage error.
+    pub fn unpin_by_id(
+        &mut self,
+        content_id: &str,
+        now_millis: u64,
+    ) -> std::result::Result<StampedOperation, HistoryError> {
+        self.unpin(parse_history_content_id(content_id)?, now_millis)
+    }
+
+    /// Deletes a visible item mesh-wide.
+    ///
+    /// # Errors
+    ///
+    /// Returns visibility, authoring, or durable-storage errors.
+    pub fn delete(
+        &mut self,
+        content_id: ContentId,
+        now_millis: u64,
+    ) -> std::result::Result<StampedOperation, HistoryError> {
+        self.commit_one(|replica| replica.delete(content_id, now_millis))
+    }
+
+    /// Parses and deletes an externally supplied content ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed invalid-ID, visibility, authoring, or storage error.
+    pub fn delete_by_id(
+        &mut self,
+        content_id: &str,
+        now_millis: u64,
+    ) -> std::result::Result<StampedOperation, HistoryError> {
+        self.delete(parse_history_content_id(content_id)?, now_millis)
+    }
+
+    /// Updates a replicated shared setting.
+    ///
+    /// # Errors
+    ///
+    /// Returns setting validation, authoring, or durable-storage errors.
+    pub fn set_shared_setting(
+        &mut self,
+        setting: SharedSetting,
+        value: u64,
+        now_millis: u64,
+    ) -> std::result::Result<StampedOperation, HistoryError> {
+        self.commit_one(|replica| replica.set_shared_setting(setting, value, now_millis))
+    }
+
+    /// Replicates and persists a device-forget decision.
+    ///
+    /// # Errors
+    ///
+    /// Returns local-device validation, authoring, or durable-storage errors.
+    pub fn forget_device(
+        &mut self,
+        node_id: NodeId,
+        now_millis: u64,
+    ) -> std::result::Result<StampedOperation, HistoryError> {
+        self.commit_one(|replica| replica.forget_device(node_id, now_millis))
+    }
+
+    /// Authors and atomically persists all deterministic quota deletions.
+    ///
+    /// # Errors
+    ///
+    /// Returns incomplete-state, authoring, or durable-storage errors.
+    pub fn enforce_quota(
+        &mut self,
+        now_millis: u64,
+    ) -> std::result::Result<Vec<StampedOperation>, HistoryError> {
+        self.commit_many(|replica| replica.enforce_quota(now_millis))
+    }
+
+    /// Changes the mesh quota and atomically persists its resulting evictions.
+    ///
+    /// # Errors
+    ///
+    /// Returns setting, incomplete-state, authoring, or storage errors.
+    pub fn set_mesh_quota_and_enforce(
+        &mut self,
+        quota_bytes: u64,
+        now_millis: u64,
+    ) -> std::result::Result<Vec<StampedOperation>, HistoryError> {
+        self.commit_many(|replica| replica.set_mesh_quota_and_enforce(quota_bytes, now_millis))
+    }
+
+    /// Ingests and durably stores one peer operation and its HLC observation.
+    ///
+    /// # Errors
+    ///
+    /// Returns projection, clock, identity-conflict, or storage errors without
+    /// changing live state.
+    pub fn ingest(
+        &mut self,
+        operation: &StampedOperation,
+        now_millis: u64,
+    ) -> std::result::Result<ApplyOutcome, HistoryError> {
+        let mut next = self.replica.clone();
+        let outcome = next.ingest(operation, now_millis)?;
+        if outcome == ApplyOutcome::Duplicate {
+            return Ok(outcome);
+        }
+        self.storage
+            .append_ingested_operation(operation, next.last_timestamp())?;
+        self.replica = next;
+        Ok(outcome)
+    }
+
+    /// Monotonically persists a peer's anti-entropy acknowledgement.
+    ///
+    /// # Errors
+    ///
+    /// Returns serialization, corruption, or database errors.
+    pub fn record_peer_acknowledgement(
+        &mut self,
+        peer: NodeId,
+        seen: &SeenOps,
+    ) -> std::result::Result<(), HistoryError> {
+        self.storage.record_peer_acknowledgement(peer, seen)?;
+        Ok(())
+    }
+
+    /// Loads persisted acknowledgement frontiers.
+    ///
+    /// # Errors
+    ///
+    /// Returns deserialization, corruption, or database errors.
+    pub fn acknowledgements(&self) -> std::result::Result<Acknowledgements, HistoryError> {
+        self.storage.acknowledgements().map_err(Into::into)
+    }
+
+    fn commit_one(
+        &mut self,
+        author: impl FnOnce(&mut Replica) -> std::result::Result<StampedOperation, ReplicaError>,
+    ) -> std::result::Result<StampedOperation, HistoryError> {
+        let mut next = self.replica.clone();
+        let operation = author(&mut next)?;
+        self.storage.append_local_operation(&operation)?;
+        self.replica = next;
+        Ok(operation)
+    }
+
+    fn commit_many(
+        &mut self,
+        author: impl FnOnce(&mut Replica) -> std::result::Result<Vec<StampedOperation>, ReplicaError>,
+    ) -> std::result::Result<Vec<StampedOperation>, HistoryError> {
+        let mut next = self.replica.clone();
+        let operations = author(&mut next)?;
+        self.storage.append_local_operations(&operations)?;
+        self.replica = next;
+        Ok(operations)
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum HistoryError {
+    #[error("content ID is invalid: {0}")]
+    InvalidContentId(String),
+    #[error(transparent)]
+    Replica(#[from] ReplicaError),
+    #[error(transparent)]
+    Storage(#[from] StorageError),
+}
+
+fn parse_history_content_id(content_id: &str) -> std::result::Result<ContentId, HistoryError> {
+    content_id
+        .parse()
+        .map_err(|error: crate::model::ContentIdParseError| {
+            HistoryError::InvalidContentId(error.to_string())
+        })
 }
 
 fn serialize_operation(operation: &StampedOperation) -> Result<Zeroizing<Vec<u8>>> {
@@ -617,6 +1161,29 @@ fn read_replica_metadata(connection: &Connection) -> Result<ReplicaMetadata> {
         next_operation_counter,
         last_hlc: HlcTimestamp::new(physical_millis, logical),
     })
+}
+
+fn update_replica_metadata(connection: &Connection, metadata: ReplicaMetadata) -> Result<()> {
+    let next_counter = sqlite_integer("next operation counter", metadata.next_operation_counter)?;
+    let physical = sqlite_integer(
+        "last_hlc.physical_millis",
+        metadata.last_hlc.physical_millis(),
+    )?;
+    let logical = i64::from(metadata.last_hlc.logical());
+    let changed = connection.execute(
+        "UPDATE local_replica
+         SET next_operation_counter = ?1,
+             last_hlc_physical_millis = ?2,
+             last_hlc_logical = ?3
+         WHERE singleton = 1",
+        (next_counter, physical, logical),
+    )?;
+    if changed != 1 {
+        return Err(StorageError::CorruptReplicaMetadata(
+            "singleton row disappeared during transaction".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn should_initialize(path: &Path) -> Result<bool> {
@@ -772,6 +1339,9 @@ fn apply_migrations(connection: &Connection, current_version: u32) -> Result<()>
     if current_version < 2 {
         connection.execute_batch(MIGRATION_2)?;
     }
+    if current_version < 3 {
+        connection.execute_batch(MIGRATION_3)?;
+    }
     Ok(())
 }
 
@@ -783,7 +1353,7 @@ fn verify_current_schema(connection: &Connection) -> Result<()> {
         )));
     }
 
-    for table in ["operations", "local_replica"] {
+    for table in ["operations", "local_replica", "peer_acknowledgements"] {
         let exists = connection.query_row(
             "SELECT EXISTS(
                  SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1
