@@ -51,6 +51,7 @@ in
       partOf = [ "graphical-session.target" ];
       wantedBy = cfg.wantedBy;
       environment = cfg.extraEnvironment;
+      path = [ pkgs.netbird ];
 
       serviceConfig = {
         Type = "simple";
