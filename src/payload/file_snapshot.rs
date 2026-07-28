@@ -219,6 +219,54 @@ pub fn snapshot_file_uris(
     limits: FileSnapshotLimits,
     cancellation: &CancellationToken,
 ) -> Result<FileSnapshot, FileSnapshotError> {
+    let (planned, logical_size) = plan_snapshot(paths, limits, cancellation)?;
+
+    let mut entries = Vec::with_capacity(planned.len());
+    for entry in planned {
+        ensure_not_cancelled(cancellation)?;
+        let blob = if entry.kind == SnapshotEntryKind::File {
+            let mut file = open_revalidated_file(&entry)?;
+            Some(store.stage_reader(&mut file, entry.logical_size, cancellation)?)
+        } else {
+            None
+        };
+        entries.push(FileSnapshotEntry {
+            relative_path: entry.relative_path,
+            kind: entry.kind,
+            executable: entry.executable,
+            logical_size: entry.logical_size,
+            blob,
+        });
+    }
+
+    let snapshot = FileSnapshot {
+        logical_size,
+        entries,
+    };
+    snapshot.validate(limits.max_logical_bytes)?;
+    Ok(snapshot)
+}
+
+/// Safely walks local file roots and returns their aggregate regular-file size
+/// without reading or chunking file bytes.
+///
+/// # Errors
+///
+/// Returns the same path, symlink, traversal, type, entry, depth, size, or
+/// cancellation errors as [`snapshot_file_uris`].
+pub fn inspect_file_uris(
+    paths: &[PathBuf],
+    limits: FileSnapshotLimits,
+    cancellation: &CancellationToken,
+) -> Result<u64, FileSnapshotError> {
+    plan_snapshot(paths, limits, cancellation).map(|(_, logical_size)| logical_size)
+}
+
+fn plan_snapshot(
+    paths: &[PathBuf],
+    limits: FileSnapshotLimits,
+    cancellation: &CancellationToken,
+) -> Result<(Vec<PlannedEntry>, u64), FileSnapshotError> {
     validate_limits(limits)?;
     if paths.is_empty() {
         return Err(FileSnapshotError::Empty);
@@ -252,31 +300,7 @@ pub fn snapshot_file_uris(
         .plan_entry(path, &root_name, 0)?;
     }
     planned.sort_unstable_by(|left, right| left.relative_path.cmp(&right.relative_path));
-
-    let mut entries = Vec::with_capacity(planned.len());
-    for entry in planned {
-        ensure_not_cancelled(cancellation)?;
-        let blob = if entry.kind == SnapshotEntryKind::File {
-            let mut file = open_revalidated_file(&entry)?;
-            Some(store.stage_reader(&mut file, entry.logical_size, cancellation)?)
-        } else {
-            None
-        };
-        entries.push(FileSnapshotEntry {
-            relative_path: entry.relative_path,
-            kind: entry.kind,
-            executable: entry.executable,
-            logical_size: entry.logical_size,
-            blob,
-        });
-    }
-
-    let snapshot = FileSnapshot {
-        logical_size,
-        entries,
-    };
-    snapshot.validate(limits.max_logical_bytes)?;
-    Ok(snapshot)
+    Ok((planned, logical_size))
 }
 
 #[derive(Debug)]

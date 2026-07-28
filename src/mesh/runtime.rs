@@ -21,12 +21,15 @@ use crate::{
     discovery::DiscoverySnapshot,
     model::{NodeId, SeenOps, StampedOperation},
     replication::{AntiEntropyState, BatchLimits, Codec, JsonV1Codec},
+    transfer::{TransferChunk, TransferId},
     transport::{Psk, authenticate_client, authenticate_server, mesh_endpoint},
 };
 
 use super::protocol::{
-    IdentityHello, MAX_BATCH_OPERATIONS, MAX_FRONTIER_BYTES, MAX_HOSTNAME_BYTES, PROTOCOL_VERSION,
-    ProtocolError, SyncRequest, SyncResponse, read_message, validate_batch, write_message,
+    ChunkStreamRequest, ChunkStreamResponse, IdentityHello, MAX_BATCH_OPERATIONS,
+    MAX_CHUNK_CONTROL_BYTES, MAX_ENCRYPTED_CHUNK_BYTES, MAX_FRONTIER_BYTES, MAX_HOSTNAME_BYTES,
+    PROTOCOL_VERSION, ProtocolError, STREAM_KIND_CHUNK, STREAM_KIND_SYNC, SyncRequest,
+    SyncResponse, read_message, read_message_bounded, validate_batch, write_message,
 };
 
 const SERVER_NAME: &str = "clip-sync.mesh";
@@ -35,6 +38,9 @@ const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(30);
 const PERSIST_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_RECONCILE_ROUNDS: usize = 1024;
 const MAX_CONCURRENT_HANDSHAKES: usize = 32;
+const MAX_CONCURRENT_CHUNK_STREAMS: usize = 4;
+const MAX_MISSING_CHUNKS_PER_ROUND: usize = 64;
+const CHUNK_BROKER_TIMEOUT: Duration = Duration::from_secs(30);
 const CLOSE_DUPLICATE: u32 = 0x201;
 const CLOSE_SHUTDOWN: u32 = 0x203;
 
@@ -48,6 +54,7 @@ pub struct MeshRuntimeConfig {
     pub reconnect_min: Duration,
     pub reconnect_max: Duration,
     pub batch_limits: BatchLimits,
+    pub max_concurrent_chunk_streams: usize,
 }
 
 impl MeshRuntimeConfig {
@@ -64,6 +71,7 @@ impl MeshRuntimeConfig {
                 max_ops: MAX_BATCH_OPERATIONS,
                 max_bytes: 4 * 1024 * 1024,
             },
+            max_concurrent_chunk_streams: MAX_CONCURRENT_CHUNK_STREAMS,
         }
     }
 }
@@ -74,6 +82,30 @@ pub struct PersistBatch {
     operations: Vec<Vec<u8>>,
     reply: oneshot::Sender<Result<(), String>>,
 }
+
+/// Daemon-owned chunk-store work requested only by authenticated sessions.
+#[derive(Debug)]
+pub enum MeshChunkCommand {
+    Missing {
+        maximum: usize,
+        reply: oneshot::Sender<Result<Vec<TransferChunk>, String>>,
+    },
+    Export {
+        request: TransferChunk,
+        reply: oneshot::Sender<Result<Vec<u8>, String>>,
+    },
+    Import {
+        request: TransferChunk,
+        encrypted: Vec<u8>,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+}
+
+type RuntimeSpawn = (
+    MeshRuntime,
+    mpsc::Receiver<PersistBatch>,
+    Option<mpsc::Receiver<MeshChunkCommand>>,
+);
 
 impl PersistBatch {
     #[must_use]
@@ -119,6 +151,11 @@ impl MeshHandle {
     pub async fn frontier(&self) -> SeenOps {
         self.state.read().await.seen().clone()
     }
+
+    /// Wakes live authenticated sessions after transfer state changes.
+    pub fn notify_transfers(&self) {
+        bump_revision(&self.revision);
+    }
 }
 
 /// Owned background mesh supervisor.
@@ -142,6 +179,43 @@ impl MeshRuntime {
         persisted_operations: &[StampedOperation],
         shutdown: CancellationToken,
     ) -> Result<(Self, mpsc::Receiver<PersistBatch>), MeshError> {
+        let (runtime, persist_rx, _) =
+            Self::spawn_inner(config, psk, persisted_operations, shutdown, false)?;
+        Ok((runtime, persist_rx))
+    }
+
+    /// Creates a runtime with a daemon-owned encrypted chunk broker.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same configuration/operation errors as [`Self::spawn`].
+    #[allow(clippy::type_complexity)]
+    pub fn spawn_with_transfers(
+        config: MeshRuntimeConfig,
+        psk: Psk,
+        persisted_operations: &[StampedOperation],
+        shutdown: CancellationToken,
+    ) -> Result<
+        (
+            Self,
+            mpsc::Receiver<PersistBatch>,
+            mpsc::Receiver<MeshChunkCommand>,
+        ),
+        MeshError,
+    > {
+        let (runtime, persist_rx, chunk_rx) =
+            Self::spawn_inner(config, psk, persisted_operations, shutdown, true)?;
+        let chunk_rx = chunk_rx.ok_or(MeshError::ChunkBrokerUnavailable)?;
+        Ok((runtime, persist_rx, chunk_rx))
+    }
+
+    fn spawn_inner(
+        config: MeshRuntimeConfig,
+        psk: Psk,
+        persisted_operations: &[StampedOperation],
+        shutdown: CancellationToken,
+        transfers: bool,
+    ) -> Result<RuntimeSpawn, MeshError> {
         validate_local_config(&config)?;
         let mut state = AntiEntropyState::new();
         for operation in persisted_operations {
@@ -152,6 +226,12 @@ impl MeshRuntime {
         let (discovery, discovery_rx) = watch::channel(None);
         let (revision, _) = watch::channel(0_u64);
         let (persist_tx, persist_rx) = mpsc::channel(32);
+        let (chunk_tx, chunk_rx) = if transfers {
+            let (tx, rx) = mpsc::channel(32);
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
         let handle = MeshHandle {
             discovery,
             revision: revision.clone(),
@@ -163,6 +243,7 @@ impl MeshRuntime {
             state,
             revision,
             persist_tx,
+            chunk_tx,
             registry: Arc::new(Mutex::new(BTreeMap::new())),
         });
         let task = tokio::spawn(supervise(context, discovery_rx, shutdown));
@@ -172,6 +253,7 @@ impl MeshRuntime {
                 task,
             },
             persist_rx,
+            chunk_rx,
         ))
     }
 
@@ -194,6 +276,7 @@ struct RuntimeContext {
     state: Arc<RwLock<AntiEntropyState>>,
     revision: watch::Sender<u64>,
     persist_tx: mpsc::Sender<PersistBatch>,
+    chunk_tx: Option<mpsc::Sender<MeshChunkCommand>>,
     registry: Arc<Mutex<BTreeMap<NodeId, ActiveConnection>>>,
 }
 
@@ -681,20 +764,24 @@ async fn session_loop(
     peer_frontier: Arc<Mutex<SeenOps>>,
     shutdown: CancellationToken,
 ) -> Result<(), MeshError> {
-    let inbound = accept_sync_streams(connection, context, peer_frontier.clone(), shutdown.clone());
+    let inbound =
+        accept_session_streams(connection, context, peer_frontier.clone(), shutdown.clone());
     let outbound = initiate_sync_streams(connection, context, peer_frontier, shutdown.clone());
+    let transfers = initiate_chunk_streams(connection, context, shutdown.clone());
     tokio::pin!(inbound);
     tokio::pin!(outbound);
+    tokio::pin!(transfers);
 
     tokio::select! {
         result = &mut inbound => result,
         result = &mut outbound => result,
+        result = &mut transfers => result,
         error = connection.closed() => Err(MeshError::Connection(error)),
         () = shutdown.cancelled() => Ok(()),
     }
 }
 
-async fn accept_sync_streams(
+async fn accept_session_streams(
     connection: &Connection,
     context: &Arc<RuntimeContext>,
     peer_frontier: Arc<Mutex<SeenOps>>,
@@ -707,19 +794,34 @@ async fn accept_sync_streams(
         };
         timeout(
             EXCHANGE_TIMEOUT,
-            answer_sync(streams, context, &peer_frontier),
+            answer_session(streams, context, &peer_frontier),
         )
         .await
         .map_err(|_| MeshError::ExchangeTimeout)??;
     }
 }
 
-async fn answer_sync(
+async fn answer_session(
     (mut send, mut recv): (quinn::SendStream, quinn::RecvStream),
     context: &RuntimeContext,
     peer_frontier: &Mutex<SeenOps>,
 ) -> Result<(), MeshError> {
-    let request: SyncRequest = read_message(&mut recv).await?;
+    let mut kind = [0_u8; 1];
+    recv.read_exact(&mut kind).await?;
+    match kind[0] {
+        STREAM_KIND_SYNC => answer_sync(&mut send, &mut recv, context, peer_frontier).await,
+        STREAM_KIND_CHUNK => answer_chunk(&mut send, &mut recv, context).await,
+        kind => Err(MeshError::UnknownStreamKind(kind)),
+    }
+}
+
+async fn answer_sync(
+    send: &mut quinn::SendStream,
+    recv: &mut quinn::RecvStream,
+    context: &RuntimeContext,
+    peer_frontier: &Mutex<SeenOps>,
+) -> Result<(), MeshError> {
+    let request: SyncRequest = read_message(recv).await?;
     validate_batch(&request.frontier, &request.operations)?;
     tracing::debug!(
         received_operations = request.operations.len(),
@@ -735,7 +837,7 @@ async fn answer_sync(
         operations,
         has_more,
     };
-    write_message(&mut send, &response).await?;
+    write_message(send, &response).await?;
     send.finish()?;
     Ok(())
 }
@@ -788,6 +890,7 @@ async fn initiate_sync(
         has_more: request_has_more,
     };
     let (mut send, mut recv) = connection.open_bi().await?;
+    send.write_all(&[STREAM_KIND_SYNC]).await?;
     write_message(&mut send, &request).await?;
     let response: SyncResponse = read_message(&mut recv).await?;
     validate_batch(&response.frontier, &response.operations)?;
@@ -801,6 +904,137 @@ async fn initiate_sync(
     *peer_frontier.lock().await = response_frontier;
     send.finish()?;
     Ok(request_has_more || response.has_more)
+}
+
+async fn initiate_chunk_streams(
+    connection: &Connection,
+    context: &RuntimeContext,
+    shutdown: CancellationToken,
+) -> Result<(), MeshError> {
+    let Some(_) = &context.chunk_tx else {
+        std::future::pending::<()>().await;
+        return Ok(());
+    };
+    let mut interval = tokio::time::interval(context.config.reconcile_interval);
+    interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut revision = context.revision.subscribe();
+    loop {
+        tokio::select! {
+            () = shutdown.cancelled() => return Ok(()),
+            _ = interval.tick() => {}
+            result = revision.changed() => {
+                if result.is_err() {
+                    return Ok(());
+                }
+            }
+        }
+        let missing = broker_missing(context, MAX_MISSING_CHUNKS_PER_ROUND).await?;
+        let semaphore = Arc::new(Semaphore::new(context.config.max_concurrent_chunk_streams));
+        let mut tasks = JoinSet::new();
+        for request in missing {
+            let permit = semaphore
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(|_| MeshError::PersistenceUnavailable)?;
+            let connection = connection.clone();
+            let chunk_tx = context
+                .chunk_tx
+                .as_ref()
+                .expect("checked transfer broker")
+                .clone();
+            tasks.spawn(async move {
+                let _permit = permit;
+                request_chunk(&connection, &chunk_tx, request).await
+            });
+        }
+        while let Some(result) = tasks.join_next().await {
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => tracing::debug!(%error, "chunk request did not complete"),
+                Err(error) => tracing::debug!(%error, "chunk request task failed"),
+            }
+        }
+    }
+}
+
+async fn request_chunk(
+    connection: &Connection,
+    chunk_tx: &mpsc::Sender<MeshChunkCommand>,
+    request: TransferChunk,
+) -> Result<(), MeshError> {
+    let (mut send, mut recv) = connection.open_bi().await?;
+    send.write_all(&[STREAM_KIND_CHUNK]).await?;
+    write_message(
+        &mut send,
+        &ChunkStreamRequest {
+            transfer_id: request.transfer_id.as_uuid().as_bytes().to_vec(),
+            manifest_id: request.manifest_id.as_bytes().to_vec(),
+            chunk_id: request.chunk_id.as_bytes().to_vec(),
+            logical_size: request.logical_size,
+        },
+    )
+    .await?;
+    let response: ChunkStreamResponse =
+        read_message_bounded(&mut recv, MAX_CHUNK_CONTROL_BYTES).await?;
+    validate_chunk_response(&response, request)?;
+    if !response.available {
+        send.finish()?;
+        return Ok(());
+    }
+    let encrypted_size = usize::try_from(response.encrypted_size)
+        .map_err(|_| MeshError::ChunkFrameTooLarge(usize::MAX))?;
+    if encrypted_size == 0 || encrypted_size > MAX_ENCRYPTED_CHUNK_BYTES {
+        return Err(MeshError::ChunkFrameTooLarge(encrypted_size));
+    }
+    let mut encrypted = vec![0_u8; encrypted_size];
+    recv.read_exact(&mut encrypted).await?;
+    send.finish()?;
+    broker_import(chunk_tx, request, encrypted).await
+}
+
+async fn answer_chunk(
+    send: &mut quinn::SendStream,
+    recv: &mut quinn::RecvStream,
+    context: &RuntimeContext,
+) -> Result<(), MeshError> {
+    let request: ChunkStreamRequest = read_message_bounded(recv, MAX_CHUNK_CONTROL_BYTES).await?;
+    let request = parse_chunk_request(&request)?;
+    let encrypted = match broker_export(context, request).await {
+        Ok(encrypted) => encrypted,
+        Err(error) => {
+            tracing::debug!(%error, "requested chunk is unavailable");
+            write_message(
+                send,
+                &ChunkStreamResponse {
+                    available: false,
+                    transfer_id: request.transfer_id.as_uuid().as_bytes().to_vec(),
+                    chunk_id: request.chunk_id.as_bytes().to_vec(),
+                    encrypted_size: 0,
+                },
+            )
+            .await?;
+            send.finish()?;
+            return Ok(());
+        }
+    };
+    if encrypted.is_empty() || encrypted.len() > MAX_ENCRYPTED_CHUNK_BYTES {
+        return Err(MeshError::ChunkFrameTooLarge(encrypted.len()));
+    }
+    write_message(
+        send,
+        &ChunkStreamResponse {
+            available: true,
+            transfer_id: request.transfer_id.as_uuid().as_bytes().to_vec(),
+            chunk_id: request.chunk_id.as_bytes().to_vec(),
+            encrypted_size: u32::try_from(encrypted.len())
+                .map_err(|_| MeshError::ChunkFrameTooLarge(encrypted.len()))?,
+        },
+    )
+    .await?;
+    send.write_all(&encrypted).await?;
+    send.finish()?;
+    Ok(())
 }
 
 async fn batch_for_peer(
@@ -850,6 +1084,101 @@ async fn persist_and_record(
     }
     drop(state);
     bump_revision(&context.revision);
+    Ok(())
+}
+
+async fn broker_missing(
+    context: &RuntimeContext,
+    maximum: usize,
+) -> Result<Vec<TransferChunk>, MeshError> {
+    let sender = context
+        .chunk_tx
+        .as_ref()
+        .ok_or(MeshError::ChunkBrokerUnavailable)?;
+    let (reply, completed) = oneshot::channel();
+    sender
+        .send(MeshChunkCommand::Missing { maximum, reply })
+        .await
+        .map_err(|_| MeshError::ChunkBrokerUnavailable)?;
+    timeout(CHUNK_BROKER_TIMEOUT, completed)
+        .await
+        .map_err(|_| MeshError::ChunkBrokerTimeout)?
+        .map_err(|_| MeshError::ChunkBrokerUnavailable)?
+        .map_err(MeshError::ChunkBrokerRejected)
+}
+
+async fn broker_export(
+    context: &RuntimeContext,
+    request: TransferChunk,
+) -> Result<Vec<u8>, MeshError> {
+    let sender = context
+        .chunk_tx
+        .as_ref()
+        .ok_or(MeshError::ChunkBrokerUnavailable)?;
+    let (reply, completed) = oneshot::channel();
+    sender
+        .send(MeshChunkCommand::Export { request, reply })
+        .await
+        .map_err(|_| MeshError::ChunkBrokerUnavailable)?;
+    timeout(CHUNK_BROKER_TIMEOUT, completed)
+        .await
+        .map_err(|_| MeshError::ChunkBrokerTimeout)?
+        .map_err(|_| MeshError::ChunkBrokerUnavailable)?
+        .map_err(MeshError::ChunkBrokerRejected)
+}
+
+async fn broker_import(
+    sender: &mpsc::Sender<MeshChunkCommand>,
+    request: TransferChunk,
+    encrypted: Vec<u8>,
+) -> Result<(), MeshError> {
+    let (reply, completed) = oneshot::channel();
+    sender
+        .send(MeshChunkCommand::Import {
+            request,
+            encrypted,
+            reply,
+        })
+        .await
+        .map_err(|_| MeshError::ChunkBrokerUnavailable)?;
+    timeout(CHUNK_BROKER_TIMEOUT, completed)
+        .await
+        .map_err(|_| MeshError::ChunkBrokerTimeout)?
+        .map_err(|_| MeshError::ChunkBrokerUnavailable)?
+        .map_err(MeshError::ChunkBrokerRejected)
+}
+
+fn parse_chunk_request(message: &ChunkStreamRequest) -> Result<TransferChunk, MeshError> {
+    if message.logical_size == 0 {
+        return Err(MeshError::InvalidChunkRequest);
+    }
+    let transfer_id = TransferId::from_uuid(
+        Uuid::from_slice(&message.transfer_id).map_err(|_| MeshError::InvalidChunkRequest)?,
+    );
+    let manifest_id = hex::encode(&message.manifest_id)
+        .parse()
+        .map_err(|_| MeshError::InvalidChunkRequest)?;
+    let chunk_id = hex::encode(&message.chunk_id)
+        .parse()
+        .map_err(|_| MeshError::InvalidChunkRequest)?;
+    Ok(TransferChunk {
+        transfer_id,
+        manifest_id,
+        chunk_id,
+        logical_size: message.logical_size,
+    })
+}
+
+fn validate_chunk_response(
+    response: &ChunkStreamResponse,
+    request: TransferChunk,
+) -> Result<(), MeshError> {
+    if response.transfer_id != request.transfer_id.as_uuid().as_bytes()
+        || response.chunk_id != request.chunk_id.as_bytes()
+        || response.available != (response.encrypted_size != 0)
+    {
+        return Err(MeshError::InvalidChunkResponse);
+    }
     Ok(())
 }
 
@@ -912,6 +1241,8 @@ fn validate_local_config(config: &MeshRuntimeConfig) -> Result<(), MeshError> {
         || config.batch_limits.max_ops > MAX_BATCH_OPERATIONS
         || config.batch_limits.max_bytes == 0
         || config.batch_limits.max_bytes > super::protocol::MAX_CONTROL_FRAME_BYTES
+        || config.max_concurrent_chunk_streams == 0
+        || config.max_concurrent_chunk_streams > 32
     {
         return Err(MeshError::InvalidConfig);
     }
@@ -948,6 +1279,20 @@ pub enum MeshError {
     PersistenceUnavailable,
     #[error("daemon rejected a remote operation batch: {0}")]
     PersistenceRejected(String),
+    #[error("authenticated chunk broker timed out")]
+    ChunkBrokerTimeout,
+    #[error("authenticated chunk broker is unavailable")]
+    ChunkBrokerUnavailable,
+    #[error("daemon rejected chunk work: {0}")]
+    ChunkBrokerRejected(String),
+    #[error("unknown authenticated stream kind {0}")]
+    UnknownStreamKind(u8),
+    #[error("chunk stream frame is too large ({0} bytes)")]
+    ChunkFrameTooLarge(usize),
+    #[error("chunk request is invalid")]
+    InvalidChunkRequest,
+    #[error("chunk response is invalid")]
+    InvalidChunkResponse,
     #[error("frontier is malformed: {0}")]
     Frontier(serde_json::Error),
     #[error("frontier serialization failed: {0}")]
@@ -962,4 +1307,8 @@ pub enum MeshError {
     Connection(#[from] quinn::ConnectionError),
     #[error("could not finish a QUIC stream: {0}")]
     Finish(#[from] quinn::ClosedStream),
+    #[error("could not write a QUIC stream: {0}")]
+    StreamWrite(#[from] quinn::WriteError),
+    #[error("could not read a QUIC stream: {0}")]
+    StreamRead(#[from] quinn::ReadExactError),
 }

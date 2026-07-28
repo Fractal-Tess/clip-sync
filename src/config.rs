@@ -127,6 +127,18 @@ impl Config {
                 "local.mesh_key_file must not be empty",
             ));
         }
+        if self.local.maximum_explicit_share_bytes < self.shared.capture_threshold_bytes {
+            return Err(ConfigError::Invalid(
+                "local.maximum_explicit_share_bytes must be at least the capture threshold",
+            ));
+        }
+        if self.local.max_concurrent_chunk_streams == 0
+            || self.local.max_concurrent_chunk_streams > 32
+        {
+            return Err(ConfigError::Invalid(
+                "local.max_concurrent_chunk_streams must be between 1 and 32",
+            ));
+        }
         Ok(())
     }
 }
@@ -166,6 +178,10 @@ pub struct LocalConfig {
     pub reconnect_min_seconds: u64,
     pub reconnect_max_seconds: u64,
     pub netbird_command: PathBuf,
+    pub maximum_explicit_share_bytes: u64,
+    pub transfer_free_space_reserve_bytes: u64,
+    pub materialization_free_space_reserve_bytes: u64,
+    pub max_concurrent_chunk_streams: usize,
 }
 
 impl Default for LocalConfig {
@@ -178,6 +194,10 @@ impl Default for LocalConfig {
             reconnect_min_seconds: 1,
             reconnect_max_seconds: 60,
             netbird_command: PathBuf::from("netbird"),
+            maximum_explicit_share_bytes: 4 * 1024 * 1024 * 1024,
+            transfer_free_space_reserve_bytes: 64 * 1024 * 1024,
+            materialization_free_space_reserve_bytes: 8 * 1024 * 1024,
+            max_concurrent_chunk_streams: 4,
         }
     }
 }

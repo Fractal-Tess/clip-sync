@@ -7,11 +7,11 @@ mod share;
 
 pub use chunk_store::{
     BlobManifest, ChunkId, ChunkRef, ChunkStore, ChunkStoreConfig, ChunkStoreError, ChunkStoreKey,
-    ManifestId, StoredManifest,
+    ManifestId, MimeBlob, MimeBundleManifest, StoredManifest,
 };
 pub use file_snapshot::{
     FileSnapshot, FileSnapshotEntry, FileSnapshotError, FileSnapshotLimits, SnapshotEntryKind,
-    parse_file_uri_list, snapshot_file_uris,
+    inspect_file_uris, parse_file_uri_list, snapshot_file_uris,
 };
 pub use materialize::{Materialization, MaterializationError, Materializer, MaterializerConfig};
 pub use share::{

@@ -22,7 +22,7 @@ pub use operation::{
     SettingValue, SharedSetting, StampedOperation,
 };
 pub use projection::{
-    ApplyOutcome, ContentView, Projection, ProjectionError, QuotaPlan, TombstoneView,
+    ApplyOutcome, ContentView, Projection, ProjectionError, QuotaPlan, TombstoneView, TransferView,
 };
 pub use retention::Acknowledgements;
 pub use seen_ops::SeenOps;

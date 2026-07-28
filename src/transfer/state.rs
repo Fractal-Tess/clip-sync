@@ -267,6 +267,17 @@ impl TransferRecord {
         self.expected_chunks.len()
     }
 
+    pub fn expected_chunks(&self) -> impl Iterator<Item = ChunkRef> + '_ {
+        self.expected_chunks
+            .iter()
+            .map(|(id, logical_size)| ChunkRef::from_parts(*id, *logical_size))
+    }
+
+    #[must_use]
+    pub fn chunk_logical_size(&self, id: ChunkId) -> Option<u32> {
+        self.expected_chunks.get(&id).copied()
+    }
+
     #[must_use]
     pub fn peers(&self) -> &BTreeMap<NodeId, PeerProgress> {
         &self.peers

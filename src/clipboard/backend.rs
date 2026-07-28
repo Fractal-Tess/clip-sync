@@ -10,8 +10,8 @@ use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
 use super::types::{
-    ClipboardContent, FeedbackMarker, Generation, OfferMimeList, ProbeResult, RejectReason,
-    SelectionKind,
+    ClipboardContent, CurrentClipboardInspection, FeedbackMarker, Generation, OfferMimeList,
+    ProbeResult, RejectReason, SelectionKind,
 };
 
 /// A clipboard event emitted by the backend to the daemon.
@@ -72,6 +72,10 @@ pub enum BackendError {
     WatchNotRunning,
     #[error("clipboard command failed: {0}")]
     ClipboardCommand(String),
+    #[error("the current clipboard offer is unavailable")]
+    CurrentOfferUnavailable,
+    #[error("the current clipboard changed during explicit inspection")]
+    CurrentOfferChanged,
 }
 
 /// Backend-neutral interface for clipboard monitoring.
@@ -106,4 +110,17 @@ pub trait ClipboardBackend: Send + Sync {
         &self,
         content: ClipboardContent,
     ) -> Result<FeedbackMarker, BackendError>;
+
+    /// Streams the current offer without retaining payload bytes to determine
+    /// its exact aggregate size before explicit-share confirmation.
+    async fn inspect_current_clipboard(
+        &self,
+        maximum_bytes: u64,
+    ) -> Result<CurrentClipboardInspection, BackendError>;
+
+    /// Re-reads the exact inspected generation after confirmation.
+    async fn capture_current_clipboard(
+        &self,
+        inspection: &CurrentClipboardInspection,
+    ) -> Result<ClipboardContent, BackendError>;
 }

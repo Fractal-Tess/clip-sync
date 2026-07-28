@@ -14,7 +14,9 @@ use crate::{
         Acknowledgements, ApplyOutcome, ContentId, HlcTimestamp, NodeId, OpId, Payload, Projection,
         ProjectionError, SeenOps, SharedSetting, StampedOperation,
     },
+    payload::{ManifestId, StoredManifest},
     replica::{Replica, ReplicaError},
+    transfer::TransferId,
 };
 
 const SCHEMA_VERSION: u32 = 3;
@@ -811,6 +813,58 @@ impl HistoryStore {
         now_millis: u64,
     ) -> std::result::Result<StampedOperation, HistoryError> {
         self.commit_one(|replica| replica.share_explicit(payload, now_millis))
+    }
+
+    /// Persists a replicated pending manifest-backed share.
+    ///
+    /// # Errors
+    ///
+    /// Returns authoring or durable-storage errors without changing live state.
+    pub fn begin_manifest_share(
+        &mut self,
+        transfer_id: TransferId,
+        content_id: ContentId,
+        manifest_id: ManifestId,
+        manifest: StoredManifest,
+        quota_exempt: bool,
+        now_millis: u64,
+    ) -> std::result::Result<StampedOperation, HistoryError> {
+        self.commit_one(|replica| {
+            replica.begin_manifest_share(
+                transfer_id,
+                content_id,
+                manifest_id,
+                manifest,
+                quota_exempt,
+                now_millis,
+            )
+        })
+    }
+
+    /// Persists successful local completion of a manifest-backed share.
+    ///
+    /// # Errors
+    ///
+    /// Returns transfer-state, authoring, or durable-storage errors.
+    pub fn complete_manifest_share(
+        &mut self,
+        transfer_id: TransferId,
+        now_millis: u64,
+    ) -> std::result::Result<StampedOperation, HistoryError> {
+        self.commit_one(|replica| replica.complete_manifest_share(transfer_id, now_millis))
+    }
+
+    /// Persists a dominating replicated transfer cancellation.
+    ///
+    /// # Errors
+    ///
+    /// Returns transfer-state, authoring, or durable-storage errors.
+    pub fn cancel_manifest_share(
+        &mut self,
+        transfer_id: TransferId,
+        now_millis: u64,
+    ) -> std::result::Result<StampedOperation, HistoryError> {
+        self.commit_one(|replica| replica.cancel_manifest_share(transfer_id, now_millis))
     }
 
     /// Captures payload and atomically persists its deterministic quota

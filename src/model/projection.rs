@@ -6,6 +6,11 @@ use std::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::{
+    payload::{ManifestId, StoredManifest},
+    transfer::{TransferId, TransferPhase},
+};
+
 use super::{
     Acknowledgements, ContentId, EffectiveSharedSettings, EventKey, NodeId, Operation, Payload,
     SeenOps, SettingValue, SharedSetting, StampedOperation,
@@ -78,6 +83,67 @@ impl ContentState {
         self.quota_exempt.as_ref().is_some_and(|exempt| {
             exempt.value && self.deletion.is_none_or(|deletion| exempt.event > deletion)
         })
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct TransferMetadata {
+    content_id: ContentId,
+    manifest_id: ManifestId,
+    manifest: StoredManifest,
+    quota_exempt: bool,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct TransferTerminal {
+    content_id: ContentId,
+    manifest_id: ManifestId,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct TransferProjectionState {
+    begin: Option<Register<TransferMetadata>>,
+    complete: Option<Register<TransferTerminal>>,
+    cancelled: Option<Register<TransferTerminal>>,
+}
+
+impl TransferProjectionState {
+    fn new() -> Self {
+        Self {
+            begin: None,
+            complete: None,
+            cancelled: None,
+        }
+    }
+
+    fn phase(&self) -> TransferPhase {
+        if self.terminal_matches(self.cancelled.as_ref()) {
+            TransferPhase::Cancelled
+        } else if self.terminal_matches(self.complete.as_ref()) {
+            TransferPhase::Complete
+        } else {
+            TransferPhase::Pending
+        }
+    }
+
+    fn terminal_matches(&self, terminal: Option<&Register<TransferTerminal>>) -> bool {
+        self.begin
+            .as_ref()
+            .zip(terminal)
+            .is_some_and(|(begin, terminal)| {
+                begin.value.content_id == terminal.value.content_id
+                    && begin.value.manifest_id == terminal.value.manifest_id
+            })
+    }
+
+    fn activity(&self) -> Option<EventKey> {
+        let begin = self.begin.as_ref()?;
+        let completion = self
+            .complete
+            .as_ref()
+            .filter(|complete| self.terminal_matches(Some(complete)))
+            .map_or(begin.event, |complete| complete.event);
+        Some(begin.event.max(completion))
     }
 }
 
@@ -169,6 +235,49 @@ pub struct TombstoneView {
     currently_deleted: bool,
 }
 
+/// Read-only replicated transfer transaction state.
+#[derive(Clone, Copy, Debug)]
+pub struct TransferView<'a> {
+    transfer_id: TransferId,
+    content_id: Option<ContentId>,
+    manifest_id: Option<ManifestId>,
+    manifest: Option<&'a StoredManifest>,
+    phase: TransferPhase,
+    quota_exempt: bool,
+}
+
+impl<'a> TransferView<'a> {
+    #[must_use]
+    pub const fn transfer_id(self) -> TransferId {
+        self.transfer_id
+    }
+
+    #[must_use]
+    pub const fn content_id(self) -> Option<ContentId> {
+        self.content_id
+    }
+
+    #[must_use]
+    pub const fn manifest_id(self) -> Option<ManifestId> {
+        self.manifest_id
+    }
+
+    #[must_use]
+    pub const fn manifest(self) -> Option<&'a StoredManifest> {
+        self.manifest
+    }
+
+    #[must_use]
+    pub const fn phase(self) -> TransferPhase {
+        self.phase
+    }
+
+    #[must_use]
+    pub const fn quota_exempt(self) -> bool {
+        self.quota_exempt
+    }
+}
+
 impl TombstoneView {
     #[must_use]
     pub const fn content_id(self) -> ContentId {
@@ -200,6 +309,7 @@ pub struct Projection {
     settings: BTreeMap<String, Register<SettingValue>>,
     forgotten_devices: BTreeMap<NodeId, EventKey>,
     known_members: BTreeSet<NodeId>,
+    transfers: BTreeMap<TransferId, TransferProjectionState>,
 }
 
 impl Projection {
@@ -233,6 +343,7 @@ impl Projection {
     ///
     /// Returns [`ProjectionError::PayloadContentIdMismatch`] when an `Add`
     /// operation names a different ID than its payload descriptor.
+    #[allow(clippy::too_many_lines)]
     pub fn apply(&mut self, stamped: &StampedOperation) -> Result<ApplyOutcome, ProjectionError> {
         Self::validate_operation(stamped)?;
 
@@ -266,6 +377,88 @@ impl Projection {
                 state.activity = Some(state.activity.map_or(event, |current| current.max(event)));
                 write_register(&mut state.payload, event, payload.clone());
                 write_register(&mut state.quota_exempt, event, true);
+            }
+            Operation::BeginShare {
+                transfer_id,
+                content_id,
+                manifest_id,
+                manifest,
+                quota_exempt,
+            } => {
+                let transfer = self
+                    .transfers
+                    .entry(*transfer_id)
+                    .or_insert_with(TransferProjectionState::new);
+                write_register(
+                    &mut transfer.begin,
+                    event,
+                    TransferMetadata {
+                        content_id: *content_id,
+                        manifest_id: *manifest_id,
+                        manifest: manifest.clone(),
+                        quota_exempt: *quota_exempt,
+                    },
+                );
+                let state = self
+                    .content
+                    .entry(*content_id)
+                    .or_insert_with(ContentState::new);
+                state.activity = Some(state.activity.map_or(event, |current| current.max(event)));
+                write_register(&mut state.quota_exempt, event, *quota_exempt);
+                if transfer.terminal_matches(transfer.complete.as_ref())
+                    && let Some(complete) = transfer.complete.as_ref()
+                {
+                    let completion = complete.event;
+                    state.activity = Some(
+                        state
+                            .activity
+                            .map_or(completion, |current| current.max(completion)),
+                    );
+                }
+            }
+            Operation::CompleteShare {
+                transfer_id,
+                content_id,
+                manifest_id,
+            } => {
+                let transfer = self
+                    .transfers
+                    .entry(*transfer_id)
+                    .or_insert_with(TransferProjectionState::new);
+                write_register(
+                    &mut transfer.complete,
+                    event,
+                    TransferTerminal {
+                        content_id: *content_id,
+                        manifest_id: *manifest_id,
+                    },
+                );
+                if transfer.terminal_matches(transfer.complete.as_ref()) {
+                    let state = self
+                        .content
+                        .entry(*content_id)
+                        .or_insert_with(ContentState::new);
+                    state.activity =
+                        Some(state.activity.map_or(event, |current| current.max(event)));
+                }
+            }
+            Operation::CancelShare {
+                transfer_id,
+                content_id,
+                manifest_id,
+            } => {
+                let transfer = self
+                    .transfers
+                    .entry(*transfer_id)
+                    .or_insert_with(TransferProjectionState::new);
+                write_register(
+                    &mut transfer.cancelled,
+                    event,
+                    TransferTerminal {
+                        content_id: *content_id,
+                        manifest_id: *manifest_id,
+                    },
+                );
             }
             Operation::Touch { content_id } => {
                 let state = self
@@ -328,22 +521,25 @@ impl Projection {
         &self.seen
     }
 
+    #[must_use]
     pub fn is_visible(&self, content_id: ContentId) -> bool {
         self.content
             .get(&content_id)
-            .is_some_and(ContentState::is_visible)
+            .is_some_and(|state| self.content_is_visible(content_id, state))
     }
 
+    #[must_use]
     pub fn is_pinned(&self, content_id: ContentId) -> bool {
         self.content
             .get(&content_id)
-            .is_some_and(ContentState::is_pinned)
+            .is_some_and(|state| self.content_is_visible(content_id, state) && state.is_pinned())
     }
 
+    #[must_use]
     pub fn is_quota_exempt(&self, content_id: ContentId) -> bool {
-        self.content
-            .get(&content_id)
-            .is_some_and(ContentState::is_quota_exempt)
+        self.content.get(&content_id).is_some_and(|state| {
+            self.content_is_visible(content_id, state) && state.is_quota_exempt()
+        })
     }
 
     #[must_use]
@@ -389,6 +585,69 @@ impl Projection {
         self.known_members.iter().copied()
     }
 
+    #[must_use]
+    pub fn transfer(&self, transfer_id: TransferId) -> Option<TransferView<'_>> {
+        self.transfers
+            .get(&transfer_id)
+            .map(|state| transfer_view(transfer_id, state))
+    }
+
+    #[must_use]
+    pub fn transfers(&self) -> Vec<TransferView<'_>> {
+        self.transfers
+            .iter()
+            .map(|(id, state)| transfer_view(*id, state))
+            .collect()
+    }
+
+    #[must_use]
+    pub fn completed_manifest_for_content(
+        &self,
+        content_id: ContentId,
+    ) -> Option<(TransferId, ManifestId, &StoredManifest)> {
+        self.transfers
+            .iter()
+            .filter_map(|(id, state)| {
+                if state.phase() != TransferPhase::Complete {
+                    return None;
+                }
+                let metadata = &state.begin.as_ref()?.value;
+                let activity = state.activity()?;
+                (metadata.content_id == content_id).then_some((
+                    activity,
+                    *id,
+                    metadata.manifest_id,
+                    &metadata.manifest,
+                ))
+            })
+            .max_by_key(|(activity, id, _, _)| (*activity, *id))
+            .map(|(_, id, manifest_id, manifest)| (id, manifest_id, manifest))
+    }
+
+    #[must_use]
+    pub fn manifest_for_content(
+        &self,
+        content_id: ContentId,
+    ) -> Option<(TransferId, ManifestId, &StoredManifest)> {
+        self.transfers
+            .iter()
+            .filter_map(|(id, state)| {
+                if state.phase() == TransferPhase::Cancelled {
+                    return None;
+                }
+                let metadata = &state.begin.as_ref()?.value;
+                let activity = state.activity()?;
+                (metadata.content_id == content_id).then_some((
+                    activity,
+                    *id,
+                    metadata.manifest_id,
+                    &metadata.manifest,
+                ))
+            })
+            .max_by_key(|(activity, id, _, _)| (*activity, *id))
+            .map(|(_, id, manifest_id, manifest)| (id, manifest_id, manifest))
+    }
+
     /// Computes the oldest-first eviction set from only quota-chargeable
     /// entries. Pins and explicit oversized shares are excluded from both the
     /// usage total and the candidate set.
@@ -400,14 +659,17 @@ impl Projection {
         let mut candidates = Vec::new();
 
         for (content_id, state) in &self.content {
-            if !state.is_visible() {
+            if !self.content_is_visible(*content_id, state) {
                 continue;
             }
-            let Some(payload) = state.payload.as_ref().map(|payload| &payload.value) else {
+            let size = if let Some(payload) = state.payload.as_ref().map(|payload| &payload.value) {
+                u128::from(payload.descriptor().logical_size())
+            } else if let Some((_, _, manifest)) = self.manifest_for_content(*content_id) {
+                u128::from(manifest.logical_size())
+            } else {
                 missing_payloads.push(*content_id);
                 continue;
             };
-            let size = u128::from(payload.descriptor().logical_size());
             if state.is_pinned() || state.is_quota_exempt() {
                 excluded_bytes += size;
             } else {
@@ -492,7 +754,7 @@ impl Projection {
             .content
             .iter()
             .filter_map(|(content_id, state)| {
-                if !state.is_visible() {
+                if !self.content_is_visible(*content_id, state) {
                     return None;
                 }
 
@@ -512,6 +774,25 @@ impl Projection {
                 .then_with(|| left.content_id.cmp(&right.content_id))
         });
         visible
+    }
+
+    fn content_is_visible(&self, content_id: ContentId, state: &ContentState) -> bool {
+        if !state.is_visible() {
+            return false;
+        }
+        if state.payload.is_some() {
+            return true;
+        }
+        let mut has_transfer = false;
+        let has_live_transfer = self.transfers.values().any(|transfer| {
+            let matches_content = transfer
+                .begin
+                .as_ref()
+                .is_some_and(|begin| begin.value.content_id == content_id);
+            has_transfer |= matches_content;
+            matches_content && transfer.phase() != TransferPhase::Cancelled
+        });
+        !has_transfer || has_live_transfer
     }
 
     fn active_members(
@@ -566,6 +847,7 @@ impl fmt::Debug for Projection {
             .field("settings", &self.settings)
             .field("forgotten_devices", &self.forgotten_devices)
             .field("known_members", &self.known_members)
+            .field("transfers", &self.transfers.len())
             .finish()
     }
 }
@@ -587,6 +869,18 @@ pub enum ProjectionError {
     SettingTextTooLong,
     #[error("shared setting {key:?} requires a positive unsigned integer")]
     InvalidKnownSetting { key: String },
+}
+
+fn transfer_view(transfer_id: TransferId, state: &TransferProjectionState) -> TransferView<'_> {
+    let metadata = state.begin.as_ref().map(|begin| &begin.value);
+    TransferView {
+        transfer_id,
+        content_id: metadata.map(|metadata| metadata.content_id),
+        manifest_id: metadata.map(|metadata| metadata.manifest_id),
+        manifest: metadata.map(|metadata| &metadata.manifest),
+        phase: state.phase(),
+        quota_exempt: metadata.is_some_and(|metadata| metadata.quota_exempt),
+    }
 }
 
 fn validate_setting(key: &str, value: &SettingValue) -> Result<(), ProjectionError> {

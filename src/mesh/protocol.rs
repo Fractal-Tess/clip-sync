@@ -9,6 +9,10 @@ pub const MAX_CONTROL_FRAME_BYTES: usize = 24 * 1024 * 1024;
 pub const MAX_FRONTIER_BYTES: usize = 1024 * 1024;
 pub const MAX_HOSTNAME_BYTES: usize = 255;
 pub const MAX_BATCH_OPERATIONS: usize = 128;
+pub const STREAM_KIND_SYNC: u8 = 1;
+pub const STREAM_KIND_CHUNK: u8 = 2;
+pub const MAX_ENCRYPTED_CHUNK_BYTES: usize = 4 * 1024 * 1024 + 48;
+pub const MAX_CHUNK_CONTROL_BYTES: usize = 512;
 
 #[derive(Clone, PartialEq, Message)]
 pub struct IdentityHello {
@@ -42,6 +46,30 @@ pub struct SyncResponse {
     pub has_more: bool,
 }
 
+#[derive(Clone, PartialEq, Message)]
+pub struct ChunkStreamRequest {
+    #[prost(bytes = "vec", tag = "1")]
+    pub transfer_id: Vec<u8>,
+    #[prost(bytes = "vec", tag = "2")]
+    pub manifest_id: Vec<u8>,
+    #[prost(bytes = "vec", tag = "3")]
+    pub chunk_id: Vec<u8>,
+    #[prost(uint32, tag = "4")]
+    pub logical_size: u32,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct ChunkStreamResponse {
+    #[prost(bool, tag = "1")]
+    pub available: bool,
+    #[prost(bytes = "vec", tag = "2")]
+    pub transfer_id: Vec<u8>,
+    #[prost(bytes = "vec", tag = "3")]
+    pub chunk_id: Vec<u8>,
+    #[prost(uint32, tag = "4")]
+    pub encrypted_size: u32,
+}
+
 pub async fn write_message<M: Message>(
     send: &mut SendStream,
     message: &M,
@@ -60,11 +88,18 @@ pub async fn write_message<M: Message>(
 }
 
 pub async fn read_message<M: Message + Default>(recv: &mut RecvStream) -> Result<M, ProtocolError> {
+    read_message_bounded(recv, MAX_CONTROL_FRAME_BYTES).await
+}
+
+pub async fn read_message_bounded<M: Message + Default>(
+    recv: &mut RecvStream,
+    maximum_bytes: usize,
+) -> Result<M, ProtocolError> {
     let mut length = [0; 4];
     recv.read_exact(&mut length).await?;
     let length = usize::try_from(u32::from_be_bytes(length))
         .map_err(|_| ProtocolError::FrameTooLarge(usize::MAX))?;
-    if length > MAX_CONTROL_FRAME_BYTES {
+    if length > maximum_bytes {
         return Err(ProtocolError::FrameTooLarge(length));
     }
     let mut encoded = vec![0; length];

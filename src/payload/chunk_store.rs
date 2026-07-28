@@ -123,6 +123,11 @@ pub struct ChunkRef {
 
 impl ChunkRef {
     #[must_use]
+    pub const fn from_parts(id: ChunkId, logical_size: u32) -> Self {
+        Self { id, logical_size }
+    }
+
+    #[must_use]
     pub const fn id(&self) -> ChunkId {
         self.id
     }
@@ -151,11 +156,50 @@ impl BlobManifest {
     }
 }
 
+/// One MIME representation stored as an ordered encrypted blob.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MimeBlob {
+    mime: String,
+    blob: BlobManifest,
+}
+
+impl MimeBlob {
+    #[must_use]
+    pub fn mime(&self) -> &str {
+        &self.mime
+    }
+
+    #[must_use]
+    pub const fn blob(&self) -> &BlobManifest {
+        &self.blob
+    }
+}
+
+/// Canonical multi-MIME clipboard payload whose bytes live in encrypted chunks.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MimeBundleManifest {
+    logical_size: u64,
+    representations: Vec<MimeBlob>,
+}
+
+impl MimeBundleManifest {
+    #[must_use]
+    pub const fn logical_size(&self) -> u64 {
+        self.logical_size
+    }
+
+    #[must_use]
+    pub fn representations(&self) -> &[MimeBlob] {
+        &self.representations
+    }
+}
+
 /// Encrypted manifest body retained in the `SQLCipher` catalog.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "value", rename_all = "snake_case")]
 pub enum StoredManifest {
     Blob(BlobManifest),
+    MimeBundle(MimeBundleManifest),
     Files(FileSnapshot),
 }
 
@@ -164,6 +208,7 @@ impl StoredManifest {
     pub fn logical_size(&self) -> u64 {
         match self {
             Self::Blob(blob) => blob.logical_size(),
+            Self::MimeBundle(bundle) => bundle.logical_size(),
             Self::Files(files) => files.logical_size(),
         }
     }
@@ -173,6 +218,13 @@ impl StoredManifest {
             Self::Blob(blob) => {
                 for chunk in blob.chunks() {
                     visitor(chunk);
+                }
+            }
+            Self::MimeBundle(bundle) => {
+                for representation in bundle.representations() {
+                    for chunk in representation.blob().chunks() {
+                        visitor(chunk);
+                    }
                 }
             }
             Self::Files(files) => {
@@ -185,6 +237,14 @@ impl StoredManifest {
                 }
             }
         }
+    }
+
+    /// Returns the canonical chunk references used by this manifest.
+    #[must_use]
+    pub fn chunks(&self) -> Vec<ChunkRef> {
+        let mut chunks = Vec::new();
+        self.visit_chunks(|chunk| chunks.push(chunk.clone()));
+        chunks
     }
 }
 
@@ -261,6 +321,18 @@ impl ChunkStore {
                  id BLOB PRIMARY KEY NOT NULL CHECK(length(id) = 32),
                  encoding_version INTEGER NOT NULL CHECK(encoding_version = 1),
                  body BLOB NOT NULL
+             ) STRICT, WITHOUT ROWID;
+             CREATE TABLE IF NOT EXISTS staged_manifests (
+                 id BLOB PRIMARY KEY NOT NULL CHECK(length(id) = 32),
+                 encoding_version INTEGER NOT NULL CHECK(encoding_version = 1),
+                 body BLOB NOT NULL
+             ) STRICT, WITHOUT ROWID;
+             CREATE TABLE IF NOT EXISTS staged_manifest_chunks (
+                 manifest_id BLOB NOT NULL CHECK(length(manifest_id) = 32),
+                 chunk_id BLOB NOT NULL CHECK(length(chunk_id) = 32),
+                 logical_size INTEGER NOT NULL CHECK(logical_size BETWEEN 1 AND 4194304),
+                 PRIMARY KEY(manifest_id, chunk_id),
+                 FOREIGN KEY(manifest_id) REFERENCES staged_manifests(id) ON DELETE CASCADE
              ) STRICT, WITHOUT ROWID;",
             )
             .map_err(normalize_catalog_error)?;
@@ -287,6 +359,11 @@ impl ChunkStore {
     #[must_use]
     pub const fn chunk_bytes(&self) -> usize {
         self.config.chunk_bytes
+    }
+
+    #[must_use]
+    pub fn encrypted_chunk_bytes(&self) -> u64 {
+        self.encrypted_object_bytes()
     }
 
     /// Streams a bounded reader into encrypted staged chunks.
@@ -335,6 +412,57 @@ impl ChunkStore {
             logical_size: total,
             chunks,
         })
+    }
+
+    /// Streams canonical MIME representations into a single encrypted bundle.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for empty/duplicate MIME names, size overflow, limits,
+    /// cancellation, I/O, or encryption failures.
+    pub fn stage_mime_bundle(
+        &mut self,
+        representations: &mut [(String, &[u8])],
+        maximum_bytes: u64,
+        cancellation: &CancellationToken,
+    ) -> Result<MimeBundleManifest, ChunkStoreError> {
+        if representations.is_empty() {
+            return Err(ChunkStoreError::MalformedManifest);
+        }
+        representations.sort_unstable_by(|left, right| left.0.as_bytes().cmp(right.0.as_bytes()));
+        let mut prior: Option<&str> = None;
+        let mut logical_size = 0_u64;
+        let mut bundled = Vec::with_capacity(representations.len());
+        for (mime, bytes) in representations {
+            if mime.is_empty()
+                || mime.len() > 256
+                || mime.as_bytes().contains(&0)
+                || prior == Some(mime.as_str())
+            {
+                return Err(ChunkStoreError::MalformedManifest);
+            }
+            prior = Some(mime);
+            let remaining = maximum_bytes.checked_sub(logical_size).ok_or(
+                ChunkStoreError::PayloadTooLarge {
+                    observed: logical_size,
+                    maximum: maximum_bytes,
+                },
+            )?;
+            let blob = self.stage_reader(&mut io::Cursor::new(*bytes), remaining, cancellation)?;
+            logical_size = logical_size
+                .checked_add(blob.logical_size())
+                .ok_or(ChunkStoreError::SizeOverflow)?;
+            bundled.push(MimeBlob {
+                mime: mime.clone(),
+                blob,
+            });
+        }
+        let manifest = MimeBundleManifest {
+            logical_size,
+            representations: bundled,
+        };
+        validate_mime_bundle(&manifest, self.config)?;
+        Ok(manifest)
     }
 
     /// Commits a validated encrypted manifest and increments chunk refcounts.
@@ -417,6 +545,169 @@ impl ChunkStore {
         Ok(manifest)
     }
 
+    /// Validates a replicated manifest and its keyed identifier without
+    /// changing catalog state.
+    ///
+    /// # Errors
+    ///
+    /// Returns malformed/oversized manifest or identifier mismatch errors.
+    pub fn validate_manifest_id(
+        &self,
+        expected_id: ManifestId,
+        manifest: &StoredManifest,
+    ) -> Result<(), ChunkStoreError> {
+        self.validate_manifest(manifest)?;
+        let body = Zeroizing::new(serde_json::to_vec(manifest)?);
+        if self.manifest_id(&body) != expected_id {
+            return Err(ChunkStoreError::IdentifierMismatch);
+        }
+        Ok(())
+    }
+
+    /// Computes the keyed identifier of a valid manifest without committing it.
+    ///
+    /// # Errors
+    ///
+    /// Returns malformed/oversized manifest or serialization errors.
+    pub fn manifest_id_for(
+        &self,
+        manifest: &StoredManifest,
+    ) -> Result<ManifestId, ChunkStoreError> {
+        self.validate_manifest(manifest)?;
+        let body = Zeroizing::new(serde_json::to_vec(manifest)?);
+        Ok(self.manifest_id(&body))
+    }
+
+    /// Durably records an incoming manifest before all of its chunks exist.
+    ///
+    /// Staged manifests pin any imported zero-reference chunks across restart.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for malformed manifests, identifier mismatches, or
+    /// catalog failures.
+    pub fn stage_incoming_manifest(
+        &mut self,
+        expected_id: ManifestId,
+        manifest: &StoredManifest,
+    ) -> Result<(), ChunkStoreError> {
+        self.validate_manifest_id(expected_id, manifest)?;
+        let body = Zeroizing::new(serde_json::to_vec(manifest)?);
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let existing = transaction
+            .query_row(
+                "SELECT body FROM staged_manifests WHERE id = ?1",
+                [expected_id.as_bytes().as_slice()],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()?;
+        if existing
+            .as_deref()
+            .is_some_and(|existing| existing != body.as_slice())
+        {
+            return Err(ChunkStoreError::IdentifierCollision);
+        }
+        transaction.execute(
+            "INSERT INTO staged_manifests(id, encoding_version, body) VALUES(?1, 1, ?2)
+             ON CONFLICT(id) DO NOTHING",
+            (expected_id.as_bytes().as_slice(), body.as_slice()),
+        )?;
+        let mut chunks = Vec::new();
+        manifest.visit_chunks(|chunk| chunks.push(chunk.clone()));
+        for chunk in chunks {
+            transaction.execute(
+                "INSERT INTO staged_manifest_chunks(manifest_id, chunk_id, logical_size)
+                 VALUES(?1, ?2, ?3) ON CONFLICT(manifest_id, chunk_id) DO NOTHING",
+                (
+                    expected_id.as_bytes().as_slice(),
+                    chunk.id.as_bytes().as_slice(),
+                    i64::from(chunk.logical_size),
+                ),
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Promotes a fully received staged manifest into retained history.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error until every authenticated chunk is present.
+    pub fn promote_staged_manifest(
+        &mut self,
+        id: ManifestId,
+    ) -> Result<StoredManifest, ChunkStoreError> {
+        let body = self
+            .connection
+            .query_row(
+                "SELECT body FROM staged_manifests WHERE id = ?1 AND encoding_version = 1",
+                [id.as_bytes().as_slice()],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()?
+            .ok_or(ChunkStoreError::MissingManifest(id))?;
+        let manifest: StoredManifest =
+            serde_json::from_slice(&body).map_err(|_| ChunkStoreError::CorruptManifest(id))?;
+        let committed = self.commit_manifest(&manifest)?;
+        if committed != id {
+            return Err(ChunkStoreError::IdentifierMismatch);
+        }
+        self.connection.execute(
+            "DELETE FROM staged_manifests WHERE id = ?1",
+            [id.as_bytes().as_slice()],
+        )?;
+        Ok(manifest)
+    }
+
+    /// Cancels incoming staging and reclaims chunks not retained elsewhere.
+    ///
+    /// # Errors
+    ///
+    /// Returns catalog or cleanup errors.
+    pub fn abandon_staged_manifest(&mut self, id: ManifestId) -> Result<bool, ChunkStoreError> {
+        let changed = self.connection.execute(
+            "DELETE FROM staged_manifests WHERE id = ?1",
+            [id.as_bytes().as_slice()],
+        )?;
+        self.cleanup_unreferenced()?;
+        Ok(changed != 0)
+    }
+
+    /// Drops a corrupt, unretained incoming chunk so another peer can retry it.
+    ///
+    /// # Errors
+    ///
+    /// Refuses to remove a chunk referenced by a committed manifest.
+    pub fn discard_unretained_chunk(&mut self, id: ChunkId) -> Result<bool, ChunkStoreError> {
+        let ref_count = self
+            .connection
+            .query_row(
+                "SELECT ref_count FROM chunk_catalog WHERE id = ?1",
+                [id.as_bytes().as_slice()],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?;
+        let Some(ref_count) = ref_count else {
+            return Ok(false);
+        };
+        if ref_count != 0 {
+            return Err(ChunkStoreError::ChunkRetained(id));
+        }
+        self.connection.execute(
+            "DELETE FROM chunk_catalog WHERE id = ?1 AND ref_count = 0",
+            [id.as_bytes().as_slice()],
+        )?;
+        match fs::remove_file(self.chunk_path(id)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        Ok(true)
+    }
+
     #[must_use]
     pub fn has_chunk(&self, id: ChunkId) -> bool {
         self.connection
@@ -462,6 +753,38 @@ impl ChunkStore {
         for chunk in blob.chunks() {
             self.read_chunk(chunk, writer, cancellation)?;
         }
+        Ok(())
+    }
+
+    /// Authenticates and reconstructs every MIME representation in order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for cancellation, corruption, authentication, or I/O.
+    pub fn read_mime_bundle(
+        &self,
+        bundle: &MimeBundleManifest,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<(String, Vec<u8>)>, ChunkStoreError> {
+        validate_mime_bundle(bundle, self.config)?;
+        let mut representations = Vec::with_capacity(bundle.representations.len());
+        for representation in &bundle.representations {
+            let capacity = usize::try_from(representation.blob.logical_size)
+                .map_err(|_| ChunkStoreError::SizeOverflow)?;
+            let mut bytes = Vec::with_capacity(capacity);
+            self.read_blob(&representation.blob, &mut bytes, cancellation)?;
+            representations.push((representation.mime.clone(), bytes));
+        }
+        Ok(representations)
+    }
+
+    /// Fully authenticates one locally stored encrypted chunk.
+    ///
+    /// # Errors
+    ///
+    /// Returns corruption, authentication, identifier, or I/O errors.
+    pub fn verify_chunk(&self, chunk: &ChunkRef) -> Result<(), ChunkStoreError> {
+        self.decrypt_chunk_file(chunk.id, chunk.logical_size)?;
         Ok(())
     }
 
@@ -520,7 +843,13 @@ impl ChunkStore {
         }
         file.sync_all()?;
         drop(file);
-        let plaintext = self.decrypt_path(&temporary, id, logical_size)?;
+        let plaintext = match self.decrypt_path(&temporary, id, logical_size) {
+            Ok(plaintext) => plaintext,
+            Err(error) => {
+                let _ = fs::remove_file(&temporary);
+                return Err(error);
+            }
+        };
         if self.chunk_id(&plaintext) != id {
             let _ = fs::remove_file(&temporary);
             return Err(ChunkStoreError::IdentifierMismatch);
@@ -596,9 +925,15 @@ impl ChunkStore {
     pub fn cleanup_unreferenced(&mut self) -> Result<usize, ChunkStoreError> {
         let mut removed = 0_usize;
         loop {
-            let mut statement = self
-                .connection
-                .prepare("SELECT id FROM chunk_catalog WHERE ref_count = 0 LIMIT 1024")?;
+            let mut statement = self.connection.prepare(
+                "SELECT id FROM chunk_catalog
+                     WHERE ref_count = 0
+                       AND NOT EXISTS (
+                         SELECT 1 FROM staged_manifest_chunks
+                         WHERE staged_manifest_chunks.chunk_id = chunk_catalog.id
+                       )
+                     LIMIT 1024",
+            )?;
             let rows = statement.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
             let mut ids = Vec::with_capacity(1024);
             for row in rows {
@@ -618,7 +953,12 @@ impl ChunkStore {
                 .transaction_with_behavior(TransactionBehavior::Immediate)?;
             for id in &ids {
                 transaction.execute(
-                    "DELETE FROM chunk_catalog WHERE id = ?1 AND ref_count = 0",
+                    "DELETE FROM chunk_catalog
+                     WHERE id = ?1 AND ref_count = 0
+                       AND NOT EXISTS (
+                         SELECT 1 FROM staged_manifest_chunks
+                         WHERE staged_manifest_chunks.chunk_id = chunk_catalog.id
+                       )",
                     [id.as_bytes().as_slice()],
                 )?;
             }
@@ -814,6 +1154,7 @@ impl ChunkStore {
         }
         match manifest {
             StoredManifest::Blob(blob) => validate_blob(blob, self.config),
+            StoredManifest::MimeBundle(bundle) => validate_mime_bundle(bundle, self.config),
             StoredManifest::Files(files) => files
                 .validate(self.config.max_payload_bytes)
                 .map_err(|_| ChunkStoreError::MalformedManifest),
@@ -848,6 +1189,35 @@ impl ChunkStore {
         u64::try_from(CHUNK_HEADER_BYTES + self.config.chunk_bytes + AEAD_TAG_BYTES)
             .expect("bounded chunk object size")
     }
+}
+
+fn validate_mime_bundle(
+    bundle: &MimeBundleManifest,
+    config: ChunkStoreConfig,
+) -> Result<(), ChunkStoreError> {
+    if bundle.representations.is_empty() {
+        return Err(ChunkStoreError::MalformedManifest);
+    }
+    let mut prior: Option<&str> = None;
+    let mut total = 0_u64;
+    for representation in &bundle.representations {
+        if representation.mime.is_empty()
+            || representation.mime.len() > 256
+            || representation.mime.as_bytes().contains(&0)
+            || prior.is_some_and(|prior| prior >= representation.mime.as_str())
+        {
+            return Err(ChunkStoreError::MalformedManifest);
+        }
+        prior = Some(&representation.mime);
+        validate_blob(&representation.blob, config)?;
+        total = total
+            .checked_add(representation.blob.logical_size())
+            .ok_or(ChunkStoreError::SizeOverflow)?;
+    }
+    if total != bundle.logical_size || total > config.max_payload_bytes {
+        return Err(ChunkStoreError::MalformedManifest);
+    }
+    Ok(())
 }
 
 fn validate_config(config: ChunkStoreConfig) -> Result<(), ChunkStoreError> {
@@ -1059,6 +1429,8 @@ pub enum ChunkStoreError {
     MissingChunk(ChunkId),
     #[error("chunk {0} is corrupt")]
     CorruptChunk(ChunkId),
+    #[error("chunk {0} is retained and cannot be discarded")]
+    ChunkRetained(ChunkId),
     #[error("manifest {0} is missing")]
     MissingManifest(ManifestId),
     #[error("manifest {0} is corrupt")]

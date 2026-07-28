@@ -3,4 +3,6 @@
 mod protocol;
 mod runtime;
 
-pub use runtime::{MeshError, MeshHandle, MeshRuntime, MeshRuntimeConfig, PersistBatch};
+pub use runtime::{
+    MeshChunkCommand, MeshError, MeshHandle, MeshRuntime, MeshRuntimeConfig, PersistBatch,
+};

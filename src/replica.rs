@@ -4,6 +4,10 @@ use crate::model::{
     ApplyOutcome, ContentId, HlcError, HlcTimestamp, HybridLogicalClock, NodeId, OpId, OpIdError,
     Operation, Payload, Projection, ProjectionError, SettingValue, SharedSetting, StampedOperation,
 };
+use crate::{
+    payload::{ManifestId, StoredManifest},
+    transfer::{TransferId, TransferPhase},
+};
 
 /// Generous tolerance for wall-clock skew without allowing a malformed peer
 /// event to pin the local HLC arbitrarily far into the future.
@@ -115,6 +119,95 @@ impl Replica {
             }
         };
         self.author(operation, now_millis)
+    }
+
+    /// Authors the pending replicated half of a manifest-backed share.
+    ///
+    /// # Errors
+    ///
+    /// Returns an authoring or projection validation error.
+    pub fn begin_manifest_share(
+        &mut self,
+        transfer_id: TransferId,
+        content_id: ContentId,
+        manifest_id: ManifestId,
+        manifest: StoredManifest,
+        quota_exempt: bool,
+        now_millis: u64,
+    ) -> Result<StampedOperation, ReplicaError> {
+        self.author(
+            Operation::BeginShare {
+                transfer_id,
+                content_id,
+                manifest_id,
+                manifest,
+                quota_exempt,
+            },
+            now_millis,
+        )
+    }
+
+    /// Authors completion after local encrypted chunks are durable.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an absent/cancelled transfer or authoring failure.
+    pub fn complete_manifest_share(
+        &mut self,
+        transfer_id: TransferId,
+        now_millis: u64,
+    ) -> Result<StampedOperation, ReplicaError> {
+        let transfer = self
+            .projection
+            .transfer(transfer_id)
+            .ok_or(ReplicaError::TransferNotFound(transfer_id))?;
+        if transfer.phase() == TransferPhase::Cancelled {
+            return Err(ReplicaError::TransferCancelled(transfer_id));
+        }
+        let content_id = transfer
+            .content_id()
+            .ok_or(ReplicaError::TransferNotFound(transfer_id))?;
+        let manifest_id = transfer
+            .manifest_id()
+            .ok_or(ReplicaError::TransferNotFound(transfer_id))?;
+        self.author(
+            Operation::CompleteShare {
+                transfer_id,
+                content_id,
+                manifest_id,
+            },
+            now_millis,
+        )
+    }
+
+    /// Authors a cancellation tombstone which dominates completion ordering.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an absent transfer or authoring failure.
+    pub fn cancel_manifest_share(
+        &mut self,
+        transfer_id: TransferId,
+        now_millis: u64,
+    ) -> Result<StampedOperation, ReplicaError> {
+        let transfer = self
+            .projection
+            .transfer(transfer_id)
+            .ok_or(ReplicaError::TransferNotFound(transfer_id))?;
+        let content_id = transfer
+            .content_id()
+            .ok_or(ReplicaError::TransferNotFound(transfer_id))?;
+        let manifest_id = transfer
+            .manifest_id()
+            .ok_or(ReplicaError::TransferNotFound(transfer_id))?;
+        self.author(
+            Operation::CancelShare {
+                transfer_id,
+                content_id,
+                manifest_id,
+            },
+            now_millis,
+        )
     }
 
     /// Captures payload and immediately applies the effective replicated quota.
@@ -427,6 +520,10 @@ pub enum ReplicaError {
     CounterExhausted,
     #[error("content {0} is not visible")]
     ContentNotVisible(ContentId),
+    #[error("transfer {0} is not available")]
+    TransferNotFound(TransferId),
+    #[error("transfer {0} was cancelled")]
+    TransferCancelled(TransferId),
     #[error("content ID is invalid: {0}")]
     InvalidContentId(String),
     #[error("shared setting {setting:?} cannot be set to {value}")]

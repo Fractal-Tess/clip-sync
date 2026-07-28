@@ -341,6 +341,40 @@ pub struct ClipboardContent {
     representations: Vec<ClipboardRepresentation>,
 }
 
+/// Size-only snapshot of the current live offer used for explicit sharing.
+#[derive(Clone, Debug)]
+pub struct CurrentClipboardInspection {
+    generation: Generation,
+    mime_list: OfferMimeList,
+    logical_size: u64,
+}
+
+impl CurrentClipboardInspection {
+    #[must_use]
+    pub const fn new(generation: Generation, mime_list: OfferMimeList, logical_size: u64) -> Self {
+        Self {
+            generation,
+            mime_list,
+            logical_size,
+        }
+    }
+
+    #[must_use]
+    pub const fn generation(&self) -> Generation {
+        self.generation
+    }
+
+    #[must_use]
+    pub const fn mime_list(&self) -> &OfferMimeList {
+        &self.mime_list
+    }
+
+    #[must_use]
+    pub const fn logical_size(&self) -> u64 {
+        self.logical_size
+    }
+}
+
 impl ClipboardContent {
     /// Builds clipboard content after enforcing count, uniqueness, and size
     /// bounds.
@@ -353,6 +387,25 @@ impl ClipboardContent {
     pub fn new(
         representations: Vec<ClipboardRepresentation>,
     ) -> Result<Self, ClipboardContentError> {
+        Self::new_with_limit(representations, MAX_CAPTURE_BYTES)
+    }
+
+    /// Builds clipboard content with an explicit daemon-enforced aggregate cap.
+    ///
+    /// This is used only for confirmed explicit shares and activation; ordinary
+    /// automatic capture continues to use [`Self::new`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the same validation errors as [`Self::new`] or when the caller
+    /// supplied a zero/exceeded aggregate bound.
+    pub fn new_with_limit(
+        representations: Vec<ClipboardRepresentation>,
+        maximum_bytes: u64,
+    ) -> Result<Self, ClipboardContentError> {
+        if maximum_bytes == 0 {
+            return Err(ClipboardContentError::TooLarge { total_bytes: 0 });
+        }
         if representations.is_empty() {
             return Err(ClipboardContentError::Empty);
         }
@@ -380,7 +433,7 @@ impl ClipboardContent {
                 .saturating_add(u64::try_from(representation.bytes().len()).unwrap_or(u64::MAX));
         }
 
-        if total_bytes > MAX_CAPTURE_BYTES {
+        if total_bytes > maximum_bytes {
             return Err(ClipboardContentError::TooLarge { total_bytes });
         }
 

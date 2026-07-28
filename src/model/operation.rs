@@ -1,5 +1,10 @@
 use serde::{Deserialize, Serialize};
 
+use crate::{
+    payload::{ManifestId, StoredManifest},
+    transfer::TransferId,
+};
+
 use super::{ContentId, EventKey, HlcTimestamp, NodeId, OpId, Payload};
 
 pub const DEFAULT_MESH_QUOTA_BYTES: u64 = 1024 * 1024 * 1024;
@@ -76,6 +81,26 @@ pub enum Operation {
         content_id: ContentId,
         payload: Payload,
     },
+    /// Announces a manifest-backed explicit share before peer chunk fetching.
+    BeginShare {
+        transfer_id: TransferId,
+        content_id: ContentId,
+        manifest_id: ManifestId,
+        manifest: StoredManifest,
+        quota_exempt: bool,
+    },
+    /// Declares that the origin durably retained every manifest chunk.
+    CompleteShare {
+        transfer_id: TransferId,
+        content_id: ContentId,
+        manifest_id: ManifestId,
+    },
+    /// Dominating cancellation tombstone for an incomplete share.
+    CancelShare {
+        transfer_id: TransferId,
+        content_id: ContentId,
+        manifest_id: ManifestId,
+    },
     Touch {
         content_id: ContentId,
     },
@@ -101,6 +126,9 @@ impl Operation {
         match self {
             Self::Add { content_id, .. }
             | Self::AddQuotaExempt { content_id, .. }
+            | Self::BeginShare { content_id, .. }
+            | Self::CompleteShare { content_id, .. }
+            | Self::CancelShare { content_id, .. }
             | Self::Touch { content_id }
             | Self::Delete { content_id }
             | Self::SetPin { content_id, .. } => Some(*content_id),
