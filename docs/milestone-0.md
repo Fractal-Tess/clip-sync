@@ -1,74 +1,51 @@
 # Milestone 0 findings
 
-Milestone 0 validates the riskiest platform and security assumptions before clip-sync commits to production storage, transport, clipboard, or UI APIs.
+Milestone 0 is complete. The risk spikes were converted into production paths and validated locally before daily-driver deployment.
 
 ## NetBird discovery — validated
 
-The daemon parses the stable subset of `netbird status --json`, validates local and peer addresses, and degrades without stopping local service when discovery fails.
+The daemon parses the bounded stable subset of `netbird status --json`, validates local and peer addresses, limits the peer set, binds QUIC only to the local NetBird address, and tears down stale listeners when NetBird disappears or changes address. Local clipboard history remains available while discovery is degraded.
 
-Live result on the initial Hyprland host:
+The initial live host discovered address `100.91.0.2` and 13 peers. Parsing remains isolated behind `PeerDiscovery` and fixtures because the NetBird JSON schema is external.
 
-- local NetBird address discovered successfully;
-- 13 peers parsed;
-- discovery exposed over redacted local IPC status.
+## Wayland data-control — validated live
 
-The parser remains isolated behind `PeerDiscovery` and fixture tests because the CLI JSON schema is external and may change.
+The native backend selects `ext-data-control-v1` first and falls back to `wlr-data-control-v1`. It monitors only the regular clipboard, bounds MIME metadata and aggregate bytes, drains pipes outside compositor callbacks, invalidates stale generations, reconnects after compositor disruption, and lazily serves daemon-owned multi-MIME content.
 
-## Wayland data-control — native implementation landed, live mutation test remains
+Live Hyprland validation passed against `wayland-1`:
 
-The native probe connects directly through `wayland-client`, performs a registry round trip, and selects:
+- `ext-data-control-v1` and `wl_seat` were detected;
+- duplicate MIME advertisements were normalized;
+- exact text was captured before the original `wl-copy` source was terminated;
+- activation served the retained bytes after source exit;
+- ownership did not deadlock daemon IPC;
+- the private owner marker produced at most one intentional touch;
+- the encrypted database remained mode `0600` and did not contain the plaintext marker.
 
-1. `ext-data-control-v1` when available;
-2. deprecated `wlr-data-control-v1` as fallback.
+The repeatable test is `scripts/test-live-wayland`. WLR fallback is covered structurally but still needs a compositor that lacks the ext protocol for live coverage.
 
-The live Hyprland session advertises `ext-data-control-v1` and a seat. The pure clipboard model enforces MIME-name/count bounds, the 20 MiB aggregate threshold, offer generations, and a strict distinction between regular clipboard and primary selection.
+## QUIC shared-key authentication — validated
 
-The watcher now binds `ext-data-control-v1` first with WLR v1 fallback, receives regular-clipboard offers, drains MIME pipes off the Wayland callback path with a shared aggregate budget, invalidates stale generations, serves daemon-owned multi-MIME content lazily, and uses a private marker MIME to suppress its compositor echo.
+Quinn sessions perform version preflight and TLS-exporter-bound, nonce-based, role-separated HMAC confirmation before replication metadata. Handshakes, messages, streams, peer counts, clocks, and allocations are bounded. Mismatched keys, malformed membership, replayed/conflicting operations, and incompatible protocol versions fail closed.
 
-Pure and integration tests cover capture bounds, lazy representation lookup, ownership commands, and one-shot feedback handling. A real Wayland ownership test exists but remains ignored/manual because it intentionally replaces the user's active clipboard. WLR fallback has not yet been exercised on a compositor that lacks the ext protocol.
+Loopback tests cover matching and mismatched keys, two-way reconciliation, three-node store-and-forward, offline restart, forgotten identities, and dedicated authenticated chunk streams. The disposable `scripts/deploy-smoke` test covers the real NetBird path between `vd` and `kiwi`.
 
-## QUIC shared-key authentication — validated on loopback
+## Encrypted storage and rekeying — validated
 
-The transport spike provides a fixed-size versioned handshake with:
+SQLCipher stores metadata and operations; fixed-size XChaCha20-Poly1305 chunks store large payloads and file snapshots. Mode, ownership, symlink, wrong-key, plaintext-absence, crash-window, migration, and restart tests pass.
 
-- fresh client and server nonces;
-- canonical client/server transcript ordering;
-- TLS-exporter binding;
-- HKDF-SHA-256 key separation;
-- role-separated HMAC-SHA-256 proofs;
-- constant-time verification;
-- five-second timeout and generic peer-visible failure reason;
-- an `AuthenticatedConnection` gate before application metadata.
+An authenticated `history.keyslot` wraps random database, chunk-store, and content-identity keys. `clip-sync rekey` uses an exclusive store lock, durable candidate keyslot, atomic replacement, reopen verification, and idempotent interrupted-rekey recovery. Rotation normally changes only the wrapped keyslot and mesh transport key.
 
-Real Quinn loopback tests prove matching keys authenticate and mismatched keys fail. Certificate-chain identity is intentionally not used; the custom test verifier still verifies TLS handshake signatures. Production endpoint limits, duplicate-connection resolution, protocol negotiation, and NetBird binding remain Milestone 3 work.
+## Optional egui UI — validated live
 
-## SQLCipher encrypted storage — validated
+The `ui` feature provides a keyboard-first switcher and full control center. Live Hyprland smoke tests observed:
 
-The storage spike uses the bundled SQLCipher source and verifies at open time:
+- `clip-sync-switcher`, floating and mapped at `720x420`;
+- `clip-sync-control`, floating and mapped at `1040x700`;
+- a second switcher invocation focused/signalled the singleton instead of opening a duplicate.
 
-- a nonempty SQLCipher version;
-- FTS5 support;
-- in-memory temporary storage;
-- foreign-key enforcement;
-- schema compatibility.
+The daemon-only build has no egui/windowing dependency path. Final rules and the `SUPER+H` cutover are documented in [deployment.md](deployment.md).
 
-Database files are created/restricted to mode `0600`. Tests write a unique plaintext marker, checkpoint and close the database, scan the database/WAL/shared-memory files for that marker, reopen with the correct key, and reject an incorrect key without modifying persistent files.
+## Remaining validation beyond Milestone 0
 
-This is not yet the production history schema. Envelope keyslots, the dedicated storage actor, migrations, operation persistence, encrypted chunk manifests, and transactional rekeying remain open.
-
-## Optional egui window — validated
-
-The `ui` Cargo feature builds an eframe/egui Glow application without enabling WGPU. Both planned modes exist:
-
-```console
-clip-sync ui switcher
-clip-sync ui control
-```
-
-A live Wayland smoke test opened the switcher with app ID `clip-sync-switcher` and title `clip-sync switcher`. The UI is a deliberate shell: it demonstrates sizing, dark styling, tabs, search focus, and Escape handling, but does not claim history functionality before Milestone 2.
-
-The Nix development shell supplies Wayland, libxkbcommon, and OpenGL dynamic libraries. Final package wrapping and Hyprland floating rules remain deployment work.
-
-## Remaining exit criterion
-
-Milestone 0 stays open until the ignored live Wayland test is run in a disposable compositor/session, proving that native ownership remains available after the original source exits and that compositor echoes cannot create capture loops. The implementation and bounded model tests are already in place; the remaining gap is non-destructive live validation.
+Milestone 0 has no open exit criterion. Release validation still includes the real-device compatibility matrix, actual suspend/resume cycles, and multi-day soak described in [PLAN.md](../PLAN.md).

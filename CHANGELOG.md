@@ -12,10 +12,13 @@ All notable changes will be documented here. The project is pre-alpha; storage, 
 - SQLCipher encrypted operation log with restart recovery and private file permissions.
 - Authenticated envelope keyslots with offline mesh-secret rotation and interrupted-rekey recovery.
 - Native Wayland ext-data-control watcher with WLR fallback and bounded multi-MIME capture.
-- TLS-exporter-bound QUIC shared-key authentication.
-- Transport-independent bounded anti-entropy and store-and-forward tests.
-- CLI daemon status, diagnostics, history listing, and activation commands.
-- Typed, quoted, bounded history search across CLI, IPC, and egui with
-  deterministic newest-first results and an in-memory metadata index.
-- Optional egui switcher and control-center shell.
-- Nix development shell and package.
+- TLS-exporter-bound QUIC shared-key authentication with NetBird-only listeners.
+- Durable bounded anti-entropy, offline reconciliation, membership acknowledgements, forgotten-device rejection, and tombstone compaction.
+- Fixed-size encrypted chunk storage, resumable/cancellable dedicated QUIC chunk streams, and non-origin relay forwarding.
+- Automatic and explicit safe file/directory snapshots with private runtime materialization and cleanup.
+- Replicated pins, deletes, quota eviction, quota exemptions, capture policy, and atomically mirrored Stow configuration.
+- Full JSON CLI and IPC parity for status, peers, diagnostics, history, sharing, transfers, settings, and devices.
+- Typed, quoted, bounded history search across CLI, IPC, and egui with deterministic newest-first results and an in-memory metadata index.
+- Keyboard-first singleton egui switcher and functional control center.
+- Crash-safe authenticated keyslots and offline `rekey` with interrupted-operation recovery.
+- Local security/audit checks, live Wayland validation, disposable two-node deployment testing, Nix UI/daemon packages, and a hardened NixOS user-service module.

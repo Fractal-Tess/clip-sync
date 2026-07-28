@@ -31,14 +31,14 @@ systemctl --user show-environment | grep WAYLAND_DISPLAY
 
 ## Secret provisioning
 
-Provision the same high-entropy 32-byte raw or 64-character hexadecimal secret on every mesh member. The file must be owned by the desktop user and mode `0600`. For sops-nix:
+Provision the same high-entropy 32-byte raw or 64-character hexadecimal secret on every mesh member. The target file must be owned by the desktop user with no group/other permissions (`0400` or `0600`). Stable sops-nix symlinks are supported after descriptor-level target validation:
 
 ```nix
 sops.secrets.clip_sync_mesh_key = {
   sopsFile = ./secrets.json;
   format = "json";
   owner = "your-user";
-  mode = "0600";
+  mode = "0400";
 };
 ```
 
@@ -48,6 +48,7 @@ Reference its runtime path from the local config:
 [shared]
 mesh_quota_bytes = 1073741824
 capture_threshold_bytes = 20971520
+revision = ""
 
 [local]
 mesh_key_file = "/run/secrets/clip_sync_mesh_key"
@@ -57,6 +58,10 @@ reconcile_interval_seconds = 5
 reconnect_min_seconds = 1
 reconnect_max_seconds = 60
 netbird_command = "netbird"
+maximum_explicit_share_bytes = 4294967296
+transfer_free_space_reserve_bytes = 67108864
+materialization_free_space_reserve_bytes = 8388608
+max_concurrent_chunk_streams = 4
 ```
 
 ## Mesh-secret rotation
@@ -106,8 +111,9 @@ Remove any `wl-paste --watch cliphist store` autostart only after `scripts/test-
 ## Validation
 
 ```console
-./scripts/check --nix
+./scripts/check --nix --security
 WAYLAND_DISPLAY=wayland-1 ./scripts/test-live-wayland
+WAYLAND_DISPLAY=wayland-1 ./scripts/deploy-smoke kiwi
 systemctl --user status clip-sync
 clip-sync doctor --json
 clip-sync status --json

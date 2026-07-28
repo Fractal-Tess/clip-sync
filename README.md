@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <strong>Early development:</strong> the protocol and storage format are not yet stable or ready for sensitive data.
+  <strong>Pre-release:</strong> the daily-driver implementation is feature-complete and under real-device validation; it has not received an independent security review.
 </p>
 
 ![A masterless network of clipboard peers](assets/splash.png)
@@ -29,9 +29,9 @@ Most clipboard sync tools assume a central service or immediately replace every 
 
 The first daily-driver target is NixOS on Hyprland/wlroots, synchronizing two personal devices over NetBird. The architecture keeps clipboard and peer-discovery boundaries narrow so other platforms can be added later.
 
-The first end-to-end milestone is intentionally smaller: authenticated two-node synchronization of encrypted text history.
+The current pre-release implements the complete Linux daily-driver path; real-device smoke, deployment, and soak validation remain the release gate.
 
-## Planned commands
+## Commands
 
 ```console
 clip-sync daemon
@@ -39,9 +39,16 @@ clip-sync ui switcher
 clip-sync ui control
 clip-sync status --json
 clip-sync peers --json
-clip-sync history search "device:kiwi error" --json
-clip-sync share-clipboard
+clip-sync history search 'device:kiwi type:text pinned:false "error message"' --json
+clip-sync history pin <content-id> --json
+clip-sync history delete <content-id> --json
+clip-sync share-clipboard --confirm --json
+clip-sync transfer list --json
+clip-sync transfer cancel <transfer-id> --json
+clip-sync device forget <node-id> --json
+clip-sync config set mesh-quota 1073741824 --json
 clip-sync doctor --json
+clip-sync rekey --old-key-file OLD --new-key-file NEW
 ```
 
 The UI commands will only be available when built with the optional `ui` Cargo feature.
@@ -65,16 +72,16 @@ history remains in the encrypted SQLCipher operation store.
 
 | Phase | Goal | Status |
 | --- | --- | --- |
-| 0 | Validate Wayland, NetBird, QUIC authentication, encrypted storage, and egui integration | In progress (4/5 validated; native capture remains) |
+| 0 | Validate Wayland, NetBird, QUIC authentication, encrypted storage, and egui integration | Complete |
 | 1 | Project foundation, config, model, IPC, CLI, and local checks | Complete |
-| 2 | Encrypted local text history | In progress (capture, persistence, list, and activate landed) |
-| 3 | Two-node text mesh vertical slice | In progress (QUIC auth and anti-entropy core landed) |
-| 4 | Keyboard-first egui switcher | In progress (native shell landed) |
-| 5 | Arbitrary MIME and safe file snapshots | Planned |
-| 6 | Chunked, cancellable, resumable large sharing | Planned |
-| 7 | Retention and convergence hardening | Planned |
-| 8 | Full control center and diagnostics | Planned |
-| 9 | NixOS daily-driver deployment | Planned |
+| 2 | Encrypted local text history | Complete |
+| 3 | Two-node text mesh vertical slice | Complete in implementation and automated tests; live `vd`/`kiwi` validation in progress |
+| 4 | Keyboard-first egui switcher | Complete; live Hyprland shell/singleton smoke passed |
+| 5 | Arbitrary MIME and safe file snapshots | Complete in implementation and integration tests |
+| 6 | Chunked, cancellable, resumable large sharing | Complete in implementation and integration tests |
+| 7 | Retention and convergence hardening | Complete |
+| 8 | Full control center and diagnostics | Complete |
+| 9 | NixOS daily-driver deployment | In progress |
 
 See [PLAN.md](PLAN.md) for the detailed architecture, threat model, milestones, test strategy, and acceptance criteria.
 
@@ -88,7 +95,7 @@ Please report vulnerabilities according to [SECURITY.md](SECURITY.md).
 
 ## Development
 
-The current foundation includes validated TOML configuration, NetBird and Wayland capability discovery, a versioned Protobuf Unix-socket IPC service, daemon status/doctor commands, a deterministic operation projection, gap-aware version frontiers, keyed exact-byte content IDs, SQLCipher and QUIC-authentication spikes, an optional egui shell, property tests, repeatable local checks, and a Nix flake. See [the Milestone 0 findings](docs/milestone-0.md) for validated behavior and honest limitations.
+The current implementation includes native Wayland capture/ownership, SQLCipher operation history, envelope rekeying, authenticated NetBird-only QUIC sessions, store-and-forward anti-entropy, encrypted resumable chunks, safe file snapshots/materialization, replicated retention and settings, full CLI/IPC parity, and optional egui switcher/control-center modes. See [the deployment guide](docs/deployment.md), [Milestone 0 findings](docs/milestone-0.md), and [PLAN.md](PLAN.md) for validation details and remaining live soak work.
 
 ```console
 nix develop
@@ -102,11 +109,14 @@ cargo run -- status --json
 All validation runs locally; the repository intentionally has no hosted CI/CD workflow.
 
 ```console
-./scripts/check          # format, daemon/UI builds, clippy, and tests
-./scripts/check --nix    # also build and validate the Nix package
+./scripts/check                     # format, daemon/UI builds, clippy, and tests
+./scripts/check --security          # also run RustSec and source-policy checks
+./scripts/check --nix --security    # also build and validate the Nix packages
+WAYLAND_DISPLAY=wayland-1 ./scripts/test-live-wayland
+./scripts/deploy-smoke kiwi          # disposable two-node NetBird test
 ```
 
-Nix development and packaging support will be added as the Rust foundation lands.
+The flake exports UI and daemon-only packages plus a hardened NixOS user-service module.
 
 ## Contributing
 

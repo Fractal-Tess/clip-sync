@@ -21,6 +21,10 @@ done
 
 cargo fmt --all --check
 cargo check --no-default-features
+if cargo tree --no-default-features | grep -Eq '(^| )((eframe|egui|winit|glutin) v)'; then
+  echo "daemon-only dependency graph unexpectedly contains UI/windowing crates" >&2
+  exit 1
+fi
 cargo check --all-targets --all-features
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-features
