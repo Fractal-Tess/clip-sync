@@ -135,7 +135,10 @@ EOF
 rm -f "$root/clip-sync-bundle"
 echo "building portable bundle..."
 nix bundle --bundler github:NixOS/bundlers#toArx .#daemon -o "$root/clip-sync-bundle"
-chmod +x "$root/clip-sync-bundle"
+test -x "$root/clip-sync-bundle" || {
+  echo "bundle is not executable: $root/clip-sync-bundle" >&2
+  exit 1
+}
 
 remote "rm -rf '$remote_root'; mkdir -p '$remote_root/config/clip-sync' '$remote_root/state' '$remote_root/runtime'; \
   ln -s '$remote_runtime/$remote_wayland' '$remote_root/runtime/$remote_wayland'"
