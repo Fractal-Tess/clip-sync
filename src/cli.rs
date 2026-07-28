@@ -48,9 +48,9 @@ enum Command {
     },
     /// Report live daemon, storage, clipboard, and discovery diagnostics.
     Doctor(OutputArgs),
-    /// Explicitly add the current clipboard even when it exceeds capture policy.
+    /// Request explicit capture; the current Wayland backend reports this as unsupported.
     ShareClipboard(OutputArgs),
-    /// Inspect or cancel resumable transfers.
+    /// Query transfer controls; daemon wiring is not available yet.
     Transfer {
         #[command(subcommand)]
         command: TransferCommand,
@@ -133,9 +133,9 @@ enum ConfigCommand {
 
 #[derive(Debug, Subcommand)]
 enum TransferCommand {
-    /// List active, queued, and interrupted transfers.
+    /// Request transfer state from the daemon.
     List(OutputArgs),
-    /// Cancel a transfer and its partial data.
+    /// Request cancellation of a transfer.
     Cancel {
         transfer_id: String,
         #[arg(long)]
@@ -145,7 +145,7 @@ enum TransferCommand {
 
 #[derive(Debug, Subcommand)]
 enum DeviceCommand {
-    /// Replicate rejection of a previously trusted device identity.
+    /// Request rejection of a device identity; the current replica backend is unsupported.
     Forget {
         device_id: String,
         #[arg(long)]
@@ -173,6 +173,9 @@ struct SafeConfig {
 struct SafeLocal {
     listen_port: u16,
     discovery_interval_seconds: u64,
+    reconcile_interval_seconds: u64,
+    reconnect_min_seconds: u64,
+    reconnect_max_seconds: u64,
     netbird_command: String,
     mesh_key_file_configured: bool,
     config_path: String,
@@ -244,7 +247,7 @@ async fn status(paths: &AppPaths, output: OutputArgs) -> anyhow::Result<()> {
             Ok(())
         }
         Some(response::Body::Error(error)) => Err(daemon_response_error(&error, output.json)),
-        _ => bail!("daemon returned an unexpected response to status"),
+        _ => Err(unexpected_response(output.json, "status")),
     }
 }
 
@@ -297,7 +300,7 @@ async fn peers(paths: &AppPaths, output: OutputArgs) -> anyhow::Result<()> {
             Ok(())
         }
         Some(response::Body::Error(error)) => Err(daemon_response_error(&error, output.json)),
-        _ => bail!("daemon returned an unexpected response to peers"),
+        _ => Err(unexpected_response(output.json, "peers")),
     }
 }
 
@@ -375,7 +378,7 @@ async fn history_query(
             Ok(())
         }
         Some(response::Body::Error(error)) => Err(daemon_response_error(&error, json)),
-        _ => bail!("daemon returned an unexpected response to history query"),
+        _ => Err(unexpected_response(json, "history query")),
     }
 }
 
@@ -421,7 +424,7 @@ async fn config_command(paths: &AppPaths, command: ConfigCommand) -> anyhow::Res
                 Some(response::Body::Error(error)) => {
                     Err(daemon_response_error(&error, output.json))
                 }
-                _ => bail!("daemon returned an unexpected response to config show"),
+                _ => Err(unexpected_response(output.json, "config show")),
             }
         }
         ConfigCommand::Init { force } => {
@@ -479,7 +482,7 @@ async fn doctor(paths: &AppPaths, output: OutputArgs) -> anyhow::Result<()> {
             }
         }
         Some(response::Body::Error(error)) => Err(daemon_response_error(&error, output.json)),
-        _ => bail!("daemon returned an unexpected response to diagnostics"),
+        _ => Err(unexpected_response(output.json, "diagnostics")),
     }
 }
 
@@ -541,7 +544,7 @@ async fn transfer_command(paths: &AppPaths, command: TransferCommand) -> anyhow:
                 Some(response::Body::Error(error)) => {
                     Err(daemon_response_error(&error, output.json))
                 }
-                _ => bail!("daemon returned an unexpected response to transfers"),
+                _ => Err(unexpected_response(output.json, "transfers")),
             }
         }
         TransferCommand::Cancel { transfer_id, json } => {
@@ -595,13 +598,7 @@ async fn daemon_request(
                 paths.socket.display()
             );
             if json {
-                print_json(&serde_json::json!({
-                    "ok": false,
-                    "error": {
-                        "code": "daemon_unavailable",
-                        "message": message,
-                    }
-                }))?;
+                print_json(&error_json("daemon_unavailable", &message))?;
             }
             Err(anyhow::Error::new(error).context(message))
         }
@@ -628,26 +625,46 @@ fn mutation_response(
             }
             Ok(())
         }
-        Some(response::Body::Mutation(_)) => bail!("daemon reported an unsuccessful mutation"),
+        Some(response::Body::Mutation(_)) => Err(operation_error(
+            json,
+            "mutation_failed",
+            "daemon reported an unsuccessful mutation",
+        )),
         Some(response::Body::Error(error)) => Err(daemon_response_error(&error, json)),
-        _ => bail!("daemon returned an unexpected mutation response"),
+        _ => Err(unexpected_response(json, "mutation")),
     }
 }
 
 fn daemon_response_error(error: &crate::ipc::protocol::ErrorResponse, json: bool) -> anyhow::Error {
+    operation_error(json, &error.code, &error.message)
+}
+
+fn unexpected_response(json: bool, operation: &str) -> anyhow::Error {
+    operation_error(
+        json,
+        "protocol_error",
+        &format!("daemon returned an unexpected response to {operation}"),
+    )
+}
+
+fn operation_error(json: bool, code: &str, message: &str) -> anyhow::Error {
     if json {
-        let value = serde_json::json!({
-            "ok": false,
-            "error": {
-                "code": error.code,
-                "message": error.message,
-            }
-        });
+        let value = error_json(code, message);
         if let Err(serialization_error) = print_json(&value) {
             return serialization_error;
         }
     }
-    anyhow::anyhow!("{}: {}", error.code, error.message)
+    anyhow::anyhow!("{code}: {message}")
+}
+
+fn error_json(code: &str, message: &str) -> serde_json::Value {
+    serde_json::json!({
+        "ok": false,
+        "error": {
+            "code": code,
+            "message": message,
+        }
+    })
 }
 
 fn print_json(value: &impl Serialize) -> anyhow::Result<()> {
@@ -671,5 +688,44 @@ mod tests {
         ] {
             Cli::try_parse_from(arguments).expect("command should parse");
         }
+    }
+
+    #[test]
+    fn json_error_shape_is_stable() {
+        assert_eq!(
+            error_json("daemon_unavailable", "not running"),
+            serde_json::json!({
+                "ok": false,
+                "error": {
+                    "code": "daemon_unavailable",
+                    "message": "not running",
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn status_json_fields_are_stable() {
+        let address = Some("100.64.0.1".to_owned());
+        let output = StatusOutput {
+            version: "0.1.0",
+            hostname: "kiwi",
+            uptime_seconds: 42,
+            config_path: "/config.toml",
+            netbird_address: &address,
+            discovered_peers: 2,
+        };
+
+        assert_eq!(
+            serde_json::to_value(output).expect("serialize status"),
+            serde_json::json!({
+                "version": "0.1.0",
+                "hostname": "kiwi",
+                "uptime_seconds": 42,
+                "config_path": "/config.toml",
+                "netbird_address": "100.64.0.1",
+                "discovered_peers": 2,
+            })
+        );
     }
 }

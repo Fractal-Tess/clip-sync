@@ -1,12 +1,21 @@
 use std::{
+    fs::{File, OpenOptions},
+    os::unix::net::{UnixListener as StdUnixListener, UnixStream as StdUnixStream},
     path::{Path, PathBuf},
-    sync::mpsc as std_mpsc,
-    time::Duration,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc as std_mpsc,
+    },
+    thread::JoinHandle,
+    time::{Duration, Instant},
 };
 
 use eframe::egui::{
     self, Color32, CornerRadius, FontId, Frame, Key, Margin, RichText, ScrollArea, Stroke, Vec2,
 };
+use fs2::FileExt;
+use tokio_util::sync::CancellationToken;
 
 use crate::{
     config::AppPaths,
@@ -16,9 +25,7 @@ use crate::{
             ActivateRequest, ConfigRequest, ConfigResponse, DiagnosticCheck, DiagnosticsRequest,
             DiagnosticsResponse, HistoryItem, HistoryRequest, HistoryResponse, HistoryUpdateAction,
             HistoryUpdateRequest, IPC_PROTOCOL_VERSION, MutationResponse, PeerItem, PeersRequest,
-            PeersResponse, Request, Response, ShareClipboardRequest, StatusRequest, StatusResponse,
-            TransferCancelRequest, TransferItem, TransfersRequest, TransfersResponse, request,
-            response,
+            PeersResponse, Request, Response, StatusRequest, StatusResponse, request, response,
         },
     },
 };
@@ -30,6 +37,7 @@ const CYAN: Color32 = Color32::from_rgb(35, 200, 226);
 const MUTED: Color32 = Color32::from_rgb(137, 154, 160);
 const ERROR: Color32 = Color32::from_rgb(242, 119, 119);
 const SUCCESS: Color32 = Color32::from_rgb(105, 219, 160);
+const SEARCH_DEBOUNCE: Duration = Duration::from_millis(120);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UiMode {
@@ -43,6 +51,9 @@ pub enum UiMode {
 ///
 /// Returns an error when the native event loop or graphics context cannot start.
 pub fn run(mode: UiMode, paths: AppPaths) -> Result<(), String> {
+    let Some(instance) = UiInstance::acquire(&paths.runtime_dir, mode)? else {
+        return Ok(());
+    };
     let (title, app_id, size, decorations) = match mode {
         UiMode::Switcher => (
             "clip-sync switcher",
@@ -72,11 +83,9 @@ pub fn run(mode: UiMode, paths: AppPaths) -> Result<(), String> {
         options,
         Box::new(move |context| {
             configure_style(&context.egui_ctx);
-            Ok(Box::new(ClipSyncApp::new(
-                mode,
-                paths,
-                context.egui_ctx.clone(),
-            )))
+            let app = ClipSyncApp::new(mode, paths, context.egui_ctx.clone(), instance)
+                .map_err(std::io::Error::other)?;
+            Ok(Box::new(app))
         }),
     )
     .map_err(|error| error.to_string())
@@ -110,45 +119,226 @@ enum SwitcherState {
     Close,
 }
 
+struct UiInstance {
+    _lock: File,
+    focus_socket: PathBuf,
+    listener: Option<StdUnixListener>,
+    shutdown: Arc<AtomicBool>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl UiInstance {
+    fn acquire(runtime_dir: &Path, mode: UiMode) -> Result<Option<Self>, String> {
+        std::fs::create_dir_all(runtime_dir).map_err(|error| {
+            format!(
+                "could not create UI runtime directory {}: {error}",
+                runtime_dir.display()
+            )
+        })?;
+        set_private_mode(runtime_dir, 0o700)?;
+
+        let name = match mode {
+            UiMode::Switcher => "switcher",
+            UiMode::Control => "control",
+        };
+        let lock_path = runtime_dir.join(format!("{name}.lock"));
+        let focus_socket = runtime_dir.join(format!("{name}.sock"));
+        let lock = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+            .map_err(|error| format!("could not open {}: {error}", lock_path.display()))?;
+        set_private_mode(&lock_path, 0o600)?;
+
+        match lock.try_lock_exclusive() {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                request_existing_focus(&focus_socket)?;
+                return Ok(None);
+            }
+            Err(error) => {
+                return Err(format!(
+                    "could not lock UI instance file {}: {error}",
+                    lock_path.display()
+                ));
+            }
+        }
+
+        remove_stale_ui_socket(&focus_socket)?;
+        let listener = StdUnixListener::bind(&focus_socket).map_err(|error| {
+            format!(
+                "could not bind UI focus socket {}: {error}",
+                focus_socket.display()
+            )
+        })?;
+        set_private_mode(&focus_socket, 0o600)?;
+        Ok(Some(Self {
+            _lock: lock,
+            focus_socket,
+            listener: Some(listener),
+            shutdown: Arc::new(AtomicBool::new(false)),
+            thread: None,
+        }))
+    }
+
+    fn start_focus_listener(&mut self, context: egui::Context) -> Result<(), String> {
+        let Some(listener) = self.listener.take() else {
+            return Ok(());
+        };
+        let shutdown = Arc::clone(&self.shutdown);
+        let thread = std::thread::Builder::new()
+            .name("clip-sync-ui-focus".to_owned())
+            .spawn(move || {
+                for stream in listener.incoming() {
+                    match stream {
+                        Ok(_) if shutdown.load(Ordering::Acquire) => break,
+                        Ok(_) => {
+                            context.send_viewport_cmd(egui::ViewportCommand::Focus);
+                            context.request_repaint();
+                        }
+                        Err(error) => {
+                            tracing::debug!(%error, "UI focus listener stopped");
+                            break;
+                        }
+                    }
+                }
+            })
+            .map_err(|error| format!("could not start UI focus listener: {error}"))?;
+        self.thread = Some(thread);
+        Ok(())
+    }
+}
+
+impl Drop for UiInstance {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::Release);
+        let _ = StdUnixStream::connect(&self.focus_socket);
+        if let Some(thread) = self.thread.take()
+            && thread.join().is_err()
+        {
+            tracing::debug!("UI focus listener panicked during shutdown");
+        }
+        match std::fs::remove_file(&self.focus_socket) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => tracing::debug!(%error, "could not remove UI focus socket"),
+        }
+    }
+}
+
+fn request_existing_focus(socket: &Path) -> Result<(), String> {
+    let mut last_error = None;
+    for _ in 0..10 {
+        match StdUnixStream::connect(socket) {
+            Ok(_stream) => return Ok(()),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+                ) =>
+            {
+                last_error = Some(error);
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(error) => {
+                last_error = Some(error);
+                break;
+            }
+        }
+    }
+    Err(format!(
+        "another clip-sync UI is running, but its focus socket {} is unavailable: {}",
+        socket.display(),
+        last_error.expect("at least one focus connection was attempted")
+    ))
+}
+
+fn remove_stale_ui_socket(socket: &Path) -> Result<(), String> {
+    match std::fs::symlink_metadata(socket) {
+        Ok(metadata) => {
+            use std::os::unix::fs::FileTypeExt;
+
+            if !metadata.file_type().is_socket() {
+                return Err(format!(
+                    "refusing to replace non-socket UI focus path {}",
+                    socket.display()
+                ));
+            }
+            std::fs::remove_file(socket).map_err(|error| {
+                format!(
+                    "could not remove stale UI focus socket {}: {error}",
+                    socket.display()
+                )
+            })
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "could not inspect UI focus socket {}: {error}",
+            socket.display()
+        )),
+    }
+}
+
+#[cfg(unix)]
+fn set_private_mode(path: &Path, mode: u32) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+        .map_err(|error| format!("could not secure {}: {error}", path.display()))
+}
+
 struct ClipSyncApp {
     mode: UiMode,
     paths: AppPaths,
-    command_tx: std_mpsc::Sender<UiCommand>,
+    context: egui::Context,
+    _instance: UiInstance,
+    ipc_worker: IpcWorker,
     event_rx: std_mpsc::Receiver<UiEvent>,
     search: String,
     selected_history: usize,
+    scroll_selected_history: bool,
     selected_tab: ControlTab,
     switcher_state: SwitcherState,
     history_generation: u64,
     history_loading: bool,
+    pending_history_refresh: Option<Instant>,
     history: Vec<HistoryItem>,
     status: Option<StatusResponse>,
     peers: Option<PeersResponse>,
     config: Option<serde_json::Value>,
     diagnostics: Vec<DiagnosticCheck>,
-    transfers: Vec<TransferItem>,
     daemon_error: Option<String>,
+    history_error: Option<String>,
     peers_error: Option<String>,
     config_error: Option<String>,
     diagnostics_error: Option<String>,
-    transfers_error: Option<String>,
     notice: Option<Notice>,
     mutation_pending: bool,
 }
 
 impl ClipSyncApp {
-    fn new(mode: UiMode, paths: AppPaths, context: egui::Context) -> Self {
-        let (command_tx, command_rx) = std_mpsc::channel();
+    fn new(
+        mode: UiMode,
+        paths: AppPaths,
+        context: egui::Context,
+        mut instance: UiInstance,
+    ) -> Result<Self, String> {
         let (event_tx, event_rx) = std_mpsc::channel();
-        spawn_ipc_worker(paths.socket.clone(), command_rx, event_tx, context);
+        instance.start_focus_listener(context.clone())?;
+        let ipc_worker = spawn_ipc_worker(paths.socket.clone(), event_tx, context.clone());
 
         let mut app = Self {
             mode,
             paths,
-            command_tx,
+            context,
+            _instance: instance,
+            ipc_worker,
             event_rx,
             search: String::new(),
             selected_history: 0,
+            scroll_selected_history: false,
             selected_tab: ControlTab::History,
             switcher_state: if mode == UiMode::Switcher {
                 SwitcherState::NeedsFocus
@@ -157,17 +347,17 @@ impl ClipSyncApp {
             },
             history_generation: 1,
             history_loading: true,
+            pending_history_refresh: None,
             history: Vec::new(),
             status: None,
             peers: None,
             config: None,
             diagnostics: Vec::new(),
-            transfers: Vec::new(),
             daemon_error: None,
+            history_error: None,
             peers_error: None,
             config_error: None,
             diagnostics_error: None,
-            transfers_error: None,
             notice: None,
             mutation_pending: false,
         };
@@ -176,11 +366,11 @@ impl ClipSyncApp {
         if mode == UiMode::Control {
             app.refresh_control_data();
         }
-        app
+        Ok(app)
     }
 
     fn send(&mut self, command: UiCommand) {
-        if self.command_tx.send(command).is_err() {
+        if self.ipc_worker.send(command).is_err() {
             self.daemon_error = Some("the local IPC worker stopped unexpectedly".to_owned());
         }
     }
@@ -191,7 +381,32 @@ impl ClipSyncApp {
 
     fn refresh_history(&mut self) {
         self.history_loading = true;
+        self.history_error = None;
+        self.pending_history_refresh = None;
         self.history_generation = self.history_generation.saturating_add(1);
+        self.send(UiCommand::History {
+            query: self.search.clone(),
+            generation: self.history_generation,
+        });
+    }
+
+    fn schedule_history_refresh(&mut self) {
+        self.history_loading = true;
+        self.history_error = None;
+        self.history.clear();
+        self.history_generation = self.history_generation.saturating_add(1);
+        self.pending_history_refresh = Some(Instant::now() + SEARCH_DEBOUNCE);
+        self.context.request_repaint_after(SEARCH_DEBOUNCE);
+    }
+
+    fn dispatch_pending_history_refresh(&mut self) {
+        let Some(deadline) = self.pending_history_refresh else {
+            return;
+        };
+        if Instant::now() < deadline {
+            return;
+        }
+        self.pending_history_refresh = None;
         self.send(UiCommand::History {
             query: self.search.clone(),
             generation: self.history_generation,
@@ -202,7 +417,6 @@ impl ClipSyncApp {
         self.send(UiCommand::Peers);
         self.send(UiCommand::Config);
         self.send(UiCommand::Diagnostics);
-        self.send(UiCommand::Transfers);
     }
 
     fn poll_events(&mut self) {
@@ -213,7 +427,10 @@ impl ClipSyncApp {
                         self.status = Some(status);
                         self.daemon_error = None;
                     }
-                    Err(error) => self.daemon_error = Some(error),
+                    Err(error) => {
+                        self.status = None;
+                        self.daemon_error = Some(error);
+                    }
                 },
                 UiEvent::History { generation, result } => {
                     if generation != self.history_generation {
@@ -226,9 +443,13 @@ impl ClipSyncApp {
                             self.selected_history = self
                                 .selected_history
                                 .min(self.history.len().saturating_sub(1));
-                            self.daemon_error = None;
+                            self.history_error = None;
                         }
-                        Err(error) => self.daemon_error = Some(error),
+                        Err(error) => {
+                            self.history.clear();
+                            self.history_error = Some(error);
+                            self.refresh_status();
+                        }
                     }
                 }
                 UiEvent::Peers(result) => match result {
@@ -257,13 +478,6 @@ impl ClipSyncApp {
                     }
                     Err(error) => self.diagnostics_error = Some(error),
                 },
-                UiEvent::Transfers(result) => match result {
-                    Ok(transfers) => {
-                        self.transfers = transfers.transfers;
-                        self.transfers_error = None;
-                    }
-                    Err(error) => self.transfers_error = Some(error),
-                },
                 UiEvent::Mutation { kind, result } => {
                     self.mutation_pending = false;
                     match result {
@@ -288,7 +502,12 @@ impl ClipSyncApp {
     }
 
     fn retry_connection(&mut self) {
+        self.status = None;
         self.daemon_error = None;
+        self.history_error = None;
+        self.peers_error = None;
+        self.config_error = None;
+        self.diagnostics_error = None;
         self.send(UiCommand::RetryStatus);
         self.refresh_history();
         if self.mode == UiMode::Control {
@@ -297,7 +516,8 @@ impl ClipSyncApp {
     }
 
     fn switcher(&mut self, ui: &mut egui::Ui) {
-        if ui.input(|input| input.key_pressed(Key::Escape)) {
+        let pressed_key = ui.input(switcher_key);
+        if pressed_key == SwitcherKey::Escape {
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
             return;
         }
@@ -325,32 +545,38 @@ impl ClipSyncApp {
                 }
                 if search.changed() {
                     self.selected_history = 0;
-                    self.refresh_history();
+                    self.schedule_history_refresh();
                 }
 
-                if ui.input(|input| input.key_pressed(Key::ArrowDown)) {
-                    self.selected_history =
-                        move_selection(self.selected_history, self.history.len(), 1);
-                }
-                if ui.input(|input| input.key_pressed(Key::ArrowUp)) {
-                    self.selected_history =
-                        move_selection(self.selected_history, self.history.len(), -1);
-                }
-                if ui.input(|input| input.key_pressed(Key::Enter))
-                    && !self.mutation_pending
-                    && let Some(item) = self.history.get(self.selected_history)
-                {
-                    self.mutation_pending = true;
-                    self.send(UiCommand::Activate {
-                        content_id: item.content_id.clone(),
-                        kind: MutationKind::ActivateSwitcher,
-                    });
+                match apply_switcher_key(
+                    pressed_key,
+                    &mut self.selected_history,
+                    self.history.len(),
+                    self.history_loading || self.mutation_pending,
+                ) {
+                    SwitcherIntent::None => {}
+                    SwitcherIntent::Moved => self.scroll_selected_history = true,
+                    SwitcherIntent::Close => {
+                        ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                        return;
+                    }
+                    SwitcherIntent::Activate => {
+                        let content_id = self.history[self.selected_history].content_id.clone();
+                        self.mutation_pending = true;
+                        self.notice = None;
+                        self.send(UiCommand::Activate {
+                            content_id,
+                            kind: MutationKind::ActivateSwitcher,
+                        });
+                    }
                 }
 
                 ui.add_space(6.0);
                 if let Some(error) = self.daemon_error.clone() {
                     let socket = self.paths.socket.clone();
                     unavailable_panel(ui, &socket, &error, || self.retry_connection());
+                } else if let Some(error) = &self.history_error {
+                    message_panel(ui, error, ERROR);
                 } else if self.history_loading && self.history.is_empty() {
                     message_panel(ui, "Loading history…", MUTED);
                 } else if self.history.is_empty() {
@@ -387,13 +613,15 @@ impl ClipSyncApp {
                             .size(11.0),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let (color, text) = if let Some(status) = &self.status {
+                        let (color, text) = if self.daemon_error.is_some() {
+                            (ERROR, "daemon unavailable".to_owned())
+                        } else if let Some(status) = &self.status {
                             (
                                 SUCCESS,
                                 format!("{} · {} peers", status.hostname, status.discovered_peers),
                             )
                         } else {
-                            (ERROR, "daemon unavailable".to_owned())
+                            (MUTED, "connecting to daemon…".to_owned())
                         };
                         ui.label(RichText::new(text).color(MUTED).size(12.0));
                         ui.colored_label(color, "●");
@@ -426,10 +654,15 @@ impl ClipSyncApp {
 
                 match self.selected_tab {
                     ControlTab::History => self.history_tab(ui),
-                    ControlTab::Peers => self.peers_tab(ui),
-                    ControlTab::Settings => self.settings_tab(ui),
-                    ControlTab::Diagnostics => self.diagnostics_tab(ui),
-                    ControlTab::Transfers => self.transfers_tab(ui),
+                    ControlTab::Peers => {
+                        ScrollArea::vertical().show(ui, |ui| self.peers_tab(ui));
+                    }
+                    ControlTab::Settings => {
+                        ScrollArea::vertical().show(ui, |ui| self.settings_tab(ui));
+                    }
+                    ControlTab::Diagnostics => {
+                        ScrollArea::vertical().show(ui, |ui| self.diagnostics_tab(ui));
+                    }
                 }
             });
     }
@@ -442,25 +675,27 @@ impl ClipSyncApp {
             );
             if search.changed() {
                 self.selected_history = 0;
-                self.refresh_history();
+                self.schedule_history_refresh();
             }
-            if ui
-                .add_enabled(!self.mutation_pending, egui::Button::new("Share clipboard"))
-                .clicked()
-            {
-                self.mutation_pending = true;
-                self.send(UiCommand::ShareClipboard);
-            }
+            ui.add_enabled(
+                false,
+                egui::Button::new("Share current clipboard unavailable"),
+            )
+            .on_disabled_hover_text(
+                "The Wayland backend cannot inspect the current offer on demand yet.",
+            );
         });
         ui.label(
             RichText::new(
-                "Remote items remain history-only until you activate them. Pins and deletes replicate.",
+                "Items with locally available payloads can be activated. Pins and deletes replicate.",
             )
             .color(MUTED)
             .size(12.0),
         );
         ui.add_space(6.0);
-        if self.history.is_empty() {
+        if let Some(error) = &self.history_error {
+            message_panel(ui, error, ERROR);
+        } else if self.history.is_empty() {
             message_panel(
                 ui,
                 if self.history_loading {
@@ -486,7 +721,7 @@ impl ClipSyncApp {
             .show(ui, |ui| {
                 for (index, item) in self.history.iter().enumerate() {
                     let selected = index == self.selected_history;
-                    Frame::new()
+                    let row = Frame::new()
                         .fill(if selected {
                             Color32::from_rgb(24, 48, 54)
                         } else {
@@ -559,8 +794,12 @@ impl ClipSyncApp {
                                 action = Some(HistoryAction::Activate(item.content_id.clone()));
                             }
                         });
+                    if selected && self.scroll_selected_history {
+                        row.response.scroll_to_me(Some(egui::Align::Center));
+                    }
                 }
             });
+        self.scroll_selected_history = false;
 
         if self.mutation_pending {
             return;
@@ -568,6 +807,7 @@ impl ClipSyncApp {
         match action {
             Some(HistoryAction::Activate(content_id)) => {
                 self.mutation_pending = true;
+                self.notice = None;
                 self.send(UiCommand::Activate {
                     content_id,
                     kind: if self.mode == UiMode::Switcher {
@@ -579,6 +819,7 @@ impl ClipSyncApp {
             }
             Some(HistoryAction::Pin { content_id, pinned }) => {
                 self.mutation_pending = true;
+                self.notice = None;
                 self.send(UiCommand::HistoryUpdate {
                     content_id,
                     action: if pinned {
@@ -591,6 +832,7 @@ impl ClipSyncApp {
             }
             Some(HistoryAction::Delete(content_id)) => {
                 self.mutation_pending = true;
+                self.notice = None;
                 self.send(UiCommand::HistoryUpdate {
                     content_id,
                     action: HistoryUpdateAction::Delete,
@@ -653,8 +895,10 @@ impl ClipSyncApp {
         };
         ui.heading("Effective settings");
         ui.label(
-            RichText::new("Secret paths are redacted. Edit the TOML file and restart the daemon.")
-                .color(MUTED),
+            RichText::new(
+                "The secret path is redacted. Edit the TOML file and restart the daemon.",
+            )
+            .color(MUTED),
         );
         ui.add_space(8.0);
         setting_row(
@@ -677,15 +921,40 @@ impl ClipSyncApp {
         setting_row(
             ui,
             "Discovery interval",
-            format!(
-                "{} seconds",
-                config_pointer(config, "/local/discovery_interval_seconds")
-            ),
+            config_seconds(config, "/local/discovery_interval_seconds"),
+        );
+        setting_row(
+            ui,
+            "Reconciliation interval",
+            config_seconds(config, "/local/reconcile_interval_seconds"),
+        );
+        setting_row(
+            ui,
+            "Reconnect delay",
+            match (
+                config_pointer_u64(config, "/local/reconnect_min_seconds"),
+                config_pointer_u64(config, "/local/reconnect_max_seconds"),
+            ) {
+                (Some(minimum), Some(maximum)) => format!("{minimum}–{maximum} seconds"),
+                _ => "unavailable".to_owned(),
+            },
         );
         setting_row(
             ui,
             "NetBird command",
             config_pointer(config, "/local/netbird_command"),
+        );
+        setting_row(
+            ui,
+            "Mesh key file",
+            match config
+                .pointer("/local/mesh_key_file_configured")
+                .and_then(serde_json::Value::as_bool)
+            {
+                Some(true) => "configured (path redacted)".to_owned(),
+                Some(false) => "not configured".to_owned(),
+                None => "unavailable".to_owned(),
+            },
         );
         setting_row(ui, "Config", config_pointer(config, "/local/config_path"));
     }
@@ -720,54 +989,12 @@ impl ClipSyncApp {
                 });
         }
     }
-
-    fn transfers_tab(&mut self, ui: &mut egui::Ui) {
-        if let Some(error) = &self.transfers_error {
-            message_panel(ui, error, ERROR);
-            return;
-        }
-        if self.transfers.is_empty() {
-            message_panel(ui, "No active or interrupted transfers", MUTED);
-            return;
-        }
-        let mut cancel = None;
-        for transfer in &self.transfers {
-            Frame::new()
-                .fill(SURFACE)
-                .stroke(Stroke::new(1.0, BORDER))
-                .corner_radius(CornerRadius::same(7))
-                .inner_margin(Margin::same(12))
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.vertical(|ui| {
-                            ui.strong(format!("{} · {}", transfer.state, transfer.peer));
-                            ui.label(
-                                RichText::new(format!(
-                                    "{} / {}",
-                                    format_bytes(transfer.completed_bytes),
-                                    format_bytes(transfer.total_bytes)
-                                ))
-                                .color(MUTED),
-                            );
-                        });
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.button("Cancel").clicked() {
-                                cancel = Some(transfer.transfer_id.clone());
-                            }
-                        });
-                    });
-                });
-        }
-        if let Some(transfer_id) = cancel {
-            self.mutation_pending = true;
-            self.send(UiCommand::TransferCancel { transfer_id });
-        }
-    }
 }
 
 impl eframe::App for ClipSyncApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.poll_events();
+        self.dispatch_pending_history_refresh();
         match self.mode {
             UiMode::Switcher => self.switcher(ui),
             UiMode::Control => self.control(ui),
@@ -781,16 +1008,14 @@ enum ControlTab {
     Peers,
     Settings,
     Diagnostics,
-    Transfers,
 }
 
 impl ControlTab {
-    const ALL: [Self; 5] = [
+    const ALL: [Self; 4] = [
         Self::History,
         Self::Peers,
         Self::Settings,
         Self::Diagnostics,
-        Self::Transfers,
     ];
 
     const fn label(self) -> &'static str {
@@ -799,7 +1024,6 @@ impl ControlTab {
             Self::Peers => "Peers",
             Self::Settings => "Settings",
             Self::Diagnostics => "Diagnostics",
-            Self::Transfers => "Transfers",
         }
     }
 }
@@ -816,16 +1040,11 @@ enum MutationKind {
     ActivateSwitcher,
     Pin,
     Delete,
-    Share,
-    TransferCancel,
 }
 
 impl MutationKind {
     const fn refreshes_history(self) -> bool {
-        matches!(
-            self,
-            Self::Activate | Self::Pin | Self::Delete | Self::Share
-        )
+        matches!(self, Self::Activate | Self::Pin | Self::Delete)
     }
 }
 
@@ -839,7 +1058,6 @@ enum UiCommand {
     Peers,
     Config,
     Diagnostics,
-    Transfers,
     Activate {
         content_id: String,
         kind: MutationKind,
@@ -848,10 +1066,6 @@ enum UiCommand {
         content_id: String,
         action: HistoryUpdateAction,
         kind: MutationKind,
-    },
-    ShareClipboard,
-    TransferCancel {
-        transfer_id: String,
     },
 }
 
@@ -864,20 +1078,48 @@ enum UiEvent {
     Peers(Result<PeersResponse, String>),
     Config(Result<ConfigResponse, String>),
     Diagnostics(Result<DiagnosticsResponse, String>),
-    Transfers(Result<TransfersResponse, String>),
     Mutation {
         kind: MutationKind,
         result: Result<MutationResponse, String>,
     },
 }
 
+struct IpcWorker {
+    command_tx: Option<std_mpsc::Sender<UiCommand>>,
+    shutdown: CancellationToken,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl IpcWorker {
+    fn send(&self, command: UiCommand) -> Result<(), std_mpsc::SendError<UiCommand>> {
+        self.command_tx
+            .as_ref()
+            .expect("IPC sender exists until worker drop")
+            .send(command)
+    }
+}
+
+impl Drop for IpcWorker {
+    fn drop(&mut self) {
+        self.shutdown.cancel();
+        self.command_tx.take();
+        if let Some(thread) = self.thread.take()
+            && thread.join().is_err()
+        {
+            tracing::debug!("local UI IPC worker panicked during shutdown");
+        }
+    }
+}
+
 fn spawn_ipc_worker(
     socket: PathBuf,
-    command_rx: std_mpsc::Receiver<UiCommand>,
     event_tx: std_mpsc::Sender<UiEvent>,
     context: egui::Context,
-) {
-    std::thread::Builder::new()
+) -> IpcWorker {
+    let (command_tx, command_rx) = std_mpsc::channel();
+    let shutdown = CancellationToken::new();
+    let worker_shutdown = shutdown.clone();
+    let thread = std::thread::Builder::new()
         .name("clip-sync-ui-ipc".to_owned())
         .spawn(move || {
             let runtime = match tokio::runtime::Builder::new_current_thread()
@@ -901,15 +1143,24 @@ fn spawn_ipc_worker(
                     start_attempted = false;
                 }
                 let (body, target) = command.request_body();
-                let response = runtime.block_on(request_with_daemon_start(
-                    &socket,
-                    Request {
-                        protocol_version: IPC_PROTOCOL_VERSION,
-                        request_id,
-                        body: Some(body),
-                    },
-                    &mut start_attempted,
-                ));
+                let response = runtime.block_on(async {
+                    tokio::select! {
+                        biased;
+                        () = worker_shutdown.cancelled() => None,
+                        response = request_with_daemon_start(
+                            &socket,
+                            Request {
+                                protocol_version: IPC_PROTOCOL_VERSION,
+                                request_id,
+                                body: Some(body),
+                            },
+                            &mut start_attempted,
+                        ) => Some(response),
+                    }
+                });
+                let Some(response) = response else {
+                    break;
+                };
                 let event = target.into_event(response);
                 if event_tx.send(event).is_err() {
                     break;
@@ -918,6 +1169,11 @@ fn spawn_ipc_worker(
             }
         })
         .ok();
+    IpcWorker {
+        command_tx: Some(command_tx),
+        shutdown,
+        thread,
+    }
 }
 
 impl UiCommand {
@@ -936,10 +1192,6 @@ impl UiCommand {
                 request::Body::Diagnostics(DiagnosticsRequest {}),
                 EventTarget::Diagnostics,
             ),
-            Self::Transfers => (
-                request::Body::Transfers(TransfersRequest {}),
-                EventTarget::Transfers,
-            ),
             Self::Activate { content_id, kind } => (
                 request::Body::Activate(ActivateRequest { content_id }),
                 EventTarget::Mutation(kind),
@@ -955,14 +1207,6 @@ impl UiCommand {
                 }),
                 EventTarget::Mutation(kind),
             ),
-            Self::ShareClipboard => (
-                request::Body::ShareClipboard(ShareClipboardRequest {}),
-                EventTarget::Mutation(MutationKind::Share),
-            ),
-            Self::TransferCancel { transfer_id } => (
-                request::Body::TransferCancel(TransferCancelRequest { transfer_id }),
-                EventTarget::Mutation(MutationKind::TransferCancel),
-            ),
         }
     }
 }
@@ -973,7 +1217,6 @@ enum EventTarget {
     Peers,
     Config,
     Diagnostics,
-    Transfers,
     Mutation(MutationKind),
 }
 
@@ -988,7 +1231,6 @@ impl EventTarget {
             Self::Peers => UiEvent::Peers(expect_peers(result)),
             Self::Config => UiEvent::Config(expect_config(result)),
             Self::Diagnostics => UiEvent::Diagnostics(expect_diagnostics(result)),
-            Self::Transfers => UiEvent::Transfers(expect_transfers(result)),
             Self::Mutation(kind) => UiEvent::Mutation {
                 kind,
                 result: expect_mutation(result),
@@ -1003,7 +1245,10 @@ async fn request_with_daemon_start(
     start_attempted: &mut bool,
 ) -> Result<Response, String> {
     match ipc::request(socket, request.clone()).await {
-        Ok(response) => return Ok(response),
+        Ok(response) => {
+            *start_attempted = false;
+            return Ok(response);
+        }
         Err(error) if !is_daemon_absent(&error) => return Err(error.to_string()),
         Err(_) if *start_attempted => {}
         Err(_) => {
@@ -1012,7 +1257,10 @@ async fn request_with_daemon_start(
             for _ in 0..20 {
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 match ipc::request(socket, request.clone()).await {
-                    Ok(response) => return Ok(response),
+                    Ok(response) => {
+                        *start_attempted = false;
+                        return Ok(response);
+                    }
                     Err(error) if is_daemon_absent(&error) => {}
                     Err(error) => return Err(error.to_string()),
                 }
@@ -1044,6 +1292,7 @@ fn is_daemon_absent(error: &ipc::IpcError) -> bool {
 async fn start_user_service() -> String {
     let mut command = tokio::process::Command::new("systemctl");
     command.args(["--user", "start", "clip-sync.service"]);
+    command.kill_on_drop(true);
     match tokio::time::timeout(Duration::from_secs(3), command.output()).await {
         Ok(Ok(output)) if output.status.success() => {
             "requested systemd user service start".to_owned()
@@ -1105,13 +1354,6 @@ fn expect_diagnostics(result: Result<Response, String>) -> Result<DiagnosticsRes
     }
 }
 
-fn expect_transfers(result: Result<Response, String>) -> Result<TransfersResponse, String> {
-    match response_error(result?)? {
-        response::Body::Transfers(value) => Ok(value),
-        _ => Err("daemon returned an unexpected transfers response".to_owned()),
-    }
-}
-
 fn expect_mutation(result: Result<Response, String>) -> Result<MutationResponse, String> {
     match response_error(result?)? {
         response::Body::Mutation(value) => Ok(value),
@@ -1149,7 +1391,7 @@ fn unavailable_panel(ui: &mut egui::Ui, socket: &Path, error: &str, retry: impl 
             );
             ui.label(
                 RichText::new(
-                    "A systemd user-service start was attempted. You can also run `clip-sync daemon`.",
+                    "When the socket is absent, the UI requests the systemd user service. You can also run `clip-sync daemon`.",
                 )
                 .color(MUTED),
             );
@@ -1263,6 +1505,13 @@ fn config_pointer_u64(config: &serde_json::Value, pointer: &str) -> Option<u64> 
     config.pointer(pointer).and_then(serde_json::Value::as_u64)
 }
 
+fn config_seconds(config: &serde_json::Value, pointer: &str) -> String {
+    config_pointer_u64(config, pointer).map_or_else(
+        || "unavailable".to_owned(),
+        |value| format!("{value} seconds"),
+    )
+}
+
 fn format_bytes(bytes: u64) -> String {
     const KIB: u64 = 1024;
     const MIB: u64 = KIB * 1024;
@@ -1282,6 +1531,61 @@ fn format_unit(bytes: u64, unit: u64, suffix: &str) -> String {
     let whole = bytes / unit;
     let decimal = (bytes % unit) * 10 / unit;
     format!("{whole}.{decimal} {suffix}")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SwitcherKey {
+    None,
+    Up,
+    Down,
+    Enter,
+    Escape,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SwitcherIntent {
+    None,
+    Moved,
+    Activate,
+    Close,
+}
+
+fn switcher_key(input: &egui::InputState) -> SwitcherKey {
+    if input.key_pressed(Key::Escape) {
+        SwitcherKey::Escape
+    } else if input.key_pressed(Key::ArrowDown) {
+        SwitcherKey::Down
+    } else if input.key_pressed(Key::ArrowUp) {
+        SwitcherKey::Up
+    } else if input.key_pressed(Key::Enter) {
+        SwitcherKey::Enter
+    } else {
+        SwitcherKey::None
+    }
+}
+
+fn apply_switcher_key(
+    key: SwitcherKey,
+    selection: &mut usize,
+    item_count: usize,
+    activation_blocked: bool,
+) -> SwitcherIntent {
+    match key {
+        SwitcherKey::Escape => SwitcherIntent::Close,
+        SwitcherKey::Up => {
+            *selection = move_selection(*selection, item_count, -1);
+            SwitcherIntent::Moved
+        }
+        SwitcherKey::Down => {
+            *selection = move_selection(*selection, item_count, 1);
+            SwitcherIntent::Moved
+        }
+        SwitcherKey::Enter if item_count > 0 && !activation_blocked => {
+            *selection = (*selection).min(item_count - 1);
+            SwitcherIntent::Activate
+        }
+        SwitcherKey::None | SwitcherKey::Enter => SwitcherIntent::None,
+    }
 }
 
 fn move_selection(current: usize, item_count: usize, direction: i32) -> usize {
@@ -1305,6 +1609,90 @@ mod tests {
         assert_eq!(move_selection(0, 3, -1), 0);
         assert_eq!(move_selection(0, 3, 1), 1);
         assert_eq!(move_selection(2, 3, 1), 2);
+    }
+
+    #[test]
+    fn switcher_keys_navigate_activate_and_close() {
+        let mut selection = 0;
+        assert_eq!(
+            apply_switcher_key(SwitcherKey::Down, &mut selection, 3, false),
+            SwitcherIntent::Moved
+        );
+        assert_eq!(selection, 1);
+        assert_eq!(
+            apply_switcher_key(SwitcherKey::Enter, &mut selection, 3, false),
+            SwitcherIntent::Activate
+        );
+        assert_eq!(
+            apply_switcher_key(SwitcherKey::Escape, &mut selection, 3, false),
+            SwitcherIntent::Close
+        );
+    }
+
+    #[test]
+    fn switcher_enter_is_blocked_for_loading_or_empty_results() {
+        let mut selection = 0;
+        assert_eq!(
+            apply_switcher_key(SwitcherKey::Enter, &mut selection, 1, true),
+            SwitcherIntent::None
+        );
+        assert_eq!(
+            apply_switcher_key(SwitcherKey::Enter, &mut selection, 0, false),
+            SwitcherIntent::None
+        );
+    }
+
+    #[tokio::test]
+    async fn unavailable_daemon_after_start_attempt_returns_actionable_error() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let socket = temporary.path().join("missing.sock");
+        let mut start_attempted = true;
+        let error = request_with_daemon_start(
+            &socket,
+            Request {
+                protocol_version: IPC_PROTOCOL_VERSION,
+                request_id: 1,
+                body: Some(request::Body::Status(StatusRequest {})),
+            },
+            &mut start_attempted,
+        )
+        .await
+        .expect_err("missing daemon must fail");
+
+        assert!(error.contains(&socket.display().to_string()));
+        assert!(error.contains("clip-sync daemon"));
+    }
+
+    #[test]
+    fn second_ui_instance_signals_existing_instance() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let first = UiInstance::acquire(temporary.path(), UiMode::Switcher)
+            .expect("acquire first instance")
+            .expect("first instance owns lock");
+
+        let second =
+            UiInstance::acquire(temporary.path(), UiMode::Switcher).expect("signal first instance");
+
+        assert!(second.is_none());
+        drop(first);
+        assert!(!temporary.path().join("switcher.sock").exists());
+    }
+
+    #[test]
+    fn ui_instance_does_not_replace_regular_focus_path() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let focus_socket = temporary.path().join("control.sock");
+        std::fs::write(&focus_socket, b"sentinel").expect("write sentinel");
+
+        let Err(error) = UiInstance::acquire(temporary.path(), UiMode::Control) else {
+            panic!("regular focus path must be rejected");
+        };
+
+        assert!(error.contains("refusing to replace non-socket"));
+        assert_eq!(
+            std::fs::read(&focus_socket).expect("sentinel remains"),
+            b"sentinel"
+        );
     }
 
     #[test]

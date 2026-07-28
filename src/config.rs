@@ -200,12 +200,11 @@ impl AppPaths {
         let base = BaseDirs::new().ok_or(ConfigError::MissingHome)?;
         let config =
             config_override.unwrap_or_else(|| base.config_dir().join("clip-sync/config.toml"));
-        let state_dir = env::var_os("XDG_STATE_HOME").map_or_else(
-            || base.home_dir().join(".local/state/clip-sync"),
-            |path| PathBuf::from(path).join("clip-sync"),
-        );
-        let runtime_root = env::var_os("XDG_RUNTIME_DIR").ok_or(ConfigError::MissingRuntime)?;
-        let runtime_dir = PathBuf::from(runtime_root).join("clip-sync");
+        let state_root =
+            xdg_path("XDG_STATE_HOME")?.unwrap_or_else(|| base.home_dir().join(".local/state"));
+        let state_dir = state_root.join("clip-sync");
+        let runtime_root = xdg_path("XDG_RUNTIME_DIR")?.ok_or(ConfigError::MissingRuntime)?;
+        let runtime_dir = runtime_root.join("clip-sync");
         let socket = runtime_dir.join("daemon.sock");
 
         Ok(Self {
@@ -217,12 +216,38 @@ impl AppPaths {
     }
 }
 
+fn xdg_path(variable: &'static str) -> Result<Option<PathBuf>, ConfigError> {
+    xdg_path_value(variable, env::var_os(variable))
+}
+
+fn xdg_path_value(
+    variable: &'static str,
+    value: Option<std::ffi::OsString>,
+) -> Result<Option<PathBuf>, ConfigError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if value.is_empty() {
+        return Ok(None);
+    }
+    let path = PathBuf::from(value);
+    if !path.is_absolute() {
+        return Err(ConfigError::RelativeXdgPath { variable, path });
+    }
+    Ok(Some(path))
+}
+
 #[derive(Debug, Error)]
 pub enum ConfigError {
     #[error("could not determine the user's home directory")]
     MissingHome,
     #[error("XDG_RUNTIME_DIR is not set")]
     MissingRuntime,
+    #[error("{variable} must be an absolute path, got {path:?}")]
+    RelativeXdgPath {
+        variable: &'static str,
+        path: PathBuf,
+    },
     #[error("the config path has no parent directory")]
     MissingParent,
     #[error("could not read the config: {0}")]
@@ -294,5 +319,22 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(Config::load(&path), Err(ConfigError::TooLarge)));
+    }
+
+    #[test]
+    fn xdg_paths_must_be_absolute() {
+        assert_eq!(
+            xdg_path_value("XDG_STATE_HOME", Some(std::ffi::OsString::new())).expect("empty path"),
+            None
+        );
+        let error =
+            xdg_path_value("XDG_RUNTIME_DIR", Some("relative".into())).expect_err("relative path");
+        assert!(matches!(
+            error,
+            ConfigError::RelativeXdgPath {
+                variable: "XDG_RUNTIME_DIR",
+                ..
+            }
+        ));
     }
 }

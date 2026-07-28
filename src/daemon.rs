@@ -32,6 +32,8 @@ pub async fn run(paths: AppPaths, config: Config) -> anyhow::Result<()> {
     fs::create_dir_all(&paths.runtime_dir).context("create runtime directory")?;
     make_private_directory(&paths.state_dir).context("secure state directory")?;
     make_private_directory(&paths.runtime_dir).context("secure runtime directory")?;
+    let _instance = ipc::DaemonInstance::acquire(&paths.runtime_dir)
+        .context("acquire daemon singleton lock")?;
 
     let mesh_secret = MeshSecret::load(&config.local.mesh_key_file)
         .context("load mesh secret from configured file")?;

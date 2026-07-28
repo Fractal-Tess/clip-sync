@@ -3,12 +3,14 @@ pub mod protocol;
 #[cfg(target_os = "linux")]
 use std::os::fd::AsFd;
 use std::{
+    fs::{File, OpenOptions},
     path::{Path, PathBuf},
     sync::Arc,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use bytes::Bytes;
+use fs2::FileExt;
 use futures_util::{SinkExt, StreamExt};
 use prost::Message;
 use serde::Serialize;
@@ -35,6 +37,39 @@ use crate::{
 
 const MAX_IPC_FRAME_BYTES: usize = 1024 * 1024;
 const MAX_IPC_CONNECTIONS: usize = 32;
+const IPC_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+pub struct DaemonInstance {
+    _lock: File,
+}
+
+impl DaemonInstance {
+    /// Acquires the per-user daemon startup lock.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IpcError::AlreadyRunning`] when another daemon startup or
+    /// process owns the lock, and an I/O error when the lock cannot be secured.
+    pub fn acquire(runtime_dir: &Path) -> Result<Self, IpcError> {
+        std::fs::create_dir_all(runtime_dir)?;
+        make_socket_parent_private(runtime_dir)?;
+        let lock_path = runtime_dir.join("daemon.lock");
+        let lock = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)?;
+        set_lock_permissions(&lock_path)?;
+        match lock.try_lock_exclusive() {
+            Ok(()) => Ok(Self { _lock: lock }),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                Err(IpcError::AlreadyRunning)
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct DaemonState {
@@ -156,6 +191,9 @@ impl DaemonState {
                 struct RedactedLocal<'a> {
                     listen_port: u16,
                     discovery_interval_seconds: u64,
+                    reconcile_interval_seconds: u64,
+                    reconnect_min_seconds: u64,
+                    reconnect_max_seconds: u64,
                     netbird_command: String,
                     mesh_key_file_configured: bool,
                     config_path: &'a str,
@@ -177,6 +215,13 @@ impl DaemonState {
                             .config
                             .local
                             .discovery_interval_seconds,
+                        reconcile_interval_seconds: self
+                            .inner
+                            .config
+                            .local
+                            .reconcile_interval_seconds,
+                        reconnect_min_seconds: self.inner.config.local.reconnect_min_seconds,
+                        reconnect_max_seconds: self.inner.config.local.reconnect_max_seconds,
                         netbird_command: self
                             .inner
                             .config
@@ -467,20 +512,40 @@ pub async fn serve(
     shutdown: CancellationToken,
 ) -> Result<(), IpcError> {
     prepare_socket(socket).await?;
-    let listener = UnixListener::bind(socket)?;
-    set_socket_permissions(socket)?;
-    let connections = Arc::new(Semaphore::new(MAX_IPC_CONNECTIONS));
-    let mut tasks = JoinSet::new();
+    let listener = match UnixListener::bind(socket) {
+        Ok(listener) => listener,
+        Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
+            return Err(IpcError::AlreadyRunning);
+        }
+        Err(error) => return Err(error.into()),
+    };
+    if let Err(error) = set_socket_permissions(socket) {
+        let _ = remove_socket(socket).await;
+        return Err(error);
+    }
 
-    loop {
+    let limiter = Arc::new(Semaphore::new(MAX_IPC_CONNECTIONS));
+    let mut tasks = JoinSet::new();
+    let result = loop {
         tokio::select! {
-            () = shutdown.cancelled() => break,
+            biased;
+            () = shutdown.cancelled() => break Ok(()),
+            joined = tasks.join_next(), if !tasks.is_empty() => {
+                if let Some(Err(error)) = joined
+                    && !error.is_cancelled()
+                {
+                    tracing::debug!(%error, "local IPC connection task failed");
+                }
+            }
             accepted = listener.accept() => {
-                let (stream, _) = accepted?;
+                let (stream, _) = match accepted {
+                    Ok(accepted) => accepted,
+                    Err(error) => break Err(IpcError::Io(error)),
+                };
                 if !peer_is_current_user(&stream)? {
                     continue;
                 }
-                let Ok(permit) = connections.clone().try_acquire_owned() else {
+                let Ok(permit) = limiter.clone().try_acquire_owned() else {
                     continue;
                 };
                 let state = state.clone();
@@ -491,17 +556,26 @@ pub async fn serve(
                     }
                 });
             }
-            completed = tasks.join_next(), if !tasks.is_empty() => {
-                if let Some(Err(error)) = completed {
-                    tracing::debug!(%error, "local IPC connection task failed");
-                }
-            }
         }
-    }
+    };
 
+    drop(listener);
     tasks.abort_all();
     while tasks.join_next().await.is_some() {}
+    let cleanup = remove_socket(socket).await;
+    match (result, cleanup) {
+        (Err(error), _) => Err(error),
+        (Ok(()), cleanup) => cleanup,
+    }
+}
 
+async fn remove_socket(socket: &Path) -> Result<(), IpcError> {
+    match tokio::fs::symlink_metadata(socket).await {
+        Ok(metadata) if is_socket(&metadata) => {}
+        Ok(_) => return Err(IpcError::SocketPathNotSocket(socket.to_owned())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    }
     match tokio::fs::remove_file(socket).await {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -513,8 +587,29 @@ pub async fn serve(
 ///
 /// # Errors
 ///
-/// Returns an error when connection, framing, encoding, or decoding fails.
+/// Returns an error when connection, framing, encoding, decoding, response
+/// correlation, or the bounded response wait fails.
 pub async fn request(socket: &Path, request: Request) -> Result<Response, IpcError> {
+    let request_id = request.request_id;
+    let response = tokio::time::timeout(IPC_REQUEST_TIMEOUT, request_inner(socket, request))
+        .await
+        .map_err(|_| IpcError::Timeout)??;
+    if response.protocol_version != IPC_PROTOCOL_VERSION {
+        return Err(IpcError::ResponseProtocol {
+            expected: IPC_PROTOCOL_VERSION,
+            actual: response.protocol_version,
+        });
+    }
+    if response.request_id != request_id {
+        return Err(IpcError::ResponseRequestId {
+            expected: request_id,
+            actual: response.request_id,
+        });
+    }
+    Ok(response)
+}
+
+async fn request_inner(socket: &Path, request: Request) -> Result<Response, IpcError> {
     let stream = UnixStream::connect(socket).await?;
     let mut framed = Framed::new(stream, codec());
     let mut encoded = Vec::with_capacity(request.encoded_len());
@@ -559,7 +654,9 @@ async fn prepare_socket(socket: &Path) -> Result<(), IpcError> {
     tokio::fs::create_dir_all(parent).await?;
     make_socket_parent_private(parent)?;
     match std::fs::symlink_metadata(socket) {
-        Ok(_) if !is_socket_path(socket)? => return Err(IpcError::UnsafeSocketPath),
+        Ok(_) if !is_socket_path(socket)? => {
+            return Err(IpcError::SocketPathNotSocket(socket.to_owned()));
+        }
         Ok(_) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
@@ -573,16 +670,26 @@ async fn prepare_socket(socket: &Path) -> Result<(), IpcError> {
                 std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
             ) =>
         {
-            if error.kind() == std::io::ErrorKind::ConnectionRefused {
-                if !is_socket_path(socket)? {
-                    return Err(IpcError::UnsafeSocketPath);
-                }
-                tokio::fs::remove_file(socket).await?;
-            }
-            Ok(())
+            remove_stale_socket(socket).await
         }
         Err(error) => Err(error.into()),
     }
+}
+
+async fn remove_stale_socket(socket: &Path) -> Result<(), IpcError> {
+    match tokio::fs::symlink_metadata(socket).await {
+        Ok(metadata) if is_socket(&metadata) => remove_socket(socket).await,
+        Ok(_) => Err(IpcError::SocketPathNotSocket(socket.to_owned())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(unix)]
+fn is_socket(metadata: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::FileTypeExt;
+
+    metadata.file_type().is_socket()
 }
 
 #[cfg(unix)]
@@ -642,6 +749,14 @@ fn set_socket_permissions(socket: &Path) -> Result<(), IpcError> {
     Ok(())
 }
 
+#[cfg(unix)]
+fn set_lock_permissions(lock: &Path) -> Result<(), IpcError> {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::set_permissions(lock, std::fs::Permissions::from_mode(0o600))?;
+    Ok(())
+}
+
 fn error_response(
     request_id: u64,
     code: impl Into<String>,
@@ -665,10 +780,16 @@ pub enum IpcError {
     MissingSocketParent,
     #[error("IPC socket parent is not an owned private directory")]
     UnsafeSocketParent,
-    #[error("refusing to replace a non-socket IPC path")]
-    UnsafeSocketPath,
+    #[error("refusing to replace non-socket IPC path {0:?}")]
+    SocketPathNotSocket(PathBuf),
     #[error("daemon closed the IPC connection without responding")]
     ConnectionClosed,
+    #[error("daemon did not respond within the local IPC timeout")]
+    Timeout,
+    #[error("daemon response protocol mismatch: expected {expected}, got {actual}")]
+    ResponseProtocol { expected: u32, actual: u32 },
+    #[error("daemon response request ID mismatch: expected {expected}, got {actual}")]
+    ResponseRequestId { expected: u64, actual: u64 },
     #[error("IPC I/O failed: {0}")]
     Io(#[from] std::io::Error),
     #[error("invalid IPC message: {0}")]
@@ -773,6 +894,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shutdown_aborts_idle_connections_and_removes_socket() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let socket = temporary.path().join("daemon.sock");
+        let (commands, _command_rx) = mpsc::unbounded_channel();
+        let state = DaemonState::new(
+            "test-node".to_owned(),
+            temporary.path().join("config.toml"),
+            Config::default(),
+            commands,
+        );
+        let shutdown = CancellationToken::new();
+        let server_shutdown = shutdown.clone();
+        let server_socket = socket.clone();
+        let server = tokio::spawn(async move {
+            serve(&server_socket, state, server_shutdown)
+                .await
+                .expect("serve IPC");
+        });
+        for _ in 0..50 {
+            if socket.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        let _idle = UnixStream::connect(&socket).await.expect("idle connection");
+
+        shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .expect("server shutdown must be bounded")
+            .expect("server task");
+        assert!(!socket.exists());
+    }
+
+    #[tokio::test]
     async fn history_search_is_bounded_and_case_insensitive() {
         let temporary = tempfile::tempdir().expect("temporary directory");
         let (commands, _command_rx) = mpsc::unbounded_channel();
@@ -820,6 +976,50 @@ mod tests {
         };
         assert_eq!(history.items.len(), 1);
         assert_eq!(history.items[0].content_id, "alpha");
+    }
+
+    #[tokio::test]
+    async fn config_response_is_redacted_and_complete_for_local_ui_fields() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let (commands, _command_rx) = mpsc::unbounded_channel();
+        let state = DaemonState::new(
+            "test-node".to_owned(),
+            temporary.path().join("config.toml"),
+            Config::default(),
+            commands,
+        );
+
+        let response = state
+            .handle(Request {
+                protocol_version: IPC_PROTOCOL_VERSION,
+                request_id: 11,
+                body: Some(request::Body::Config(protocol::ConfigRequest {})),
+            })
+            .await;
+        let Some(response::Body::Config(config)) = response.body else {
+            panic!("expected config response");
+        };
+        let value: serde_json::Value =
+            serde_json::from_slice(&config.redacted_json).expect("valid config JSON");
+        let local = value
+            .get("local")
+            .and_then(serde_json::Value::as_object)
+            .expect("local config object");
+
+        for field in [
+            "listen_port",
+            "discovery_interval_seconds",
+            "reconcile_interval_seconds",
+            "reconnect_min_seconds",
+            "reconnect_max_seconds",
+            "netbird_command",
+            "mesh_key_file_configured",
+            "config_path",
+        ] {
+            assert!(local.contains_key(field), "missing {field}");
+        }
+        assert!(!local.contains_key("mesh_key_file"));
+        assert!(!String::from_utf8_lossy(&config.redacted_json).contains("/run/secrets"));
     }
 
     #[tokio::test]
@@ -891,22 +1091,100 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn refuses_to_delete_non_socket_stale_path() {
+    async fn live_socket_is_reported_as_an_existing_daemon() {
         let temporary = tempfile::tempdir().expect("temporary directory");
         let socket = temporary.path().join("daemon.sock");
-        std::fs::write(&socket, b"preserve me").unwrap();
-        let (commands, _) = mpsc::unbounded_channel();
-        let state = DaemonState::new(
-            "test-node".to_owned(),
-            temporary.path().join("config.toml"),
-            Config::default(),
-            commands,
+        let listener = UnixListener::bind(&socket).expect("bind live socket");
+
+        let error = prepare_socket(&socket)
+            .await
+            .expect_err("live daemon must win");
+
+        assert!(matches!(error, IpcError::AlreadyRunning));
+        drop(listener);
+    }
+
+    #[test]
+    fn daemon_startup_lock_is_singleton_and_recoverable() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let first = DaemonInstance::acquire(temporary.path()).expect("first daemon lock");
+        let Err(second) = DaemonInstance::acquire(temporary.path()) else {
+            panic!("second daemon must be rejected");
+        };
+        assert!(matches!(second, IpcError::AlreadyRunning));
+
+        drop(first);
+        DaemonInstance::acquire(temporary.path()).expect("lock is released on drop");
+    }
+
+    #[tokio::test]
+    async fn regular_file_at_socket_path_is_never_removed() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let socket = temporary.path().join("daemon.sock");
+        std::fs::write(&socket, b"keep me").expect("write sentinel");
+
+        let error = prepare_socket(&socket)
+            .await
+            .expect_err("regular file must be rejected");
+
+        assert!(matches!(error, IpcError::SocketPathNotSocket(path) if path == socket));
+        assert_eq!(
+            std::fs::read(&socket).expect("sentinel remains"),
+            b"keep me"
         );
+    }
+
+    #[tokio::test]
+    async fn client_rejects_mismatched_response_request_id() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let socket = temporary.path().join("daemon.sock");
+        let listener = UnixListener::bind(&socket).expect("bind test socket");
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept client");
+            let mut framed = Framed::new(stream, codec());
+            let _request = framed
+                .next()
+                .await
+                .expect("request frame")
+                .expect("valid frame");
+            let response = Response {
+                protocol_version: IPC_PROTOCOL_VERSION,
+                request_id: 999,
+                body: Some(response::Body::Status(StatusResponse {
+                    version: "test".to_owned(),
+                    hostname: "test".to_owned(),
+                    uptime_seconds: 0,
+                    config_path: "test".to_owned(),
+                    netbird_address: None,
+                    discovered_peers: 0,
+                })),
+            };
+            let mut encoded = Vec::with_capacity(response.encoded_len());
+            response.encode(&mut encoded).expect("encode response");
+            framed
+                .send(Bytes::from(encoded))
+                .await
+                .expect("send response");
+        });
+
+        let error = request(
+            &socket,
+            Request {
+                protocol_version: IPC_PROTOCOL_VERSION,
+                request_id: 12,
+                body: Some(request::Body::Status(StatusRequest {})),
+            },
+        )
+        .await
+        .expect_err("mismatched response must fail");
 
         assert!(matches!(
-            serve(&socket, state, CancellationToken::new()).await,
-            Err(IpcError::UnsafeSocketPath)
+            error,
+            IpcError::ResponseRequestId {
+                expected: 12,
+                actual: 999
+            }
         ));
-        assert_eq!(std::fs::read(&socket).unwrap(), b"preserve me");
+        server.await.expect("test server");
     }
 }
