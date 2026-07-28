@@ -66,7 +66,7 @@ cleanup() {
     wait "$local_source_pid" 2>/dev/null
   fi
   if [[ -n "$local_pid" ]]; then
-    kill "$local_pid" 2>/dev/null
+    kill -- "-$local_pid" 2>/dev/null
     wait "$local_pid" 2>/dev/null
   fi
   if [[ $local_had_text -eq 1 ]]; then
@@ -75,8 +75,8 @@ cleanup() {
     XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR_ORIGINAL:-$XDG_RUNTIME_DIR} wl-copy --clear 2>/dev/null
   fi
   if [[ $remote_started -eq 1 ]]; then
-    remote "if test -f '$remote_root/pid'; then kill \$(cat '$remote_root/pid') 2>/dev/null || true; fi; \
-      if test -s '$remote_root/original.txt'; then XDG_RUNTIME_DIR='$remote_root/runtime' wl-copy --type text/plain <'$remote_root/original.txt' || true; fi"
+    remote "if test -f '$remote_root/pid'; then kill -- -\$(cat '$remote_root/pid') 2>/dev/null || true; fi; \
+      if test -s '$remote_root/original.txt'; then nohup env XDG_RUNTIME_DIR='$remote_root/runtime' wl-copy --foreground --type text/plain <'$remote_root/original.txt' >/dev/null 2>&1 & fi"
   fi
   if [[ $keep -eq 0 ]]; then
     remote "rm -rf '$remote_root'" 2>/dev/null
@@ -150,10 +150,10 @@ remote "chmod 0700 '$remote_root/clip-sync'; chmod 0600 '$remote_root/key'; \
 remote_started=1
 
 start_remote() {
-  remote "nohup env XDG_RUNTIME_DIR='$remote_root/runtime' XDG_STATE_HOME='$remote_root/state' XDG_CONFIG_HOME='$remote_root/config' WAYLAND_DISPLAY='$remote_wayland' RUST_LOG=clip_sync=debug '$remote_root/clip-sync' daemon >'$remote_root/daemon.log' 2>&1 </dev/null & echo \$! >'$remote_root/pid'"
+  remote "nohup setsid env XDG_RUNTIME_DIR='$remote_root/runtime' XDG_STATE_HOME='$remote_root/state' XDG_CONFIG_HOME='$remote_root/config' WAYLAND_DISPLAY='$remote_wayland' RUST_LOG=clip_sync=debug '$remote_root/clip-sync' daemon >'$remote_root/daemon.log' 2>&1 </dev/null & echo \$! >'$remote_root/pid'"
 }
 stop_remote() {
-  remote "kill \$(cat '$remote_root/pid') 2>/dev/null || true; for i in \$(seq 1 50); do kill -0 \$(cat '$remote_root/pid') 2>/dev/null || exit 0; sleep .1; done; exit 1"
+  remote "kill -- -\$(cat '$remote_root/pid') 2>/dev/null || true; for i in \$(seq 1 50); do kill -0 \$(cat '$remote_root/pid') 2>/dev/null || exit 0; sleep .1; done; exit 1"
 }
 remote_cli() {
   remote "env XDG_RUNTIME_DIR='$remote_root/runtime' XDG_STATE_HOME='$remote_root/state' XDG_CONFIG_HOME='$remote_root/config' WAYLAND_DISPLAY='$remote_wayland' '$remote_root/clip-sync' $*"
@@ -165,7 +165,7 @@ export XDG_STATE_HOME=$root/state
 export XDG_CONFIG_HOME=$root/config
 export WAYLAND_DISPLAY
 export RUST_LOG=clip_sync=debug
-"$root/clip-sync-bundle" daemon >"$root/daemon.log" 2>&1 &
+setsid "$root/clip-sync-bundle" daemon >"$root/daemon.log" 2>&1 &
 local_pid=$!
 for _ in $(seq 1 600); do
   [[ -S "$root/runtime/clip-sync/daemon.sock" ]] && break
@@ -231,7 +231,7 @@ wait_remote_history "$second"
 local_before_remote=$root/local-before-remote.txt
 timeout 3 wl-paste --no-newline --type text/plain >"$local_before_remote"
 third="clip-sync-kiwi-to-vd-$(date +%s%N)"
-remote "printf %s '$third' | XDG_RUNTIME_DIR='$remote_root/runtime' WAYLAND_DISPLAY='$remote_wayland' wl-copy --type text/plain"
+remote "printf %s '$third' | XDG_RUNTIME_DIR='$remote_root/runtime' WAYLAND_DISPLAY='$remote_wayland' timeout 5 wl-copy --foreground --type text/plain"
 wait_local_history "$third"
 timeout 3 wl-paste --no-newline --type text/plain >"$root/local-after-remote.txt"
 cmp -s "$local_before_remote" "$root/local-after-remote.txt" || {
