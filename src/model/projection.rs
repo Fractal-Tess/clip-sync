@@ -239,6 +239,7 @@ pub struct TombstoneView {
 #[derive(Clone, Copy, Debug)]
 pub struct TransferView<'a> {
     transfer_id: TransferId,
+    source_node: Option<NodeId>,
     content_id: Option<ContentId>,
     manifest_id: Option<ManifestId>,
     manifest: Option<&'a StoredManifest>,
@@ -250,6 +251,11 @@ impl<'a> TransferView<'a> {
     #[must_use]
     pub const fn transfer_id(self) -> TransferId {
         self.transfer_id
+    }
+
+    #[must_use]
+    pub const fn source_node(self) -> Option<NodeId> {
+        self.source_node
     }
 
     #[must_use]
@@ -943,6 +949,10 @@ fn transfer_view(transfer_id: TransferId, state: &TransferProjectionState) -> Tr
     let metadata = state.begin.as_ref().map(|begin| &begin.value);
     TransferView {
         transfer_id,
+        source_node: state
+            .begin
+            .as_ref()
+            .map(|begin| begin.event.operation_id().node()),
         content_id: metadata.map(|metadata| metadata.content_id),
         manifest_id: metadata.map(|metadata| metadata.manifest_id),
         manifest: metadata.map(|metadata| &metadata.manifest),

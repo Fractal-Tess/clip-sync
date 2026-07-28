@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, bail};
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -14,8 +14,9 @@ use crate::{
         protocol::{
             ActivateRequest, ConfigRequest, DiagnosticsRequest, ForgetDeviceRequest,
             HistoryRequest, HistoryUpdateAction, HistoryUpdateRequest, IPC_PROTOCOL_VERSION,
-            PeersRequest, Request, ShareClipboardRequest, StatusRequest, TransferCancelRequest,
-            TransfersRequest, request, response,
+            PeersRequest, Request, ShareClipboardRequest, SharedSettingKind,
+            SharedSettingUpdateRequest, StatusRequest, TransferCancelRequest, TransfersRequest,
+            request, response,
         },
     },
 };
@@ -50,9 +51,9 @@ enum Command {
     },
     /// Report live daemon, storage, clipboard, and discovery diagnostics.
     Doctor(OutputArgs),
-    /// Request explicit capture; the current Wayland backend reports this as unsupported.
-    ShareClipboard(OutputArgs),
-    /// Query transfer controls; daemon wiring is not available yet.
+    /// Inspect and explicitly share the current clipboard.
+    ShareClipboard(ShareArgs),
+    /// Query and cancel payload transfers.
     Transfer {
         #[command(subcommand)]
         command: TransferCommand,
@@ -74,6 +75,16 @@ enum Command {
 
 #[derive(Debug, Clone, Copy, Args)]
 struct OutputArgs {
+    /// Emit stable machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Clone, Copy, Args)]
+struct ShareArgs {
+    /// Confirm sharing when the inspected offer exceeds the capture threshold.
+    #[arg(long)]
+    confirm: bool,
     /// Emit stable machine-readable JSON.
     #[arg(long)]
     json: bool,
@@ -143,6 +154,20 @@ enum ConfigCommand {
         #[arg(long)]
         force: bool,
     },
+    /// Replicate and apply one shared mesh setting.
+    Set {
+        #[arg(value_enum)]
+        setting: ConfigSetting,
+        value: u64,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum ConfigSetting {
+    MeshQuota,
+    CaptureThreshold,
 }
 
 #[derive(Debug, Subcommand)]
@@ -159,7 +184,7 @@ enum TransferCommand {
 
 #[derive(Debug, Subcommand)]
 enum DeviceCommand {
-    /// Request rejection of a device identity; the current replica backend is unsupported.
+    /// Replicate rejection of a remembered mesh identity.
     Forget {
         device_id: String,
         #[arg(long)]
@@ -305,6 +330,11 @@ async fn peers(paths: &AppPaths, output: OutputArgs) -> anyhow::Result<()> {
                 "local_address": peers.local_address,
                 "peers": peer_items,
                 "discovery_error": peers.discovery_error,
+                "devices": peers.devices.into_iter().map(|device| serde_json::json!({
+                    "device_id": device.device_id,
+                    "local": device.local,
+                    "forgotten": device.forgotten,
+                })).collect::<Vec<_>>(),
             }))
         }
         Some(response::Body::Peers(peers)) => {
@@ -329,6 +359,19 @@ async fn peers(paths: &AppPaths, output: OutputArgs) -> anyhow::Result<()> {
                     "offline"
                 };
                 println!("{}  {}  {status}", peer.hostname, peer.address);
+            }
+            if !peers.devices.is_empty() {
+                println!("mesh devices:");
+                for device in peers.devices {
+                    let state = if device.local {
+                        "local"
+                    } else if device.forgotten {
+                        "forgotten"
+                    } else {
+                        "remembered"
+                    };
+                    println!("{}  {state}", device.device_id);
+                }
             }
             Ok(())
         }
@@ -471,6 +514,26 @@ async fn config_command(paths: &AppPaths, command: ConfigCommand) -> anyhow::Res
             println!("wrote {}", paths.config.display());
             Ok(())
         }
+        ConfigCommand::Set {
+            setting,
+            value,
+            json,
+        } => {
+            let response = daemon_request(
+                paths,
+                12,
+                request::Body::SharedSettingUpdate(SharedSettingUpdateRequest {
+                    setting: match setting {
+                        ConfigSetting::MeshQuota => SharedSettingKind::MeshQuotaBytes,
+                        ConfigSetting::CaptureThreshold => SharedSettingKind::CaptureThresholdBytes,
+                    } as i32,
+                    value,
+                }),
+                json,
+            )
+            .await?;
+            mutation_response(response, json, "shared setting updated")
+        }
     }
 }
 
@@ -519,15 +582,61 @@ async fn doctor(paths: &AppPaths, output: OutputArgs) -> anyhow::Result<()> {
     }
 }
 
-async fn share_clipboard(paths: &AppPaths, output: OutputArgs) -> anyhow::Result<()> {
+async fn share_clipboard(paths: &AppPaths, args: ShareArgs) -> anyhow::Result<()> {
     let response = daemon_request(
         paths,
         8,
-        request::Body::ShareClipboard(ShareClipboardRequest {}),
-        output.json,
+        request::Body::ShareClipboard(ShareClipboardRequest {
+            confirmed: args.confirm,
+        }),
+        args.json,
     )
     .await?;
-    mutation_response(response, output.json, "clipboard shared")
+    match response.body {
+        Some(response::Body::ShareClipboard(result)) => {
+            if args.json {
+                print_json(&share_json(&result))?;
+            } else if result.shared {
+                println!("{}", result.message);
+                println!(
+                    "transfer: {}",
+                    result.transfer_id.as_deref().unwrap_or("unavailable")
+                );
+                println!(
+                    "content: {}",
+                    result.content_id.as_deref().unwrap_or("unavailable")
+                );
+            } else {
+                println!(
+                    "{} ({} bytes; MIME: {})",
+                    result.message,
+                    result.logical_size,
+                    result.mime_types.join(", ")
+                );
+            }
+            if result.shared {
+                Ok(())
+            } else {
+                bail!("{}", result.message)
+            }
+        }
+        Some(response::Body::Error(error)) => Err(daemon_response_error(&error, args.json)),
+        _ => Err(unexpected_response(args.json, "clipboard share")),
+    }
+}
+
+fn share_json(result: &crate::ipc::protocol::ShareClipboardResponse) -> serde_json::Value {
+    serde_json::json!({
+        "ok": result.shared,
+        "shared": result.shared,
+        "confirmation_required": result.confirmation_required,
+        "logical_size": result.logical_size,
+        "mime_types": &result.mime_types,
+        "quota_exempt": result.quota_exempt,
+        "transfer_id": &result.transfer_id,
+        "content_id": &result.content_id,
+        "message": &result.message,
+    })
 }
 
 async fn transfer_command(paths: &AppPaths, command: TransferCommand) -> anyhow::Result<()> {
@@ -545,16 +654,7 @@ async fn transfer_command(paths: &AppPaths, command: TransferCommand) -> anyhow:
                     let transfers = transfers
                         .transfers
                         .into_iter()
-                        .map(|transfer| {
-                            serde_json::json!({
-                                "transfer_id": transfer.transfer_id,
-                                "content_id": transfer.content_id,
-                                "peer": transfer.peer,
-                                "state": transfer.state,
-                                "completed_bytes": transfer.completed_bytes,
-                                "total_bytes": transfer.total_bytes,
-                            })
-                        })
+                        .map(|transfer| transfer_json(&transfer))
                         .collect::<Vec<_>>();
                     print_json(&transfers)
                 }
@@ -563,13 +663,19 @@ async fn transfer_command(paths: &AppPaths, command: TransferCommand) -> anyhow:
                         println!("no transfers");
                     }
                     for transfer in transfers.transfers {
+                        let percent = transfer
+                            .completed_bytes
+                            .saturating_mul(100)
+                            .checked_div(transfer.total_bytes)
+                            .unwrap_or(0);
                         println!(
-                            "{}  {}  {}/{} B  {}",
+                            "{}  {}  {}/{} B ({percent}%)  {}  {}",
                             transfer.transfer_id,
                             transfer.state,
                             transfer.completed_bytes,
                             transfer.total_bytes,
-                            transfer.peer
+                            transfer.peer,
+                            transfer.content_id,
                         );
                     }
                     Ok(())
@@ -591,6 +697,17 @@ async fn transfer_command(paths: &AppPaths, command: TransferCommand) -> anyhow:
             mutation_response(response, json, "transfer cancelled")
         }
     }
+}
+
+fn transfer_json(transfer: &crate::ipc::protocol::TransferItem) -> serde_json::Value {
+    serde_json::json!({
+        "transfer_id": transfer.transfer_id,
+        "content_id": transfer.content_id,
+        "peer": transfer.peer,
+        "state": transfer.state,
+        "completed_bytes": transfer.completed_bytes,
+        "total_bytes": transfer.total_bytes,
+    })
 }
 
 async fn device_command(paths: &AppPaths, command: DeviceCommand) -> anyhow::Result<()> {
@@ -720,6 +837,15 @@ mod tests {
             vec!["clip-sync", "device", "forget", "device-id", "--json"],
             vec![
                 "clip-sync",
+                "config",
+                "set",
+                "mesh-quota",
+                "1048576",
+                "--json",
+            ],
+            vec!["clip-sync", "share-clipboard", "--confirm", "--json"],
+            vec![
+                "clip-sync",
                 "rekey",
                 "--old-key-file",
                 "old.key",
@@ -766,6 +892,56 @@ mod tests {
                 "config_path": "/config.toml",
                 "netbird_address": "100.64.0.1",
                 "discovered_peers": 2,
+            })
+        );
+    }
+
+    #[test]
+    fn share_json_fields_and_resource_ids_are_stable() {
+        let value = share_json(&crate::ipc::protocol::ShareClipboardResponse {
+            shared: true,
+            confirmation_required: true,
+            logical_size: 42,
+            mime_types: vec!["text/plain".to_owned()],
+            quota_exempt: false,
+            transfer_id: Some("transfer-id".to_owned()),
+            content_id: Some("content-id".to_owned()),
+            message: "clipboard shared".to_owned(),
+        });
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "ok": true,
+                "shared": true,
+                "confirmation_required": true,
+                "logical_size": 42,
+                "mime_types": ["text/plain"],
+                "quota_exempt": false,
+                "transfer_id": "transfer-id",
+                "content_id": "content-id",
+                "message": "clipboard shared",
+            })
+        );
+    }
+
+    #[test]
+    fn transfer_progress_json_fields_are_stable() {
+        assert_eq!(
+            transfer_json(&crate::ipc::protocol::TransferItem {
+                transfer_id: "transfer-id".to_owned(),
+                content_id: "content-id".to_owned(),
+                peer: "peer-id".to_owned(),
+                state: "replicating".to_owned(),
+                completed_bytes: 10,
+                total_bytes: 20,
+            }),
+            serde_json::json!({
+                "transfer_id": "transfer-id",
+                "content_id": "content-id",
+                "peer": "peer-id",
+                "state": "replicating",
+                "completed_bytes": 10,
+                "total_bytes": 20,
             })
         );
     }

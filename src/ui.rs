@@ -23,9 +23,12 @@ use crate::{
         self,
         protocol::{
             ActivateRequest, ConfigRequest, ConfigResponse, DiagnosticCheck, DiagnosticsRequest,
-            DiagnosticsResponse, HistoryItem, HistoryRequest, HistoryResponse, HistoryUpdateAction,
-            HistoryUpdateRequest, IPC_PROTOCOL_VERSION, MutationResponse, PeerItem, PeersRequest,
-            PeersResponse, Request, Response, StatusRequest, StatusResponse, request, response,
+            DiagnosticsResponse, ForgetDeviceRequest, HistoryItem, HistoryRequest, HistoryResponse,
+            HistoryUpdateAction, HistoryUpdateRequest, IPC_PROTOCOL_VERSION, MutationResponse,
+            PeerItem, PeersRequest, PeersResponse, Request, Response, ShareClipboardRequest,
+            ShareClipboardResponse, SharedSettingKind, SharedSettingUpdateRequest, StatusRequest,
+            StatusResponse, TransferCancelRequest, TransferItem, TransfersRequest,
+            TransfersResponse, request, response,
         },
     },
 };
@@ -289,6 +292,10 @@ fn set_private_mode(path: &Path, mode: u32) -> Result<(), String> {
         .map_err(|error| format!("could not secure {}: {error}", path.display()))
 }
 
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "independent UI request states do not form one shared state machine"
+)]
 struct ClipSyncApp {
     mode: UiMode,
     paths: AppPaths,
@@ -309,13 +316,24 @@ struct ClipSyncApp {
     peers: Option<PeersResponse>,
     config: Option<serde_json::Value>,
     diagnostics: Vec<DiagnosticCheck>,
+    transfers: Vec<TransferItem>,
     daemon_error: Option<String>,
     history_error: Option<String>,
     peers_error: Option<String>,
     config_error: Option<String>,
     diagnostics_error: Option<String>,
+    transfers_error: Option<String>,
     notice: Option<Notice>,
     mutation_pending: bool,
+    transfer_refresh_pending: bool,
+    last_transfer_refresh: Instant,
+    share_inspection: Option<ShareClipboardResponse>,
+    pending_transfer_cancel: Option<String>,
+    forget_device_id: String,
+    pending_forget_device: Option<String>,
+    mesh_quota_input: String,
+    capture_threshold_input: String,
+    pending_setting: Option<PendingSetting>,
 }
 
 impl ClipSyncApp {
@@ -353,13 +371,26 @@ impl ClipSyncApp {
             peers: None,
             config: None,
             diagnostics: Vec::new(),
+            transfers: Vec::new(),
             daemon_error: None,
             history_error: None,
             peers_error: None,
             config_error: None,
             diagnostics_error: None,
+            transfers_error: None,
             notice: None,
             mutation_pending: false,
+            transfer_refresh_pending: false,
+            last_transfer_refresh: Instant::now()
+                .checked_sub(Duration::from_secs(1))
+                .unwrap_or_else(Instant::now),
+            share_inspection: None,
+            pending_transfer_cancel: None,
+            forget_device_id: String::new(),
+            pending_forget_device: None,
+            mesh_quota_input: String::new(),
+            capture_threshold_input: String::new(),
+            pending_setting: None,
         };
         app.refresh_status();
         app.refresh_history();
@@ -417,8 +448,32 @@ impl ClipSyncApp {
         self.send(UiCommand::Peers);
         self.send(UiCommand::Config);
         self.send(UiCommand::Diagnostics);
+        self.refresh_transfers();
     }
 
+    fn refresh_transfers(&mut self) {
+        if self.transfer_refresh_pending {
+            return;
+        }
+        self.transfer_refresh_pending = true;
+        self.last_transfer_refresh = Instant::now();
+        self.send(UiCommand::Transfers);
+    }
+
+    fn dispatch_transfer_refresh(&mut self) {
+        if self.mode == UiMode::Control
+            && self.selected_tab == ControlTab::Transfers
+            && !self.transfer_refresh_pending
+            && self.last_transfer_refresh.elapsed() >= Duration::from_millis(500)
+        {
+            self.refresh_transfers();
+        }
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "event handling keeps each typed IPC result and its UI state transition together"
+    )]
     fn poll_events(&mut self) {
         while let Ok(event) = self.event_rx.try_recv() {
             match event {
@@ -462,6 +517,16 @@ impl ClipSyncApp {
                 UiEvent::Config(result) => match result {
                     Ok(config) => match serde_json::from_slice(&config.redacted_json) {
                         Ok(config) => {
+                            if self.mesh_quota_input.is_empty() {
+                                self.mesh_quota_input =
+                                    config_pointer_u64(&config, "/shared/mesh_quota_bytes")
+                                        .map_or_else(String::new, |value| value.to_string());
+                            }
+                            if self.capture_threshold_input.is_empty() {
+                                self.capture_threshold_input =
+                                    config_pointer_u64(&config, "/shared/capture_threshold_bytes")
+                                        .map_or_else(String::new, |value| value.to_string());
+                            }
                             self.config = Some(config);
                             self.config_error = None;
                         }
@@ -478,6 +543,41 @@ impl ClipSyncApp {
                     }
                     Err(error) => self.diagnostics_error = Some(error),
                 },
+                UiEvent::Transfers(result) => {
+                    self.transfer_refresh_pending = false;
+                    self.last_transfer_refresh = Instant::now();
+                    match result {
+                        Ok(transfers) => {
+                            self.transfers = transfers.transfers;
+                            self.transfers_error = None;
+                        }
+                        Err(error) => self.transfers_error = Some(error),
+                    }
+                }
+                UiEvent::Share(result) => {
+                    self.mutation_pending = false;
+                    match result {
+                        Ok(result) if result.shared => {
+                            self.share_inspection = None;
+                            self.notice = Some(Notice::success(format!(
+                                "{} · transfer {} · content {}",
+                                result.message,
+                                result.transfer_id.as_deref().unwrap_or("unavailable"),
+                                result.content_id.as_deref().unwrap_or("unavailable"),
+                            )));
+                            self.refresh_history();
+                            self.refresh_transfers();
+                        }
+                        Ok(result) if result.confirmation_required => {
+                            self.notice = None;
+                            self.share_inspection = Some(result);
+                        }
+                        Ok(result) => {
+                            self.notice = Some(Notice::error(result.message));
+                        }
+                        Err(error) => self.notice = Some(Notice::error(error)),
+                    }
+                }
                 UiEvent::Mutation { kind, result } => {
                     self.mutation_pending = false;
                     match result {
@@ -487,6 +587,22 @@ impl ClipSyncApp {
                                 self.switcher_state = SwitcherState::Close;
                             } else if kind.refreshes_history() {
                                 self.refresh_history();
+                            }
+                            if kind == MutationKind::TransferCancel {
+                                self.pending_transfer_cancel = None;
+                                self.refresh_transfers();
+                                self.refresh_history();
+                            }
+                            if kind == MutationKind::ForgetDevice {
+                                self.pending_forget_device = None;
+                                self.forget_device_id.clear();
+                                self.send(UiCommand::Peers);
+                            }
+                            if kind == MutationKind::Setting {
+                                self.pending_setting = None;
+                                self.mesh_quota_input.clear();
+                                self.capture_threshold_input.clear();
+                                self.send(UiCommand::Config);
                             }
                         }
                         Ok(_) => {
@@ -508,6 +624,7 @@ impl ClipSyncApp {
         self.peers_error = None;
         self.config_error = None;
         self.diagnostics_error = None;
+        self.transfers_error = None;
         self.send(UiCommand::RetryStatus);
         self.refresh_history();
         if self.mode == UiMode::Control {
@@ -654,6 +771,9 @@ impl ClipSyncApp {
 
                 match self.selected_tab {
                     ControlTab::History => self.history_tab(ui),
+                    ControlTab::Transfers => {
+                        ScrollArea::vertical().show(ui, |ui| self.transfers_tab(ui));
+                    }
                     ControlTab::Peers => {
                         ScrollArea::vertical().show(ui, |ui| self.peers_tab(ui));
                     }
@@ -677,14 +797,58 @@ impl ClipSyncApp {
                 self.selected_history = 0;
                 self.schedule_history_refresh();
             }
-            ui.add_enabled(
-                false,
-                egui::Button::new("Share current clipboard unavailable"),
-            )
-            .on_disabled_hover_text(
-                "The Wayland backend cannot inspect the current offer on demand yet.",
-            );
+            if ui
+                .add_enabled(
+                    !self.mutation_pending,
+                    egui::Button::new("Share current clipboard"),
+                )
+                .clicked()
+            {
+                self.mutation_pending = true;
+                self.notice = None;
+                self.share_inspection = None;
+                self.send(UiCommand::ShareClipboard { confirmed: false });
+            }
         });
+        if let Some(inspection) = self.share_inspection.clone() {
+            Frame::new()
+                .fill(SURFACE)
+                .stroke(Stroke::new(1.0, CYAN))
+                .corner_radius(CornerRadius::same(7))
+                .inner_margin(Margin::same(12))
+                .show(ui, |ui| {
+                    ui.strong("Confirm explicit share");
+                    ui.label(&inspection.message);
+                    ui.label(
+                        RichText::new(format!(
+                            "{} · {}{}",
+                            format_bytes(inspection.logical_size),
+                            inspection.mime_types.join(", "),
+                            if inspection.quota_exempt {
+                                " · quota-exempt"
+                            } else {
+                                ""
+                            }
+                        ))
+                        .color(MUTED),
+                    );
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add_enabled(!self.mutation_pending, egui::Button::new("Confirm share"))
+                            .clicked()
+                        {
+                            self.mutation_pending = true;
+                            self.send(UiCommand::ShareClipboard { confirmed: true });
+                        }
+                        if ui
+                            .add_enabled(!self.mutation_pending, egui::Button::new("Cancel"))
+                            .clicked()
+                        {
+                            self.share_inspection = None;
+                        }
+                    });
+                });
+        }
         ui.label(
             RichText::new(
                 "Items with locally available payloads can be activated. Pins and deletes replicate.",
@@ -843,6 +1007,134 @@ impl ClipSyncApp {
         }
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "transfer rendering keeps progress and confirmed cancellation together"
+    )]
+    fn transfers_tab(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.heading("Transfers");
+            if ui
+                .add_enabled(
+                    !self.transfer_refresh_pending,
+                    egui::Button::new("Refresh progress"),
+                )
+                .clicked()
+            {
+                self.refresh_transfers();
+            }
+        });
+        if let Some(error) = &self.transfers_error {
+            message_panel(ui, error, ERROR);
+            return;
+        }
+        if self.transfers.is_empty() {
+            message_panel(ui, "No transfers", MUTED);
+            return;
+        }
+
+        let mut requested_cancel = None;
+        for transfer in &self.transfers {
+            Frame::new()
+                .fill(SURFACE)
+                .stroke(Stroke::new(1.0, BORDER))
+                .corner_radius(CornerRadius::same(7))
+                .inner_margin(Margin::same(12))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.vertical(|ui| {
+                            ui.monospace(&transfer.transfer_id);
+                            ui.label(
+                                RichText::new(format!(
+                                    "{} · content {} · peer {}",
+                                    transfer.state,
+                                    if transfer.content_id.is_empty() {
+                                        "pending"
+                                    } else {
+                                        &transfer.content_id
+                                    },
+                                    if transfer.peer.is_empty() {
+                                        "unknown"
+                                    } else {
+                                        &transfer.peer
+                                    },
+                                ))
+                                .color(MUTED)
+                                .size(11.0),
+                            );
+                            let per_mille = u16::try_from(
+                                u128::from(transfer.completed_bytes)
+                                    .saturating_mul(1000)
+                                    .checked_div(u128::from(transfer.total_bytes))
+                                    .unwrap_or(0)
+                                    .min(1000),
+                            )
+                            .unwrap_or(1000);
+                            let fraction = f32::from(per_mille) / 1000.0;
+                            ui.add(
+                                egui::ProgressBar::new(fraction)
+                                    .text(format!(
+                                        "{} / {}",
+                                        format_bytes(transfer.completed_bytes),
+                                        format_bytes(transfer.total_bytes)
+                                    ))
+                                    .desired_width(ui.available_width().max(160.0)),
+                            );
+                        });
+                        if !matches!(transfer.state.as_str(), "complete" | "cancelled" | "failed")
+                            && ui
+                                .add_enabled(
+                                    !self.mutation_pending,
+                                    egui::Button::new("Cancel transfer"),
+                                )
+                                .clicked()
+                        {
+                            requested_cancel = Some(transfer.transfer_id.clone());
+                        }
+                    });
+                });
+        }
+        if let Some(transfer_id) = requested_cancel {
+            self.pending_transfer_cancel = Some(transfer_id);
+        }
+        if let Some(transfer_id) = self.pending_transfer_cancel.clone() {
+            Frame::new()
+                .fill(SURFACE)
+                .stroke(Stroke::new(1.0, ERROR))
+                .corner_radius(CornerRadius::same(7))
+                .inner_margin(Margin::same(12))
+                .show(ui, |ui| {
+                    ui.strong("Confirm transfer cancellation");
+                    ui.label(format!(
+                        "Cancel {transfer_id}? Partial local staging will be cleaned and cancellation will replicate."
+                    ));
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add_enabled(
+                                !self.mutation_pending,
+                                egui::Button::new("Confirm cancel"),
+                            )
+                            .clicked()
+                        {
+                            self.mutation_pending = true;
+                            self.notice = None;
+                            self.send(UiCommand::TransferCancel { transfer_id });
+                        }
+                        if ui
+                            .add_enabled(!self.mutation_pending, egui::Button::new("Keep transfer"))
+                            .clicked()
+                        {
+                            self.pending_transfer_cancel = None;
+                        }
+                    });
+                });
+        }
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "peer discovery and remembered-device controls share one compact tab"
+    )]
     fn peers_tab(&mut self, ui: &mut egui::Ui) {
         if let Some(error) = &self.peers_error {
             message_panel(ui, error, ERROR);
@@ -875,65 +1167,229 @@ impl ClipSyncApp {
             peer_row(ui, peer);
         }
         ui.add_space(8.0);
+        ui.heading("Remembered mesh devices");
         ui.label(
             RichText::new(
-                "Device forgetting needs the stable mesh node ID; NetBird hostnames are not identities.",
+                "Forgetting removes a replication identity from history maintenance; it does not revoke the shared mesh secret.",
             )
             .color(MUTED)
             .size(12.0),
         );
+        let mut requested_forget = None;
+        for device in &peers.devices {
+            ui.horizontal(|ui| {
+                let state = if device.local {
+                    "local"
+                } else if device.forgotten {
+                    "forgotten"
+                } else {
+                    "remembered"
+                };
+                ui.monospace(&device.device_id);
+                ui.label(RichText::new(state).color(MUTED));
+                if !device.local
+                    && !device.forgotten
+                    && ui
+                        .add_enabled(!self.mutation_pending, egui::Button::new("Forget"))
+                        .clicked()
+                {
+                    requested_forget = Some(device.device_id.clone());
+                }
+            });
+        }
+        if let Some(device_id) = requested_forget {
+            self.pending_forget_device = Some(device_id);
+        }
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut self.forget_device_id)
+                    .hint_text("Stable device UUID"),
+            );
+            if ui
+                .add_enabled(
+                    !self.forget_device_id.trim().is_empty() && !self.mutation_pending,
+                    egui::Button::new("Review forget"),
+                )
+                .clicked()
+            {
+                self.pending_forget_device = Some(self.forget_device_id.trim().to_owned());
+            }
+        });
+        if let Some(device_id) = self.pending_forget_device.clone() {
+            Frame::new()
+                .fill(SURFACE)
+                .stroke(Stroke::new(1.0, ERROR))
+                .corner_radius(CornerRadius::same(7))
+                .inner_margin(Margin::same(12))
+                .show(ui, |ui| {
+                    ui.strong("Confirm device forget");
+                    ui.label(format!(
+                        "Forget {device_id}? A machine holding the mesh secret can rejoin with a new identity."
+                    ));
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add_enabled(
+                                !self.mutation_pending,
+                                egui::Button::new("Confirm forget"),
+                            )
+                            .clicked()
+                        {
+                            self.mutation_pending = true;
+                            self.notice = None;
+                            self.send(UiCommand::ForgetDevice { device_id });
+                        }
+                        if ui
+                            .add_enabled(!self.mutation_pending, egui::Button::new("Keep device"))
+                            .clicked()
+                        {
+                            self.pending_forget_device = None;
+                        }
+                    });
+                });
+        }
     }
 
-    fn settings_tab(&self, ui: &mut egui::Ui) {
+    #[allow(
+        clippy::too_many_lines,
+        reason = "effective settings and their validated update forms are presented together"
+    )]
+    fn settings_tab(&mut self, ui: &mut egui::Ui) {
         if let Some(error) = &self.config_error {
             message_panel(ui, error, ERROR);
             return;
         }
-        let Some(config) = &self.config else {
+        let Some(config) = self.config.clone() else {
             message_panel(ui, "Loading effective configuration…", MUTED);
             return;
         };
         ui.heading("Effective settings");
         ui.label(
-            RichText::new(
-                "The secret path is redacted. Edit the TOML file and restart the daemon.",
-            )
-            .color(MUTED),
+            RichText::new("Shared values replicate immediately; local secret paths stay redacted.")
+                .color(MUTED),
         );
         ui.add_space(8.0);
         setting_row(
             ui,
             "Mesh quota",
-            config_pointer_u64(config, "/shared/mesh_quota_bytes")
+            config_pointer_u64(&config, "/shared/mesh_quota_bytes")
                 .map_or_else(|| "unavailable".to_owned(), format_bytes),
         );
         setting_row(
             ui,
             "Capture threshold",
-            config_pointer_u64(config, "/shared/capture_threshold_bytes")
+            config_pointer_u64(&config, "/shared/capture_threshold_bytes")
                 .map_or_else(|| "unavailable".to_owned(), format_bytes),
         );
+        ui.horizontal(|ui| {
+            ui.label("Mesh quota bytes");
+            ui.add(egui::TextEdit::singleline(&mut self.mesh_quota_input).desired_width(180.0));
+            if ui
+                .add_enabled(
+                    !self.mutation_pending
+                        && self
+                            .mesh_quota_input
+                            .parse::<u64>()
+                            .is_ok_and(|value| value > 0),
+                    egui::Button::new("Review quota"),
+                )
+                .clicked()
+                && let Ok(value) = self.mesh_quota_input.parse()
+            {
+                self.pending_setting = Some(PendingSetting {
+                    kind: SharedSettingKind::MeshQuotaBytes,
+                    value,
+                });
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("Capture threshold bytes");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.capture_threshold_input).desired_width(180.0),
+            );
+            if ui
+                .add_enabled(
+                    !self.mutation_pending
+                        && self
+                            .capture_threshold_input
+                            .parse::<u64>()
+                            .is_ok_and(|value| value > 0),
+                    egui::Button::new("Review threshold"),
+                )
+                .clicked()
+                && let Ok(value) = self.capture_threshold_input.parse()
+            {
+                self.pending_setting = Some(PendingSetting {
+                    kind: SharedSettingKind::CaptureThresholdBytes,
+                    value,
+                });
+            }
+        });
+        if let Some(pending) = self.pending_setting {
+            Frame::new()
+                .fill(SURFACE)
+                .stroke(Stroke::new(
+                    1.0,
+                    if pending.kind == SharedSettingKind::MeshQuotaBytes {
+                        ERROR
+                    } else {
+                        CYAN
+                    },
+                ))
+                .corner_radius(CornerRadius::same(7))
+                .inner_margin(Margin::same(12))
+                .show(ui, |ui| {
+                    let label = pending.label();
+                    ui.strong(format!("Confirm {label} update"));
+                    ui.label(format!(
+                        "Set {label} to {}? This is a replicated mesh-wide setting. Lowering quota may delete unpinned history deterministically.",
+                        format_bytes(pending.value)
+                    ));
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add_enabled(
+                                !self.mutation_pending,
+                                egui::Button::new("Apply setting"),
+                            )
+                            .clicked()
+                        {
+                            self.mutation_pending = true;
+                            self.notice = None;
+                            self.send(UiCommand::UpdateSharedSetting {
+                                setting: pending.kind,
+                                value: pending.value,
+                            });
+                        }
+                        if ui
+                            .add_enabled(!self.mutation_pending, egui::Button::new("Cancel"))
+                            .clicked()
+                        {
+                            self.pending_setting = None;
+                        }
+                    });
+                });
+        }
+        ui.separator();
         setting_row(
             ui,
             "Listen port",
-            config_pointer(config, "/local/listen_port"),
+            config_pointer(&config, "/local/listen_port"),
         );
         setting_row(
             ui,
             "Discovery interval",
-            config_seconds(config, "/local/discovery_interval_seconds"),
+            config_seconds(&config, "/local/discovery_interval_seconds"),
         );
         setting_row(
             ui,
             "Reconciliation interval",
-            config_seconds(config, "/local/reconcile_interval_seconds"),
+            config_seconds(&config, "/local/reconcile_interval_seconds"),
         );
         setting_row(
             ui,
             "Reconnect delay",
             match (
-                config_pointer_u64(config, "/local/reconnect_min_seconds"),
-                config_pointer_u64(config, "/local/reconnect_max_seconds"),
+                config_pointer_u64(&config, "/local/reconnect_min_seconds"),
+                config_pointer_u64(&config, "/local/reconnect_max_seconds"),
             ) {
                 (Some(minimum), Some(maximum)) => format!("{minimum}–{maximum} seconds"),
                 _ => "unavailable".to_owned(),
@@ -942,7 +1398,7 @@ impl ClipSyncApp {
         setting_row(
             ui,
             "NetBird command",
-            config_pointer(config, "/local/netbird_command"),
+            config_pointer(&config, "/local/netbird_command"),
         );
         setting_row(
             ui,
@@ -956,7 +1412,7 @@ impl ClipSyncApp {
                 None => "unavailable".to_owned(),
             },
         );
-        setting_row(ui, "Config", config_pointer(config, "/local/config_path"));
+        setting_row(ui, "Config", config_pointer(&config, "/local/config_path"));
     }
 
     fn diagnostics_tab(&self, ui: &mut egui::Ui) {
@@ -995,6 +1451,7 @@ impl eframe::App for ClipSyncApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.poll_events();
         self.dispatch_pending_history_refresh();
+        self.dispatch_transfer_refresh();
         match self.mode {
             UiMode::Switcher => self.switcher(ui),
             UiMode::Control => self.control(ui),
@@ -1005,14 +1462,16 @@ impl eframe::App for ClipSyncApp {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ControlTab {
     History,
+    Transfers,
     Peers,
     Settings,
     Diagnostics,
 }
 
 impl ControlTab {
-    const ALL: [Self; 4] = [
+    const ALL: [Self; 5] = [
         Self::History,
+        Self::Transfers,
         Self::Peers,
         Self::Settings,
         Self::Diagnostics,
@@ -1021,6 +1480,7 @@ impl ControlTab {
     const fn label(self) -> &'static str {
         match self {
             Self::History => "History",
+            Self::Transfers => "Transfers",
             Self::Peers => "Peers",
             Self::Settings => "Settings",
             Self::Diagnostics => "Diagnostics",
@@ -1040,11 +1500,30 @@ enum MutationKind {
     ActivateSwitcher,
     Pin,
     Delete,
+    TransferCancel,
+    ForgetDevice,
+    Setting,
 }
 
 impl MutationKind {
     const fn refreshes_history(self) -> bool {
         matches!(self, Self::Activate | Self::Pin | Self::Delete)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct PendingSetting {
+    kind: SharedSettingKind,
+    value: u64,
+}
+
+impl PendingSetting {
+    const fn label(self) -> &'static str {
+        match self.kind {
+            SharedSettingKind::MeshQuotaBytes => "mesh quota",
+            SharedSettingKind::CaptureThresholdBytes => "capture threshold",
+            SharedSettingKind::Unspecified => "shared setting",
+        }
     }
 }
 
@@ -1058,6 +1537,20 @@ enum UiCommand {
     Peers,
     Config,
     Diagnostics,
+    Transfers,
+    ShareClipboard {
+        confirmed: bool,
+    },
+    TransferCancel {
+        transfer_id: String,
+    },
+    ForgetDevice {
+        device_id: String,
+    },
+    UpdateSharedSetting {
+        setting: SharedSettingKind,
+        value: u64,
+    },
     Activate {
         content_id: String,
         kind: MutationKind,
@@ -1078,6 +1571,8 @@ enum UiEvent {
     Peers(Result<PeersResponse, String>),
     Config(Result<ConfigResponse, String>),
     Diagnostics(Result<DiagnosticsResponse, String>),
+    Transfers(Result<TransfersResponse, String>),
+    Share(Result<ShareClipboardResponse, String>),
     Mutation {
         kind: MutationKind,
         result: Result<MutationResponse, String>,
@@ -1192,6 +1687,29 @@ impl UiCommand {
                 request::Body::Diagnostics(DiagnosticsRequest {}),
                 EventTarget::Diagnostics,
             ),
+            Self::Transfers => (
+                request::Body::Transfers(TransfersRequest {}),
+                EventTarget::Transfers,
+            ),
+            Self::ShareClipboard { confirmed } => (
+                request::Body::ShareClipboard(ShareClipboardRequest { confirmed }),
+                EventTarget::Share,
+            ),
+            Self::TransferCancel { transfer_id } => (
+                request::Body::TransferCancel(TransferCancelRequest { transfer_id }),
+                EventTarget::Mutation(MutationKind::TransferCancel),
+            ),
+            Self::ForgetDevice { device_id } => (
+                request::Body::ForgetDevice(ForgetDeviceRequest { device_id }),
+                EventTarget::Mutation(MutationKind::ForgetDevice),
+            ),
+            Self::UpdateSharedSetting { setting, value } => (
+                request::Body::SharedSettingUpdate(SharedSettingUpdateRequest {
+                    setting: setting as i32,
+                    value,
+                }),
+                EventTarget::Mutation(MutationKind::Setting),
+            ),
             Self::Activate { content_id, kind } => (
                 request::Body::Activate(ActivateRequest { content_id }),
                 EventTarget::Mutation(kind),
@@ -1217,6 +1735,8 @@ enum EventTarget {
     Peers,
     Config,
     Diagnostics,
+    Transfers,
+    Share,
     Mutation(MutationKind),
 }
 
@@ -1231,6 +1751,8 @@ impl EventTarget {
             Self::Peers => UiEvent::Peers(expect_peers(result)),
             Self::Config => UiEvent::Config(expect_config(result)),
             Self::Diagnostics => UiEvent::Diagnostics(expect_diagnostics(result)),
+            Self::Transfers => UiEvent::Transfers(expect_transfers(result)),
+            Self::Share => UiEvent::Share(expect_share(result)),
             Self::Mutation(kind) => UiEvent::Mutation {
                 kind,
                 result: expect_mutation(result),
@@ -1351,6 +1873,20 @@ fn expect_diagnostics(result: Result<Response, String>) -> Result<DiagnosticsRes
     match response_error(result?)? {
         response::Body::Diagnostics(value) => Ok(value),
         _ => Err("daemon returned an unexpected diagnostics response".to_owned()),
+    }
+}
+
+fn expect_transfers(result: Result<Response, String>) -> Result<TransfersResponse, String> {
+    match response_error(result?)? {
+        response::Body::Transfers(value) => Ok(value),
+        _ => Err("daemon returned an unexpected transfers response".to_owned()),
+    }
+}
+
+fn expect_share(result: Result<Response, String>) -> Result<ShareClipboardResponse, String> {
+    match response_error(result?)? {
+        response::Body::ShareClipboard(value) => Ok(value),
+        _ => Err("daemon returned an unexpected clipboard-share response".to_owned()),
     }
 }
 

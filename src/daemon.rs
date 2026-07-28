@@ -14,11 +14,16 @@ use crate::{
     crypto::MeshSecret,
     discovery::{NetbirdDiscovery, PeerDiscovery},
     envelope::{StateKeys, StoreLock},
-    ipc::{self, DaemonCommand, DaemonState, protocol::HistoryItem},
+    ipc::{
+        self, DaemonCommand, DaemonState,
+        protocol::{
+            DeviceItem, HistoryItem, ShareClipboardResponse, SharedSettingKind, TransferItem,
+        },
+    },
     mesh::{
         MeshChunkCommand, MeshHandle, MeshRuntime, MeshRuntimeConfig, PersistBatch, PersistResult,
     },
-    model::{Operation, Payload, Representation, SharedSetting, StampedOperation},
+    model::{NodeId, Operation, Payload, Representation, SharedSetting, StampedOperation},
     payload::{
         ChunkStore, ChunkStoreConfig, ExplicitShareInspection, ExplicitSharePolicy,
         FileSnapshotLimits, Materializer, MaterializerConfig, parse_file_uri_list,
@@ -378,6 +383,7 @@ pub async fn run(paths: AppPaths, mut config: Config) -> anyhow::Result<()> {
         command_tx,
     );
     state.set_history(history_items(history.replica())).await;
+    state.set_devices(device_items(&history)).await;
     let shutdown = CancellationToken::new();
     let mut mesh_config = MeshRuntimeConfig::new(
         history.replica().node_id(),
@@ -493,8 +499,9 @@ pub async fn run(paths: AppPaths, mut config: Config) -> anyhow::Result<()> {
                         &state,
                         &mesh_handle,
                         &mut transfers,
-                        &content_key,
-                        config.local.maximum_explicit_share_bytes,
+                        content_key,
+                        &paths.config,
+                        &mut config,
                         &mut active_materialization,
                         &mut pending_materialization_cleanup,
                         &materialization_root,
@@ -532,7 +539,7 @@ pub async fn run(paths: AppPaths, mut config: Config) -> anyhow::Result<()> {
                     let mut context = MeshPersistenceContext {
                         history: &mut history,
                         state: &state,
-                        content_key: &content_key,
+                        content_key,
                         clipboard: &clipboard,
                         mesh: &mesh_handle,
                         config_path: &paths.config,
@@ -588,7 +595,11 @@ pub async fn run(paths: AppPaths, mut config: Config) -> anyhow::Result<()> {
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "the single-owner daemon dispatcher keeps command replies next to their mutations"
+)]
 async fn handle_daemon_command(
     command: DaemonCommand,
     clipboard: &WaylandBackend,
@@ -597,7 +608,8 @@ async fn handle_daemon_command(
     mesh: &MeshHandle,
     transfers: &mut TransferCoordinator,
     content_key: &[u8; 32],
-    maximum_explicit_share_bytes: u64,
+    config_path: &std::path::Path,
+    config: &mut Config,
     active_materialization: &mut Option<crate::payload::ManifestId>,
     pending_cleanup: &mut Option<(crate::payload::ManifestId, CancellationToken)>,
     materialization_root: &std::path::Path,
@@ -612,7 +624,7 @@ async fn handle_daemon_command(
                 mesh,
                 transfers,
                 content_key,
-                maximum_explicit_share_bytes,
+                config.local.maximum_explicit_share_bytes,
             )
             .await;
             let result = result
@@ -663,7 +675,239 @@ async fn handle_daemon_command(
                     .map_err(|error| error.to_string());
             let _ = reply.send(result);
         }
+        DaemonCommand::ShareClipboard { confirmed, reply } => {
+            let result = share_clipboard_command(
+                clipboard,
+                confirmed,
+                content_key,
+                transfers,
+                history,
+                mesh,
+                config.local.maximum_explicit_share_bytes,
+            )
+            .await
+            .map_err(|error| error.to_string());
+            if result.as_ref().is_ok_and(|result| result.shared) {
+                state.set_history(history_items(history.replica())).await;
+            }
+            let _ = reply.send(result);
+        }
+        DaemonCommand::ListTransfers { reply } => {
+            let _ = reply.send(Ok(transfer_items(history, transfers)));
+        }
+        DaemonCommand::CancelTransfer { transfer_id, reply } => {
+            let result = async {
+                let transfer_id = transfer_id.parse().context("transfer ID is invalid")?;
+                cancel_transfer(transfer_id, transfers, history, mesh, unix_time_millis()?).await?;
+                state.set_history(history_items(history.replica())).await;
+                Ok(())
+            }
+            .await
+            .map_err(|error: anyhow::Error| error.to_string());
+            let _ = reply.send(result);
+        }
+        DaemonCommand::ForgetDevice { device_id, reply } => {
+            let result = forget_device(&device_id, history, mesh)
+                .await
+                .map_err(|error| error.to_string());
+            if result.is_ok() {
+                state.set_devices(device_items(history)).await;
+            }
+            let _ = reply.send(result);
+        }
+        DaemonCommand::UpdateSharedSetting {
+            setting,
+            value,
+            reply,
+        } => {
+            let result = update_shared_setting(
+                setting,
+                value,
+                history,
+                clipboard,
+                transfers,
+                mesh,
+                config_path,
+                config,
+            )
+            .await
+            .map_err(|error| error.to_string());
+            if result.is_ok() {
+                state.set_config(config.clone()).await;
+                state.set_history(history_items(history.replica())).await;
+            }
+            let _ = reply.send(result);
+        }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn share_clipboard_command(
+    clipboard: &impl ClipboardBackend,
+    confirmed: bool,
+    content_key: &[u8; 32],
+    transfers: &mut TransferCoordinator,
+    history: &mut HistoryStore,
+    mesh: &MeshHandle,
+    maximum_explicit_share_bytes: u64,
+) -> anyhow::Result<ShareClipboardResponse> {
+    let inspection =
+        inspect_live_current_clipboard(clipboard, transfers, maximum_explicit_share_bytes).await?;
+    let logical_size = inspection.policy.logical_size();
+    let mime_types = inspection
+        .current
+        .mime_list()
+        .types()
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    if inspection.policy.confirmation_required() && !confirmed {
+        return Ok(ShareClipboardResponse {
+            shared: false,
+            confirmation_required: true,
+            logical_size,
+            mime_types,
+            quota_exempt: inspection.policy.quota_exempt(),
+            transfer_id: None,
+            content_id: None,
+            message: format!(
+                "sharing {} requires confirmation; repeat with --confirm",
+                inspection.policy.human_size()
+            ),
+        });
+    }
+
+    let result = share_live_current_clipboard(
+        clipboard,
+        &inspection,
+        confirmed,
+        content_key,
+        transfers,
+        history,
+        mesh,
+        unix_time_millis()?,
+        &CancellationToken::new(),
+    )
+    .await?;
+    Ok(ShareClipboardResponse {
+        shared: true,
+        confirmation_required: inspection.policy.confirmation_required(),
+        logical_size,
+        mime_types,
+        quota_exempt: inspection.policy.quota_exempt(),
+        transfer_id: Some(result.transfer_id.to_string()),
+        content_id: Some(result.content_id.to_string()),
+        message: "clipboard shared".to_owned(),
+    })
+}
+
+fn transfer_items(history: &HistoryStore, transfers: &TransferCoordinator) -> Vec<TransferItem> {
+    let projection = history.projection();
+    transfers
+        .progress()
+        .into_iter()
+        .map(|progress| {
+            let view = projection.transfer(progress.transfer_id);
+            TransferItem {
+                transfer_id: progress.transfer_id.to_string(),
+                content_id: view
+                    .and_then(crate::model::TransferView::content_id)
+                    .map_or_else(String::new, |content_id| content_id.to_string()),
+                peer: view
+                    .and_then(crate::model::TransferView::source_node)
+                    .map_or_else(String::new, |node_id| node_id.to_string()),
+                state: format!("{:?}", progress.phase).to_lowercase(),
+                completed_bytes: progress.verified_bytes,
+                total_bytes: progress.logical_size,
+            }
+        })
+        .collect()
+}
+
+async fn forget_device(
+    encoded_node_id: &str,
+    history: &mut HistoryStore,
+    mesh: &MeshHandle,
+) -> anyhow::Result<()> {
+    let node_id: NodeId = encoded_node_id.parse().context("device ID is invalid")?;
+    let acknowledgements = history
+        .acknowledgements()
+        .context("load durable mesh membership")?;
+    let known = history
+        .projection()
+        .known_members()
+        .chain(acknowledgements.known_members())
+        .any(|member| member == node_id);
+    anyhow::ensure!(known, "device is not a known mesh member");
+    anyhow::ensure!(
+        !history.projection().is_device_forgotten(node_id),
+        "device is already forgotten"
+    );
+    let operation = history
+        .forget_device(node_id, unix_time_millis()?)
+        .context("persist device-forget operation")?;
+    mesh.record_local(&operation)
+        .await
+        .context("publish device-forget operation")?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn update_shared_setting(
+    setting: SharedSettingKind,
+    value: u64,
+    history: &mut HistoryStore,
+    clipboard: &WaylandBackend,
+    transfers: &mut TransferCoordinator,
+    mesh: &MeshHandle,
+    config_path: &std::path::Path,
+    config: &mut Config,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(value > 0, "shared setting value must be greater than zero");
+    if setting == SharedSettingKind::CaptureThresholdBytes {
+        anyhow::ensure!(
+            value <= config.local.maximum_explicit_share_bytes,
+            "capture threshold exceeds the local explicit-share hard limit"
+        );
+    }
+
+    let now = unix_time_millis()?;
+    let operations = match setting {
+        SharedSettingKind::MeshQuotaBytes => history
+            .set_mesh_quota_and_enforce(value, now)
+            .context("persist mesh quota and deterministic evictions")?,
+        SharedSettingKind::CaptureThresholdBytes => vec![
+            history
+                .set_shared_setting(SharedSetting::CaptureThresholdBytes, value, now)
+                .context("persist shared capture threshold")?,
+        ],
+        SharedSettingKind::Unspecified => anyhow::bail!("shared setting is missing"),
+    };
+    for operation in &operations {
+        mesh.record_local(operation)
+            .await
+            .context("publish shared setting operation")?;
+    }
+
+    let effective = history.projection().effective_shared_settings();
+    clipboard
+        .set_capture_threshold(effective.capture_threshold_bytes)
+        .context("apply shared capture threshold")?;
+    transfers
+        .update_policy(ExplicitSharePolicy {
+            automatic_capture_threshold_bytes: effective.capture_threshold_bytes,
+            mesh_quota_bytes: effective.mesh_quota_bytes,
+            maximum_explicit_share_bytes: config.local.maximum_explicit_share_bytes,
+            free_space_reserve_bytes: config.local.transfer_free_space_reserve_bytes,
+        })
+        .context("apply shared transfer policy")?;
+    *config = Config::rewrite_shared(
+        config_path,
+        effective,
+        history.projection().shared_settings_revision(),
+    )
+    .context("atomically mirror shared settings to config")?;
+    Ok(())
 }
 
 #[derive(Clone, Copy)]
@@ -846,6 +1090,27 @@ fn history_items(replica: &Replica) -> Vec<HistoryItem> {
         .collect()
 }
 
+fn device_items(history: &HistoryStore) -> Vec<DeviceItem> {
+    let local = history.replica().node_id();
+    let mut members = history
+        .projection()
+        .known_members()
+        .chain(history.projection().forgotten_devices())
+        .collect::<std::collections::BTreeSet<_>>();
+    if let Ok(acknowledgements) = history.acknowledgements() {
+        members.extend(acknowledgements.known_members());
+    }
+    members.insert(local);
+    members
+        .into_iter()
+        .map(|node_id| DeviceItem {
+            device_id: node_id.to_string(),
+            local: node_id == local,
+            forgotten: history.projection().is_device_forgotten(node_id),
+        })
+        .collect()
+}
+
 fn history_preview(payload: &Payload) -> String {
     if let Some(text) = payload
         .representations()
@@ -940,6 +1205,11 @@ async fn handle_mesh_batch(batch: PersistBatch, context: &mut MeshPersistenceCon
             .state
             .set_history(history_items(context.history.replica()))
             .await;
+        context
+            .state
+            .set_devices(device_items(context.history))
+            .await;
+        context.state.set_config(context.config.clone()).await;
         context.mesh.notify_transfers();
     }
     batch.complete(result.map_err(|error| error.to_string()));
@@ -981,6 +1251,10 @@ fn handle_mesh_chunk_command(
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "remote persistence, policy application, and config mirroring form one transaction boundary"
+)]
 async fn persist_mesh_batch(
     batch: &PersistBatch,
     context: &mut MeshPersistenceContext<'_>,
@@ -1074,6 +1348,11 @@ async fn persist_mesh_batch(
         match Config::rewrite_shared(context.config_path, after, revision) {
             Ok(config) => *context.config = config,
             Err(error) => {
+                context.config.shared = SharedConfig {
+                    mesh_quota_bytes: after.mesh_quota_bytes,
+                    capture_threshold_bytes: after.capture_threshold_bytes,
+                    revision: context.history.projection().shared_settings_revision(),
+                };
                 tracing::warn!(
                     %error,
                     "durable replicated settings could not be mirrored to config"
@@ -1161,6 +1440,10 @@ fn initialize_shared_settings(
     Ok(())
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "config reload updates every daemon-owned policy surface atomically"
+)]
 async fn apply_config_reload(
     mut changed: Config,
     config_path: &std::path::Path,
@@ -1183,6 +1466,7 @@ async fn apply_config_reload(
             })
             .context("apply reloaded explicit-share policy")?;
         *current = changed;
+        state.set_config(current.clone()).await;
         return Ok(());
     }
 
@@ -1234,6 +1518,7 @@ async fn apply_config_reload(
         .save(config_path)
         .context("atomically save config-authored shared settings")?;
     *current = changed;
+    state.set_config(current.clone()).await;
     state.set_history(history_items(history.replica())).await;
     Ok(())
 }
@@ -1328,6 +1613,337 @@ async fn shutdown_signal() -> std::io::Result<()> {
 
     #[cfg(not(unix))]
     tokio::signal::ctrl_c().await
+}
+
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+mod tests {
+    use std::{collections::BTreeSet, net::UdpSocket};
+
+    use async_trait::async_trait;
+
+    use super::*;
+    use crate::{
+        clipboard::{
+            backend::BackendError,
+            types::{FeedbackMarker, Generation, OfferMimeList, ProbeResult},
+        },
+        mesh::MeshRuntimeConfig,
+        payload::{ChunkStoreKey, MaterializerConfig},
+        storage::StorageKey,
+        transport::Psk,
+    };
+
+    const STORAGE_KEY: [u8; 32] = [0x31; 32];
+    const CHUNK_KEY: [u8; 32] = [0x42; 32];
+    const CONTENT_KEY: [u8; 32] = [0x53; 32];
+    const PSK: [u8; 32] = [0x64; 32];
+
+    #[derive(Clone)]
+    struct TestClipboard {
+        inspection: CurrentClipboardInspection,
+        content: ClipboardContent,
+    }
+
+    #[async_trait]
+    impl ClipboardBackend for TestClipboard {
+        async fn probe(&self) -> Result<ProbeResult, BackendError> {
+            Err(BackendError::NoDisplay)
+        }
+
+        async fn watch(
+            &self,
+            _shutdown: CancellationToken,
+            _on_event: Box<dyn Fn(ClipboardEvent) + Send + Sync>,
+        ) -> Result<(), BackendError> {
+            Err(BackendError::NoDisplay)
+        }
+
+        async fn set_clipboard_content(
+            &self,
+            _content: ClipboardContent,
+        ) -> Result<FeedbackMarker, BackendError> {
+            Err(BackendError::WatchNotRunning)
+        }
+
+        async fn inspect_current_clipboard(
+            &self,
+            _maximum_bytes: u64,
+        ) -> Result<CurrentClipboardInspection, BackendError> {
+            Ok(self.inspection.clone())
+        }
+
+        async fn capture_current_clipboard(
+            &self,
+            inspection: &CurrentClipboardInspection,
+        ) -> Result<ClipboardContent, BackendError> {
+            if inspection.generation() != self.inspection.generation() {
+                return Err(BackendError::CurrentOfferChanged);
+            }
+            Ok(self.content.clone())
+        }
+    }
+
+    fn clipboard(bytes: &[u8]) -> TestClipboard {
+        let mime = MimeType::new("text/plain").unwrap();
+        let content = ClipboardContent::new_with_max(
+            vec![ClipboardRepresentation::new(mime.clone(), bytes.to_vec())],
+            u64::MAX,
+        )
+        .unwrap();
+        let inspection = CurrentClipboardInspection::new(
+            Generation::from_value(7),
+            OfferMimeList::new(vec![mime]).unwrap(),
+            u64::try_from(bytes.len()).unwrap(),
+        );
+        TestClipboard {
+            inspection,
+            content,
+        }
+    }
+
+    fn open_state(
+        root: &std::path::Path,
+        threshold: u64,
+        quota: u64,
+    ) -> (HistoryStore, TransferCoordinator) {
+        let history = HistoryStore::open(
+            root.join("history.db"),
+            &StorageKey::from_bytes(STORAGE_KEY),
+        )
+        .unwrap();
+        let store = ChunkStore::open(
+            root.join("chunks"),
+            &ChunkStoreKey::from_bytes(CHUNK_KEY),
+            ChunkStoreConfig {
+                chunk_bytes: 64 * 1024,
+                max_payload_bytes: 1024 * 1024,
+                max_chunks_per_manifest: 1024,
+            },
+        )
+        .unwrap();
+        let materializer =
+            Materializer::new(root.join("materialized"), MaterializerConfig::default()).unwrap();
+        let transfers = TransferCoordinator::new(
+            store,
+            materializer,
+            ExplicitSharePolicy {
+                automatic_capture_threshold_bytes: threshold,
+                mesh_quota_bytes: quota,
+                maximum_explicit_share_bytes: 1024 * 1024,
+                free_space_reserve_bytes: 0,
+            },
+            TransferStateLimits::default(),
+        );
+        (history, transfers)
+    }
+
+    fn spawn_mesh(node_id: NodeId) -> (MeshRuntime, MeshHandle, CancellationToken) {
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = socket.local_addr().unwrap().port();
+        drop(socket);
+        let shutdown = CancellationToken::new();
+        let config = MeshRuntimeConfig::new(node_id, "test-node".to_owned(), port);
+        let (runtime, _persist, _chunks) = MeshRuntime::spawn_with_transfers(
+            config,
+            Psk::new(&PSK).unwrap(),
+            &[],
+            shutdown.clone(),
+        )
+        .unwrap();
+        let mesh = runtime.handle();
+        (runtime, mesh, shutdown)
+    }
+
+    #[tokio::test]
+    async fn share_command_inspects_then_requires_confirmation_and_returns_ids() {
+        let temporary = tempfile::tempdir().unwrap();
+        let (mut history, mut transfers) = open_state(temporary.path(), 4, 1024);
+        let (runtime, mesh, shutdown) = spawn_mesh(history.replica().node_id());
+        let clipboard = clipboard(b"explicit payload");
+
+        let inspection = share_clipboard_command(
+            &clipboard,
+            false,
+            &CONTENT_KEY,
+            &mut transfers,
+            &mut history,
+            &mesh,
+            1024 * 1024,
+        )
+        .await
+        .unwrap();
+        assert!(!inspection.shared);
+        assert!(inspection.confirmation_required);
+        assert!(transfers.progress().is_empty());
+
+        let shared = share_clipboard_command(
+            &clipboard,
+            true,
+            &CONTENT_KEY,
+            &mut transfers,
+            &mut history,
+            &mesh,
+            1024 * 1024,
+        )
+        .await
+        .unwrap();
+        assert!(shared.shared);
+        assert!(shared.transfer_id.is_some());
+        assert!(shared.content_id.is_some());
+        assert_eq!(transfers.progress().len(), 1);
+        assert_eq!(history.projection().transfers().len(), 1);
+
+        shutdown.cancel();
+        runtime.wait().await;
+    }
+
+    #[tokio::test]
+    async fn transfer_cancel_mutates_history_and_coordinator() {
+        let temporary = tempfile::tempdir().unwrap();
+        let (mut history, mut transfers) = open_state(temporary.path(), 1024, 4096);
+        let (runtime, mesh, shutdown) = spawn_mesh(history.replica().node_id());
+        let payload = Payload::new(
+            &CONTENT_KEY,
+            vec![Representation::new("text/plain", b"pending".to_vec())],
+        )
+        .unwrap();
+        let available = fs2::available_space(transfers.store().root()).unwrap();
+        let inspection = transfers.inspect_payload(&payload, available).unwrap();
+        let (transfer_id, begin) = transfers
+            .begin_payload_share(
+                &payload,
+                inspection,
+                false,
+                &mut history,
+                10,
+                &CancellationToken::new(),
+            )
+            .unwrap();
+        mesh.record_local(&begin).await.unwrap();
+        let listed = transfer_items(&history, &transfers);
+        assert_eq!(listed[0].transfer_id, transfer_id.to_string());
+        assert_eq!(
+            listed[0].content_id,
+            payload.descriptor().content_id().to_string()
+        );
+        assert_eq!(listed[0].peer, history.replica().node_id().to_string());
+        assert_eq!(listed[0].total_bytes, 7);
+
+        cancel_transfer(transfer_id, &mut transfers, &mut history, &mesh, 11)
+            .await
+            .unwrap();
+        assert_eq!(
+            history.projection().transfer(transfer_id).unwrap().phase(),
+            crate::transfer::TransferPhase::Cancelled
+        );
+        assert_eq!(
+            transfers.progress()[0].phase,
+            crate::transfer::TransferPhase::Cancelled
+        );
+
+        shutdown.cancel();
+        runtime.wait().await;
+    }
+
+    #[tokio::test]
+    async fn forget_device_persists_and_publishes_known_member_rejection() {
+        let temporary = tempfile::tempdir().unwrap();
+        let (mut history, _transfers) = open_state(temporary.path(), 1024, 4096);
+        let remote = NodeId::new();
+        history
+            .ingest_authenticated_batch(
+                remote,
+                &crate::model::SeenOps::default(),
+                &BTreeSet::from([remote]),
+                &[],
+                1,
+            )
+            .unwrap();
+        let (runtime, mesh, shutdown) = spawn_mesh(history.replica().node_id());
+
+        forget_device(&remote.to_string(), &mut history, &mesh)
+            .await
+            .unwrap();
+        assert!(history.projection().is_device_forgotten(remote));
+        assert!(
+            device_items(&history)
+                .iter()
+                .any(|device| device.device_id == remote.to_string() && device.forgotten)
+        );
+
+        shutdown.cancel();
+        runtime.wait().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn setting_update_replicates_enforces_quota_and_preserves_config_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let (mut history, mut transfers) = open_state(temporary.path(), 1024, 4096);
+        let payload = Payload::new(
+            &CONTENT_KEY,
+            vec![Representation::new("text/plain", vec![7; 64])],
+        )
+        .unwrap();
+        history.copy_and_enforce(payload, 1).unwrap();
+        let target = temporary.path().join("managed.toml");
+        let link = temporary.path().join("config.toml");
+        let mut config = Config::default();
+        config.local.maximum_explicit_share_bytes = 32 * 1024 * 1024;
+        config.local.transfer_free_space_reserve_bytes = 0;
+        config.save(&target).unwrap();
+        symlink("managed.toml", &link).unwrap();
+        let clipboard = WaylandBackend::new();
+        let (runtime, mesh, shutdown) = spawn_mesh(history.replica().node_id());
+
+        update_shared_setting(
+            SharedSettingKind::MeshQuotaBytes,
+            1,
+            &mut history,
+            &clipboard,
+            &mut transfers,
+            &mesh,
+            &link,
+            &mut config,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            history
+                .projection()
+                .effective_shared_settings()
+                .mesh_quota_bytes,
+            1
+        );
+        assert!(history.projection().visible_items().is_empty());
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(Config::load(&target).unwrap().shared.mesh_quota_bytes, 1);
+
+        update_shared_setting(
+            SharedSettingKind::CaptureThresholdBytes,
+            512,
+            &mut history,
+            &clipboard,
+            &mut transfers,
+            &mesh,
+            &link,
+            &mut config,
+        )
+        .await
+        .unwrap();
+        assert_eq!(config.shared.capture_threshold_bytes, 512);
+
+        shutdown.cancel();
+        runtime.wait().await;
+    }
 }
 
 #[cfg(unix)]

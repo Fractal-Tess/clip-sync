@@ -1,6 +1,6 @@
 use prost::{Enumeration, Message, Oneof};
 
-pub const IPC_PROTOCOL_VERSION: u32 = 2;
+pub const IPC_PROTOCOL_VERSION: u32 = 3;
 
 #[derive(Clone, PartialEq, Message)]
 pub struct Request {
@@ -10,7 +10,7 @@ pub struct Request {
     pub request_id: u64,
     #[prost(
         oneof = "request::Body",
-        tags = "10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20"
+        tags = "10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21"
     )]
     pub body: Option<request::Body>,
 }
@@ -18,8 +18,8 @@ pub struct Request {
 pub mod request {
     use super::{
         ActivateRequest, ConfigRequest, DiagnosticsRequest, ForgetDeviceRequest, HistoryRequest,
-        HistoryUpdateRequest, Oneof, PeersRequest, ShareClipboardRequest, StatusRequest,
-        TransferCancelRequest, TransfersRequest,
+        HistoryUpdateRequest, Oneof, PeersRequest, ShareClipboardRequest,
+        SharedSettingUpdateRequest, StatusRequest, TransferCancelRequest, TransfersRequest,
     };
 
     #[derive(Clone, PartialEq, Oneof)]
@@ -46,6 +46,8 @@ pub mod request {
         TransferCancel(TransferCancelRequest),
         #[prost(message, tag = "20")]
         ForgetDevice(ForgetDeviceRequest),
+        #[prost(message, tag = "21")]
+        SharedSettingUpdate(SharedSettingUpdateRequest),
     }
 }
 
@@ -62,7 +64,10 @@ pub struct PeersRequest {}
 pub struct DiagnosticsRequest {}
 
 #[derive(Clone, Copy, PartialEq, Eq, Message)]
-pub struct ShareClipboardRequest {}
+pub struct ShareClipboardRequest {
+    #[prost(bool, tag = "1")]
+    pub confirmed: bool,
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Message)]
 pub struct TransfersRequest {}
@@ -110,20 +115,36 @@ pub struct ForgetDeviceRequest {
     pub device_id: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Enumeration)]
+#[repr(i32)]
+pub enum SharedSettingKind {
+    Unspecified = 0,
+    MeshQuotaBytes = 1,
+    CaptureThresholdBytes = 2,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Message)]
+pub struct SharedSettingUpdateRequest {
+    #[prost(enumeration = "SharedSettingKind", tag = "1")]
+    pub setting: i32,
+    #[prost(uint64, tag = "2")]
+    pub value: u64,
+}
+
 #[derive(Clone, PartialEq, Message)]
 pub struct Response {
     #[prost(uint32, tag = "1")]
     pub protocol_version: u32,
     #[prost(uint64, tag = "2")]
     pub request_id: u64,
-    #[prost(oneof = "response::Body", tags = "10, 11, 12, 13, 14, 15, 16, 17")]
+    #[prost(oneof = "response::Body", tags = "10, 11, 12, 13, 14, 15, 16, 17, 18")]
     pub body: Option<response::Body>,
 }
 
 pub mod response {
     use super::{
         ConfigResponse, DiagnosticsResponse, ErrorResponse, HistoryResponse, MutationResponse,
-        Oneof, PeersResponse, StatusResponse, TransfersResponse,
+        Oneof, PeersResponse, ShareClipboardResponse, StatusResponse, TransfersResponse,
     };
 
     #[derive(Clone, PartialEq, Oneof)]
@@ -144,6 +165,8 @@ pub mod response {
         Diagnostics(DiagnosticsResponse),
         #[prost(message, tag = "17")]
         Transfers(TransfersResponse),
+        #[prost(message, tag = "18")]
+        ShareClipboard(ShareClipboardResponse),
     }
 }
 
@@ -203,6 +226,26 @@ pub struct MutationResponse {
     pub resource_id: Option<String>,
 }
 
+#[derive(Clone, PartialEq, Eq, Message)]
+pub struct ShareClipboardResponse {
+    #[prost(bool, tag = "1")]
+    pub shared: bool,
+    #[prost(bool, tag = "2")]
+    pub confirmation_required: bool,
+    #[prost(uint64, tag = "3")]
+    pub logical_size: u64,
+    #[prost(string, repeated, tag = "4")]
+    pub mime_types: Vec<String>,
+    #[prost(bool, tag = "5")]
+    pub quota_exempt: bool,
+    #[prost(string, optional, tag = "6")]
+    pub transfer_id: Option<String>,
+    #[prost(string, optional, tag = "7")]
+    pub content_id: Option<String>,
+    #[prost(string, tag = "8")]
+    pub message: String,
+}
+
 #[derive(Clone, PartialEq, Message)]
 pub struct PeersResponse {
     #[prost(string, tag = "1")]
@@ -213,6 +256,18 @@ pub struct PeersResponse {
     pub peers: Vec<PeerItem>,
     #[prost(string, optional, tag = "4")]
     pub discovery_error: Option<String>,
+    #[prost(message, repeated, tag = "5")]
+    pub devices: Vec<DeviceItem>,
+}
+
+#[derive(Clone, PartialEq, Eq, Message)]
+pub struct DeviceItem {
+    #[prost(string, tag = "1")]
+    pub device_id: String,
+    #[prost(bool, tag = "2")]
+    pub local: bool,
+    #[prost(bool, tag = "3")]
+    pub forgotten: bool,
 }
 
 #[derive(Clone, PartialEq, Eq, Message)]

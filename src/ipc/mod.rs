@@ -29,15 +29,17 @@ use crate::{
     config::Config,
     discovery::DiscoverySnapshot,
     ipc::protocol::{
-        ConfigResponse, DiagnosticCheck, DiagnosticsResponse, ErrorResponse, HistoryItem,
-        HistoryResponse, HistoryUpdateAction, IPC_PROTOCOL_VERSION, MutationResponse, PeerItem,
-        PeersResponse, Request, Response, StatusResponse, request, response,
+        ConfigResponse, DeviceItem, DiagnosticCheck, DiagnosticsResponse, ErrorResponse,
+        HistoryItem, HistoryResponse, HistoryUpdateAction, IPC_PROTOCOL_VERSION, MutationResponse,
+        PeerItem, PeersResponse, Request, Response, ShareClipboardResponse, SharedSettingKind,
+        StatusResponse, TransferItem, TransfersResponse, request, response,
     },
 };
 
 const MAX_IPC_FRAME_BYTES: usize = 1024 * 1024;
 const MAX_IPC_CONNECTIONS: usize = 32;
 const IPC_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+const IPC_SHARE_REQUEST_TIMEOUT: Duration = Duration::from_mins(30);
 
 pub struct DaemonInstance {
     _lock: File,
@@ -80,11 +82,12 @@ struct DaemonStateInner {
     started: Instant,
     hostname: String,
     config_path: PathBuf,
-    config: Config,
+    config: RwLock<Config>,
     discovery: RwLock<Option<DiscoverySnapshot>>,
     discovery_error: RwLock<Option<String>>,
     clipboard_status: RwLock<DiagnosticStatus>,
     history: RwLock<Vec<HistoryItem>>,
+    devices: RwLock<Vec<DeviceItem>>,
     commands: mpsc::UnboundedSender<DaemonCommand>,
 }
 
@@ -108,6 +111,26 @@ pub enum DaemonCommand {
         content_id: String,
         reply: oneshot::Sender<Result<(), String>>,
     },
+    ShareClipboard {
+        confirmed: bool,
+        reply: oneshot::Sender<Result<ShareClipboardResponse, String>>,
+    },
+    ListTransfers {
+        reply: oneshot::Sender<Result<Vec<TransferItem>, String>>,
+    },
+    CancelTransfer {
+        transfer_id: String,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+    ForgetDevice {
+        device_id: String,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+    UpdateSharedSetting {
+        setting: SharedSettingKind,
+        value: u64,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
 }
 
 impl DaemonState {
@@ -123,7 +146,7 @@ impl DaemonState {
                 started: Instant::now(),
                 hostname,
                 config_path,
-                config,
+                config: RwLock::new(config),
                 discovery: RwLock::new(None),
                 discovery_error: RwLock::new(None),
                 clipboard_status: RwLock::new(DiagnosticStatus {
@@ -131,6 +154,7 @@ impl DaemonState {
                     detail: "clipboard monitoring is starting".to_owned(),
                 }),
                 history: RwLock::new(Vec::new()),
+                devices: RwLock::new(Vec::new()),
                 commands,
             }),
         }
@@ -154,6 +178,14 @@ impl DaemonState {
 
     pub async fn set_history(&self, history: Vec<HistoryItem>) {
         *self.inner.history.write().await = history;
+    }
+
+    pub async fn set_devices(&self, devices: Vec<DeviceItem>) {
+        *self.inner.devices.write().await = devices;
+    }
+
+    pub async fn set_config(&self, config: Config) {
+        *self.inner.config.write().await = config;
     }
 
     #[allow(clippy::too_many_lines)]
@@ -205,33 +237,18 @@ impl DaemonState {
                     local: RedactedLocal<'a>,
                 }
 
+                let config = self.inner.config.read().await;
                 let config_path = self.inner.config_path.to_string_lossy();
                 let redacted = RedactedConfig {
-                    shared: &self.inner.config.shared,
+                    shared: &config.shared,
                     local: RedactedLocal {
-                        listen_port: self.inner.config.local.listen_port,
-                        discovery_interval_seconds: self
-                            .inner
-                            .config
-                            .local
-                            .discovery_interval_seconds,
-                        reconcile_interval_seconds: self
-                            .inner
-                            .config
-                            .local
-                            .reconcile_interval_seconds,
-                        reconnect_min_seconds: self.inner.config.local.reconnect_min_seconds,
-                        reconnect_max_seconds: self.inner.config.local.reconnect_max_seconds,
-                        netbird_command: self
-                            .inner
-                            .config
-                            .local
-                            .netbird_command
-                            .display()
-                            .to_string(),
-                        mesh_key_file_configured: !self
-                            .inner
-                            .config
+                        listen_port: config.local.listen_port,
+                        discovery_interval_seconds: config.local.discovery_interval_seconds,
+                        reconcile_interval_seconds: config.local.reconcile_interval_seconds,
+                        reconnect_min_seconds: config.local.reconnect_min_seconds,
+                        reconnect_max_seconds: config.local.reconnect_max_seconds,
+                        netbird_command: config.local.netbird_command.display().to_string(),
+                        mesh_key_file_configured: !config
                             .local
                             .mesh_key_file
                             .as_os_str()
@@ -339,6 +356,7 @@ impl DaemonState {
                         .map(|snapshot| snapshot.local_address.to_string()),
                     peers,
                     discovery_error,
+                    devices: self.inner.devices.read().await.clone(),
                 })
             }
             Some(request::Body::HistoryUpdate(update)) => {
@@ -454,39 +472,159 @@ impl DaemonState {
                     ],
                 })
             }
-            Some(request::Body::ShareClipboard(_)) => {
-                return error_response(
-                    request_id,
-                    "unsupported",
-                    "explicit sharing is unavailable because this clipboard backend cannot inspect the current offer on demand",
-                );
+            Some(request::Body::ShareClipboard(share)) => {
+                let (reply, result) = oneshot::channel();
+                if self
+                    .inner
+                    .commands
+                    .send(DaemonCommand::ShareClipboard {
+                        confirmed: share.confirmed,
+                        reply,
+                    })
+                    .is_err()
+                {
+                    return command_processor_unavailable(request_id);
+                }
+                match result.await {
+                    Ok(Ok(result)) => response::Body::ShareClipboard(result),
+                    Ok(Err(message)) => {
+                        return error_response(request_id, "share_failed", message);
+                    }
+                    Err(_) => return command_processor_stopped(request_id),
+                }
             }
             Some(request::Body::Transfers(_)) => {
-                return error_response(
-                    request_id,
-                    "unsupported",
-                    "transfer tracking is not available in this daemon build",
-                );
+                let (reply, result) = oneshot::channel();
+                if self
+                    .inner
+                    .commands
+                    .send(DaemonCommand::ListTransfers { reply })
+                    .is_err()
+                {
+                    return command_processor_unavailable(request_id);
+                }
+                match result.await {
+                    Ok(Ok(transfers)) => response::Body::Transfers(TransfersResponse { transfers }),
+                    Ok(Err(message)) => {
+                        return error_response(request_id, "transfer_list_failed", message);
+                    }
+                    Err(_) => return command_processor_stopped(request_id),
+                }
             }
             Some(request::Body::TransferCancel(cancel)) => {
-                return error_response(
-                    request_id,
-                    "unsupported",
-                    format!(
-                        "transfer cancellation is not available in this daemon build (requested {})",
-                        cancel.transfer_id
-                    ),
-                );
+                let transfer_id = cancel.transfer_id;
+                let (reply, result) = oneshot::channel();
+                if self
+                    .inner
+                    .commands
+                    .send(DaemonCommand::CancelTransfer {
+                        transfer_id: transfer_id.clone(),
+                        reply,
+                    })
+                    .is_err()
+                {
+                    return command_processor_unavailable(request_id);
+                }
+                match result.await {
+                    Ok(Ok(())) => response::Body::Mutation(MutationResponse {
+                        ok: true,
+                        message: "transfer cancelled".to_owned(),
+                        resource_id: Some(transfer_id),
+                    }),
+                    Ok(Err(message)) => {
+                        return error_response(request_id, "transfer_cancel_failed", message);
+                    }
+                    Err(_) => return command_processor_stopped(request_id),
+                }
             }
             Some(request::Body::ForgetDevice(forget)) => {
-                return error_response(
-                    request_id,
-                    "unsupported",
-                    format!(
-                        "device forgetting is not exposed by the replica backend in this build (requested {})",
-                        forget.device_id
-                    ),
-                );
+                let device_id = forget.device_id;
+                let (reply, result) = oneshot::channel();
+                if self
+                    .inner
+                    .commands
+                    .send(DaemonCommand::ForgetDevice {
+                        device_id: device_id.clone(),
+                        reply,
+                    })
+                    .is_err()
+                {
+                    return command_processor_unavailable(request_id);
+                }
+                match result.await {
+                    Ok(Ok(())) => response::Body::Mutation(MutationResponse {
+                        ok: true,
+                        message: "device forgotten".to_owned(),
+                        resource_id: Some(device_id),
+                    }),
+                    Ok(Err(message)) => {
+                        return error_response(request_id, "device_forget_failed", message);
+                    }
+                    Err(_) => return command_processor_stopped(request_id),
+                }
+            }
+            Some(request::Body::SharedSettingUpdate(update)) => {
+                let setting = match SharedSettingKind::try_from(update.setting) {
+                    Ok(SharedSettingKind::MeshQuotaBytes) => SharedSettingKind::MeshQuotaBytes,
+                    Ok(SharedSettingKind::CaptureThresholdBytes) => {
+                        SharedSettingKind::CaptureThresholdBytes
+                    }
+                    Ok(SharedSettingKind::Unspecified) | Err(_) => {
+                        return error_response(
+                            request_id,
+                            "invalid_request",
+                            "shared setting is missing or unknown",
+                        );
+                    }
+                };
+                if update.value == 0 {
+                    return error_response(
+                        request_id,
+                        "invalid_request",
+                        "shared setting value must be greater than zero",
+                    );
+                }
+                let (reply, result) = oneshot::channel();
+                if self
+                    .inner
+                    .commands
+                    .send(DaemonCommand::UpdateSharedSetting {
+                        setting,
+                        value: update.value,
+                        reply,
+                    })
+                    .is_err()
+                {
+                    return command_processor_unavailable(request_id);
+                }
+                match result.await {
+                    Ok(Ok(())) => response::Body::Mutation(MutationResponse {
+                        ok: true,
+                        message: format!(
+                            "{} updated to {} bytes",
+                            match setting {
+                                SharedSettingKind::MeshQuotaBytes => "mesh quota",
+                                SharedSettingKind::CaptureThresholdBytes => "capture threshold",
+                                SharedSettingKind::Unspecified => unreachable!(),
+                            },
+                            update.value
+                        ),
+                        resource_id: Some(
+                            match setting {
+                                SharedSettingKind::MeshQuotaBytes => "mesh_quota_bytes",
+                                SharedSettingKind::CaptureThresholdBytes => {
+                                    "capture_threshold_bytes"
+                                }
+                                SharedSettingKind::Unspecified => unreachable!(),
+                            }
+                            .to_owned(),
+                        ),
+                    }),
+                    Ok(Err(message)) => {
+                        return error_response(request_id, "setting_update_failed", message);
+                    }
+                    Err(_) => return command_processor_stopped(request_id),
+                }
             }
             None => {
                 return error_response(request_id, "missing_request", "request body is missing");
@@ -591,7 +729,8 @@ async fn remove_socket(socket: &Path) -> Result<(), IpcError> {
 /// correlation, or the bounded response wait fails.
 pub async fn request(socket: &Path, request: Request) -> Result<Response, IpcError> {
     let request_id = request.request_id;
-    let response = tokio::time::timeout(IPC_REQUEST_TIMEOUT, request_inner(socket, request))
+    let timeout = request_timeout(&request);
+    let response = tokio::time::timeout(timeout, request_inner(socket, request))
         .await
         .map_err(|_| IpcError::Timeout)??;
     if response.protocol_version != IPC_PROTOCOL_VERSION {
@@ -607,6 +746,17 @@ pub async fn request(socket: &Path, request: Request) -> Result<Response, IpcErr
         });
     }
     Ok(response)
+}
+
+fn request_timeout(request: &Request) -> Duration {
+    if matches!(
+        request.body.as_ref(),
+        Some(request::Body::ShareClipboard(_))
+    ) {
+        IPC_SHARE_REQUEST_TIMEOUT
+    } else {
+        IPC_REQUEST_TIMEOUT
+    }
 }
 
 async fn request_inner(socket: &Path, request: Request) -> Result<Response, IpcError> {
@@ -772,6 +922,22 @@ fn error_response(
     }
 }
 
+fn command_processor_unavailable(request_id: u64) -> Response {
+    error_response(
+        request_id,
+        "daemon_unavailable",
+        "daemon command processor is unavailable",
+    )
+}
+
+fn command_processor_stopped(request_id: u64) -> Response {
+    error_response(
+        request_id,
+        "daemon_unavailable",
+        "daemon command processor stopped",
+    )
+}
+
 #[derive(Debug, Error)]
 pub enum IpcError {
     #[error("another clip-sync daemon is already listening")]
@@ -891,6 +1057,26 @@ mod tests {
 
         shutdown.cancel();
         server.await.expect("server task");
+    }
+
+    #[test]
+    fn share_requests_keep_a_finite_extended_deadline() {
+        let share = Request {
+            protocol_version: IPC_PROTOCOL_VERSION,
+            request_id: 1,
+            body: Some(request::Body::ShareClipboard(ShareClipboardRequest {
+                confirmed: true,
+            })),
+        };
+        let status = Request {
+            protocol_version: IPC_PROTOCOL_VERSION,
+            request_id: 2,
+            body: Some(request::Body::Status(StatusRequest {})),
+        };
+
+        assert_eq!(request_timeout(&share), IPC_SHARE_REQUEST_TIMEOUT);
+        assert_eq!(request_timeout(&status), IPC_REQUEST_TIMEOUT);
+        assert!(request_timeout(&share) > request_timeout(&status));
     }
 
     #[tokio::test]
@@ -1067,27 +1253,182 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unavailable_backends_return_explicit_unsupported_error() {
+    async fn clipboard_share_inspection_round_trips_through_daemon_command() {
         let temporary = tempfile::tempdir().expect("temporary directory");
-        let (commands, _command_rx) = mpsc::unbounded_channel();
+        let (commands, mut command_rx) = mpsc::unbounded_channel();
         let state = DaemonState::new(
             "test-node".to_owned(),
             temporary.path().join("config.toml"),
             Config::default(),
             commands,
         );
-        let response = state
-            .handle(Request {
-                protocol_version: IPC_PROTOCOL_VERSION,
-                request_id: 10,
-                body: Some(request::Body::ShareClipboard(ShareClipboardRequest {})),
-            })
-            .await;
-        let Some(response::Body::Error(error)) = response.body else {
-            panic!("expected error response");
+        let handler = tokio::spawn(async move {
+            state
+                .handle(Request {
+                    protocol_version: IPC_PROTOCOL_VERSION,
+                    request_id: 10,
+                    body: Some(request::Body::ShareClipboard(ShareClipboardRequest {
+                        confirmed: false,
+                    })),
+                })
+                .await
+        });
+        let DaemonCommand::ShareClipboard { confirmed, reply } =
+            command_rx.recv().await.expect("share command")
+        else {
+            panic!("expected clipboard share command");
         };
-        assert_eq!(error.code, "unsupported");
-        assert!(error.message.contains("current offer"));
+        assert!(!confirmed);
+        reply
+            .send(Ok(protocol::ShareClipboardResponse {
+                shared: false,
+                confirmation_required: true,
+                logical_size: 42,
+                mime_types: vec!["text/plain".to_owned()],
+                quota_exempt: false,
+                transfer_id: None,
+                content_id: None,
+                message: "confirm".to_owned(),
+            }))
+            .expect("share reply");
+
+        let response = handler.await.expect("handler task");
+        let Some(response::Body::ShareClipboard(share)) = response.body else {
+            panic!("expected share response");
+        };
+        assert!(share.confirmation_required);
+        assert_eq!(share.logical_size, 42);
+    }
+
+    #[tokio::test]
+    async fn transfer_list_and_cancel_round_trip_through_daemon_commands() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let (commands, mut command_rx) = mpsc::unbounded_channel();
+        let state = DaemonState::new(
+            "test-node".to_owned(),
+            temporary.path().join("config.toml"),
+            Config::default(),
+            commands,
+        );
+        let list_state = state.clone();
+        let list_handler = tokio::spawn(async move {
+            list_state
+                .handle(Request {
+                    protocol_version: IPC_PROTOCOL_VERSION,
+                    request_id: 20,
+                    body: Some(request::Body::Transfers(protocol::TransfersRequest {})),
+                })
+                .await
+        });
+        let DaemonCommand::ListTransfers { reply } = command_rx.recv().await.expect("list command")
+        else {
+            panic!("expected transfer list command");
+        };
+        reply
+            .send(Ok(vec![protocol::TransferItem {
+                transfer_id: "transfer".to_owned(),
+                content_id: "content".to_owned(),
+                peer: "peer".to_owned(),
+                state: "replicating".to_owned(),
+                completed_bytes: 5,
+                total_bytes: 10,
+            }]))
+            .expect("list reply");
+        let response = list_handler.await.expect("list handler");
+        let Some(response::Body::Transfers(transfers)) = response.body else {
+            panic!("expected transfers response");
+        };
+        assert_eq!(transfers.transfers[0].completed_bytes, 5);
+
+        let cancel_handler = tokio::spawn(async move {
+            state
+                .handle(Request {
+                    protocol_version: IPC_PROTOCOL_VERSION,
+                    request_id: 21,
+                    body: Some(request::Body::TransferCancel(
+                        protocol::TransferCancelRequest {
+                            transfer_id: "transfer".to_owned(),
+                        },
+                    )),
+                })
+                .await
+        });
+        let DaemonCommand::CancelTransfer { transfer_id, reply } =
+            command_rx.recv().await.expect("cancel command")
+        else {
+            panic!("expected transfer cancel command");
+        };
+        assert_eq!(transfer_id, "transfer");
+        reply.send(Ok(())).expect("cancel reply");
+        let response = cancel_handler.await.expect("cancel handler");
+        let Some(response::Body::Mutation(mutation)) = response.body else {
+            panic!("expected mutation response");
+        };
+        assert_eq!(mutation.resource_id.as_deref(), Some("transfer"));
+    }
+
+    #[tokio::test]
+    async fn device_forget_and_setting_update_round_trip_through_daemon_commands() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let (commands, mut command_rx) = mpsc::unbounded_channel();
+        let state = DaemonState::new(
+            "test-node".to_owned(),
+            temporary.path().join("config.toml"),
+            Config::default(),
+            commands,
+        );
+        let forget_state = state.clone();
+        let forget_handler = tokio::spawn(async move {
+            forget_state
+                .handle(Request {
+                    protocol_version: IPC_PROTOCOL_VERSION,
+                    request_id: 30,
+                    body: Some(request::Body::ForgetDevice(protocol::ForgetDeviceRequest {
+                        device_id: "device".to_owned(),
+                    })),
+                })
+                .await
+        });
+        let DaemonCommand::ForgetDevice { device_id, reply } =
+            command_rx.recv().await.expect("forget command")
+        else {
+            panic!("expected device forget command");
+        };
+        assert_eq!(device_id, "device");
+        reply.send(Ok(())).expect("forget reply");
+        let response = forget_handler.await.expect("forget handler");
+        assert!(matches!(response.body, Some(response::Body::Mutation(_))));
+
+        let setting_handler = tokio::spawn(async move {
+            state
+                .handle(Request {
+                    protocol_version: IPC_PROTOCOL_VERSION,
+                    request_id: 31,
+                    body: Some(request::Body::SharedSettingUpdate(
+                        protocol::SharedSettingUpdateRequest {
+                            setting: protocol::SharedSettingKind::MeshQuotaBytes as i32,
+                            value: 4096,
+                        },
+                    )),
+                })
+                .await
+        });
+        let DaemonCommand::UpdateSharedSetting {
+            setting,
+            value,
+            reply,
+        } = command_rx.recv().await.expect("setting command")
+        else {
+            panic!("expected setting update command");
+        };
+        assert_eq!(setting, protocol::SharedSettingKind::MeshQuotaBytes);
+        assert_eq!(value, 4096);
+        reply.send(Ok(())).expect("setting reply");
+        let response = setting_handler.await.expect("setting handler");
+        let Some(response::Body::Mutation(mutation)) = response.body else {
+            panic!("expected setting mutation response");
+        };
+        assert_eq!(mutation.resource_id.as_deref(), Some("mesh_quota_bytes"));
     }
 
     #[tokio::test]
