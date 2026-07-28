@@ -123,8 +123,12 @@ impl fmt::Debug for MeshSecret {
 fn read_secret_file(path: &Path) -> Result<Zeroizing<Vec<u8>>, SecretError> {
     use rustix::fs::{FileType, Mode, OFlags, fstat, open};
 
+    // sops-nix exposes generation-owned secret files through a stable symlink.
+    // Resolve that link first, then refuse a second final-component symlink and
+    // validate the opened descriptor's owner, mode, type, and size.
+    let resolved = std::fs::canonicalize(path)?;
     let fd = open(
-        path,
+        &resolved,
         OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
         Mode::empty(),
     )
@@ -243,7 +247,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn rejects_secret_symlinks() {
+    fn accepts_private_owned_secret_through_stable_symlink() {
         use std::os::unix::fs::symlink;
 
         let directory = tempfile::tempdir().expect("temporary directory");
@@ -253,6 +257,6 @@ mod tests {
         set_private_permissions(&target);
         symlink(&target, &link).expect("create symlink");
 
-        assert!(MeshSecret::load(&link).is_err());
+        MeshSecret::load(&link).expect("load sops-style secret symlink");
     }
 }
