@@ -13,6 +13,7 @@ use crate::{
     config::{AppPaths, Config, SharedConfig},
     crypto::MeshSecret,
     discovery::{NetbirdDiscovery, PeerDiscovery},
+    envelope::{StateKeys, StoreLock},
     ipc::{self, DaemonCommand, DaemonState, protocol::HistoryItem},
     mesh::{
         MeshChunkCommand, MeshHandle, MeshRuntime, MeshRuntimeConfig, PersistBatch, PersistResult,
@@ -313,11 +314,14 @@ pub async fn run(paths: AppPaths, mut config: Config) -> anyhow::Result<()> {
     let _instance = ipc::DaemonInstance::acquire(&paths.runtime_dir)
         .context("acquire daemon singleton lock")?;
 
+    let store_lock =
+        StoreLock::acquire(&paths.state_dir).context("acquire exclusive daemon/store lock")?;
     let mesh_secret = MeshSecret::load(&config.local.mesh_key_file)
         .context("load mesh secret from configured file")?;
-    let storage_key = mesh_secret.storage_key().context("derive storage key")?;
+    let state_keys =
+        StateKeys::open_or_create(&store_lock, &mesh_secret).context("open encrypted keyslot")?;
     let storage_path = paths.state_dir.join("history.db");
-    let mut history = HistoryStore::open(&storage_path, &storage_key)
+    let mut history = HistoryStore::open(&storage_path, state_keys.storage_key())
         .with_context(|| format!("open encrypted history at {}", storage_path.display()))?;
     initialize_shared_settings(&mut history, &paths.config, &mut config)
         .context("reconcile shared mesh settings with config")?;
@@ -326,9 +330,7 @@ pub async fn run(paths: AppPaths, mut config: Config) -> anyhow::Result<()> {
         .load_operations()
         .context("load mesh operation log")?;
 
-    let content_key = mesh_secret
-        .content_key()
-        .context("derive content identity key")?;
+    let content_key = state_keys.content_identity_key();
     let transport_psk = mesh_secret
         .transport_psk()
         .context("derive mesh transport key")?;
@@ -523,7 +525,7 @@ pub async fn run(paths: AppPaths, mut config: Config) -> anyhow::Result<()> {
                         event,
                         &mut history,
                         &state,
-                        &content_key,
+                        content_key,
                         &mesh_handle,
                     ).await?;
                 }

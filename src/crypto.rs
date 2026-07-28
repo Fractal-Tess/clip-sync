@@ -11,6 +11,7 @@ const SECRET_BYTES: usize = 32;
 const CONTENT_KEY_INFO: &[u8] = b"clip-sync/content-id-key/v1";
 const TRANSPORT_KEY_INFO: &[u8] = b"clip-sync/transport-auth-key/v1";
 const CHUNK_STORE_KEY_INFO: &[u8] = b"clip-sync/chunk-store/root-key/v1";
+const ENVELOPE_KEY_INFO: &[u8] = b"clip-sync/envelope/key-encryption-key/v1";
 const STORAGE_SALT: &[u8] = b"clip-sync/storage-salt/v1";
 
 /// High-entropy shared mesh secret loaded from an owner-only file.
@@ -110,6 +111,14 @@ impl MeshSecret {
         hkdf.expand(CHUNK_STORE_KEY_INFO, key.as_mut())
             .map_err(|_| SecretError::Derivation)?;
         Ok(ChunkStoreKey::from_bytes(*key))
+    }
+
+    pub(crate) fn envelope_key(&self) -> Result<Zeroizing<[u8; 32]>, SecretError> {
+        let hkdf = Hkdf::<Sha256>::new(None, self.bytes.as_ref());
+        let mut key = Zeroizing::new([0; 32]);
+        hkdf.expand(ENVELOPE_KEY_INFO, key.as_mut())
+            .map_err(|_| SecretError::Derivation)?;
+        Ok(key)
     }
 }
 

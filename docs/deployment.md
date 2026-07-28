@@ -59,7 +59,37 @@ reconnect_max_seconds = 60
 netbird_command = "netbird"
 ```
 
-Restart every daemon after rotating the shared secret. Never use the production secret for smoke tests.
+## Mesh-secret rotation
+
+Rotate every retained node before deploying the replacement secret as its
+configured `mesh_key_file`:
+
+```console
+systemctl --user stop clip-sync
+clip-sync rekey \
+  --old-key-file /run/secrets/clip_sync_mesh_key_old \
+  --new-key-file /run/secrets/clip_sync_mesh_key_new
+```
+
+The command and daemon take the same non-waiting exclusive state lock, so rekey
+fails if the daemon is still running. The owner-only
+`$XDG_STATE_HOME/clip-sync/history.keyslot` authenticates and wraps stable local
+SQLCipher and chunk-store keys plus the existing mesh content-identity key.
+Normal rotations replace only this small mode-`0600` sidecar; database pages,
+content IDs, and chunk payloads are reopened and verified but not rewritten.
+
+An existing database that predates the keyslot is migrated automatically under
+the old secret. Its SQLCipher key is changed transactionally to a random local
+data key. An existing chunk store keeps its former derived root during this
+one-time migration so keyed identifiers and payload ciphertext remain stable.
+
+If the command is interrupted, rerun the same command. A durable
+`history.keyslot.next` is either resumed before the atomic commit or the
+already-committed new keyslot is recognized idempotently. Do not delete or edit
+either sidecar during recovery. After every node reports a verified rotation,
+deploy the new configured secret and restart the daemons.
+
+Never use the production secret for smoke tests.
 
 ## Hyprland
 

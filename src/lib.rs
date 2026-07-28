@@ -4,6 +4,7 @@ pub mod config;
 pub mod crypto;
 pub mod daemon;
 pub mod discovery;
+pub mod envelope;
 pub mod ipc;
 pub mod mesh;
 pub mod model;

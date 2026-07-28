@@ -41,6 +41,10 @@ impl ChunkStoreKey {
     pub fn from_bytes(bytes: [u8; 32]) -> Self {
         Self(Zeroizing::new(bytes))
     }
+
+    pub(crate) fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
 }
 
 impl fmt::Debug for ChunkStoreKey {
@@ -277,6 +281,46 @@ pub struct ChunkStore {
 }
 
 impl ChunkStore {
+    /// Authenticates an existing chunk catalog without modifying store state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unsafe path, wrong key, unavailable `SQLCipher`,
+    /// corrupt schema, or database I/O failure.
+    pub fn verify_key(root: impl AsRef<Path>, key: &ChunkStoreKey) -> Result<(), ChunkStoreError> {
+        let catalog_path = root.as_ref().join("catalog.db");
+        match fs::symlink_metadata(&catalog_path) {
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        }
+        let catalog_key = derive_key(&key.0, b"clip-sync/chunk-store/catalog/v1")?;
+        let connection = Connection::open_with_flags(
+            &catalog_path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX
+                | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )?;
+        apply_catalog_key(&connection, &catalog_key)?;
+        for table in ["chunk_catalog", "manifests"] {
+            let exists = connection
+                .query_row(
+                    "SELECT EXISTS(
+                         SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1
+                     )",
+                    [table],
+                    |row| row.get::<_, bool>(0),
+                )
+                .map_err(normalize_catalog_error)?;
+            if !exists {
+                return Err(ChunkStoreError::CorruptCatalog);
+            }
+        }
+        connection
+            .close()
+            .map_err(|(_, error)| ChunkStoreError::Sql(error))
+    }
+
     /// Opens a chunk directory and its `SQLCipher` manifest/refcount catalog.
     ///
     /// # Errors

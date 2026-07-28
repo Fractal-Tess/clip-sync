@@ -6,7 +6,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     config::{AppPaths, Config},
+    crypto::MeshSecret,
     daemon,
+    envelope::{RekeyOutcome, rekey_state},
     ipc::{
         self,
         protocol::{
@@ -60,6 +62,8 @@ enum Command {
         #[command(subcommand)]
         command: DeviceCommand,
     },
+    /// Rotate the mesh secret wrapping local encrypted-store data keys.
+    Rekey(RekeyArgs),
     /// Open the optional egui interface.
     #[cfg(feature = "ui")]
     Ui {
@@ -117,6 +121,16 @@ struct MutationArgs {
     content_id: String,
     #[arg(long)]
     json: bool,
+}
+
+#[derive(Debug, Args)]
+struct RekeyArgs {
+    /// Owner-only file containing the currently active mesh secret.
+    #[arg(long, value_name = "PATH")]
+    old_key_file: PathBuf,
+    /// Owner-only file containing the replacement mesh secret.
+    #[arg(long, value_name = "PATH")]
+    new_key_file: PathBuf,
 }
 
 #[derive(Debug, Subcommand)]
@@ -202,6 +216,7 @@ impl Cli {
             Command::ShareClipboard(output) => share_clipboard(&paths, output).await,
             Command::Transfer { command } => transfer_command(&paths, command).await,
             Command::Device { command } => device_command(&paths, command).await,
+            Command::Rekey(args) => rekey_command(&paths, &args),
             #[cfg(feature = "ui")]
             Command::Ui { command } => {
                 let mode = match command {
@@ -212,6 +227,24 @@ impl Cli {
             }
         }
     }
+}
+
+fn rekey_command(paths: &AppPaths, args: &RekeyArgs) -> anyhow::Result<()> {
+    let old_secret =
+        MeshSecret::load(&args.old_key_file).context("load old mesh-secret key file")?;
+    let new_secret =
+        MeshSecret::load(&args.new_key_file).context("load new mesh-secret key file")?;
+    match rekey_state(&paths.state_dir, &old_secret, &new_secret)
+        .context("rotate encrypted local store keyslot")?
+    {
+        RekeyOutcome::Rotated => {
+            println!("local encrypted store keyslot rotated and verified");
+        }
+        RekeyOutcome::AlreadyCurrent => {
+            println!("local encrypted store keyslot already uses the new secret");
+        }
+    }
+    Ok(())
 }
 
 async fn status(paths: &AppPaths, output: OutputArgs) -> anyhow::Result<()> {
@@ -685,6 +718,14 @@ mod tests {
             vec!["clip-sync", "history", "delete", "content"],
             vec!["clip-sync", "transfer", "cancel", "transfer-id", "--json"],
             vec!["clip-sync", "device", "forget", "device-id", "--json"],
+            vec![
+                "clip-sync",
+                "rekey",
+                "--old-key-file",
+                "old.key",
+                "--new-key-file",
+                "new.key",
+            ],
         ] {
             Cli::try_parse_from(arguments).expect("command should parse");
         }

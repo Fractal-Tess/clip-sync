@@ -227,7 +227,7 @@ impl StorageKey {
         Ok(Self { bytes })
     }
 
-    fn as_bytes(&self) -> &[u8; SQLCIPHER_KEY_BYTES] {
+    pub(crate) fn as_bytes(&self) -> &[u8; SQLCIPHER_KEY_BYTES] {
         &self.bytes
     }
 }
@@ -964,6 +964,37 @@ impl EncryptedStorage {
         self.connection
             .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
         Ok(())
+    }
+
+    /// Transactionally changes the `SQLCipher` key after checkpointing the WAL.
+    ///
+    /// The connection is consumed so callers must reopen with the new key and
+    /// verify the database before committing any external key metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when checkpointing, `SQLCipher` rekeying, integrity
+    /// verification, or closing fails.
+    pub fn rekey(self, new_key: &StorageKey) -> Result<()> {
+        self.checkpoint()?;
+        let mut pragma = Zeroizing::new(String::with_capacity(
+            "PRAGMA rekey = \"x''\";".len() + SQLCIPHER_KEY_HEX_CHARS,
+        ));
+        pragma.push_str("PRAGMA rekey = \"x'");
+        for byte in new_key.as_bytes() {
+            write!(pragma, "{byte:02x}").map_err(|_| StorageError::KeyDerivation)?;
+        }
+        pragma.push_str("'\";");
+        self.connection.execute_batch(pragma.as_str())?;
+        let integrity: String = self
+            .connection
+            .query_row("PRAGMA quick_check;", [], |row| row.get(0))?;
+        if integrity != "ok" {
+            return Err(StorageError::IncompatibleSchema(format!(
+                "database integrity check failed after rekey: {integrity}"
+            )));
+        }
+        self.close()
     }
 
     /// Closes the database and reports deferred `SQLite` failures.
