@@ -18,7 +18,7 @@ use crate::{
     model::{Operation, Payload, Representation, StampedOperation},
     replica::Replica,
     replication::{Codec, JsonV1Codec},
-    storage::EncryptedStorage,
+    storage::HistoryStore,
 };
 
 /// Runs discovery and local IPC until a termination signal is received.
@@ -35,23 +35,12 @@ pub async fn run(paths: AppPaths, config: Config) -> anyhow::Result<()> {
         .context("load mesh secret from configured file")?;
     let storage_key = mesh_secret.storage_key().context("derive storage key")?;
     let storage_path = paths.state_dir.join("history.db");
-    let mut storage = EncryptedStorage::open(&storage_path, &storage_key)
+    let mut history = HistoryStore::open(&storage_path, &storage_key)
         .with_context(|| format!("open encrypted history at {}", storage_path.display()))?;
-    let metadata = storage
-        .local_replica_metadata()
-        .context("load local replica identity")?;
-    let projection = storage
-        .rebuild_projection()
-        .context("rebuild history projection")?;
-    let persisted_operations = storage
+    let persisted_operations = history
+        .storage()
         .load_operations()
         .context("load mesh operation log")?;
-    let mut replica = Replica::restore(
-        metadata.node_id(),
-        metadata.next_operation_counter().saturating_sub(1),
-        metadata.last_hlc(),
-        projection,
-    );
 
     let content_key = mesh_secret
         .content_key()
@@ -71,10 +60,10 @@ pub async fn run(paths: AppPaths, config: Config) -> anyhow::Result<()> {
         config.clone(),
         command_tx,
     );
-    state.set_history(history_items(&replica)).await;
+    state.set_history(history_items(history.replica())).await;
     let shutdown = CancellationToken::new();
     let mut mesh_config = MeshRuntimeConfig::new(
-        replica.node_id(),
+        history.replica().node_id(),
         hostname.clone(),
         config.local.listen_port,
     );
@@ -135,8 +124,7 @@ pub async fn run(paths: AppPaths, config: Config) -> anyhow::Result<()> {
                     handle_daemon_command(
                         command,
                         &clipboard,
-                        &mut replica,
-                        &mut storage,
+                        &mut history,
                         &state,
                         &mesh_handle,
                     ).await;
@@ -146,8 +134,7 @@ pub async fn run(paths: AppPaths, config: Config) -> anyhow::Result<()> {
                 if let Some(event) = event {
                     handle_clipboard_event(
                         event,
-                        &mut replica,
-                        &mut storage,
+                        &mut history,
                         &state,
                         &content_key,
                         &mesh_handle,
@@ -158,8 +145,7 @@ pub async fn run(paths: AppPaths, config: Config) -> anyhow::Result<()> {
                 if let Some(batch) = batch {
                     handle_mesh_batch(
                         batch,
-                        &mut replica,
-                        &mut storage,
+                        &mut history,
                         &state,
                         &content_key,
                     ).await;
@@ -192,17 +178,15 @@ pub async fn run(paths: AppPaths, config: Config) -> anyhow::Result<()> {
 async fn handle_daemon_command(
     command: DaemonCommand,
     clipboard: &WaylandBackend,
-    replica: &mut Replica,
-    storage: &mut EncryptedStorage,
+    history: &mut HistoryStore,
     state: &DaemonState,
     mesh: &MeshHandle,
 ) {
     match command {
         DaemonCommand::Activate { content_id, reply } => {
-            let result =
-                activate_history_item(&content_id, clipboard, replica, storage, state, mesh)
-                    .await
-                    .map_err(|error| error.to_string());
+            let result = activate_history_item(&content_id, clipboard, history, state, mesh)
+                .await
+                .map_err(|error| error.to_string());
             let _ = reply.send(result);
         }
     }
@@ -211,20 +195,19 @@ async fn handle_daemon_command(
 async fn activate_history_item(
     encoded_content_id: &str,
     clipboard: &WaylandBackend,
-    replica: &mut Replica,
-    storage: &mut EncryptedStorage,
+    history: &mut HistoryStore,
     state: &DaemonState,
     mesh: &MeshHandle,
 ) -> anyhow::Result<()> {
     let content_id = encoded_content_id
         .parse()
         .context("content ID is invalid")?;
-    let payload = replica
+    let payload = history
         .projection()
         .payload(content_id)
         .cloned()
         .context("history item is unavailable")?;
-    if !replica.projection().is_visible(content_id) {
+    if !history.projection().is_visible(content_id) {
         anyhow::bail!("history item is deleted");
     }
 
@@ -244,18 +227,13 @@ async fn activate_history_item(
         .await
         .context("set active Wayland clipboard")?;
 
-    let mut next = replica.clone();
-    let operation = next
+    let operation = history
         .activate(content_id, unix_time_millis()?)
-        .context("author clipboard activation")?;
-    storage
-        .append_local_operation(&operation)
         .context("persist clipboard activation")?;
-    *replica = next;
     mesh.record_local(&operation)
         .await
         .context("publish clipboard activation to mesh")?;
-    state.set_history(history_items(replica)).await;
+    state.set_history(history_items(history.replica())).await;
     Ok(())
 }
 
@@ -320,8 +298,7 @@ fn history_preview(payload: &Payload) -> String {
 
 async fn handle_clipboard_event(
     event: ClipboardEvent,
-    replica: &mut Replica,
-    storage: &mut EncryptedStorage,
+    history: &mut HistoryStore,
     state: &DaemonState,
     content_key: &[u8; 32],
     mesh: &MeshHandle,
@@ -337,20 +314,17 @@ async fn handle_clipboard_event(
                 .collect::<Vec<_>>();
             let payload = Payload::new(content_key, representations)
                 .context("build captured clipboard payload")?;
-            let mut next = replica.clone();
-            let operation = next
-                .copy(payload, unix_time_millis()?)
-                .context("author clipboard history operation")?;
-            storage
-                .append_local_operation(&operation)
-                .context("persist clipboard history operation")?;
-            *replica = next;
-            mesh.record_local(&operation)
-                .await
-                .context("publish clipboard history operation to mesh")?;
-            state.set_history(history_items(replica)).await;
+            let operations = history
+                .copy_and_enforce(payload, unix_time_millis()?)
+                .context("persist clipboard history and quota operations")?;
+            for operation in &operations {
+                mesh.record_local(operation)
+                    .await
+                    .context("publish clipboard history operation to mesh")?;
+            }
+            state.set_history(history_items(history.replica())).await;
             tracing::debug!(
-                history_entries = replica.projection().visible_items().len(),
+                history_entries = history.projection().visible_items().len(),
                 "captured clipboard history entry"
             );
         }
@@ -369,22 +343,20 @@ async fn handle_clipboard_event(
 
 async fn handle_mesh_batch(
     batch: PersistBatch,
-    replica: &mut Replica,
-    storage: &mut EncryptedStorage,
+    history: &mut HistoryStore,
     state: &DaemonState,
     content_key: &[u8; 32],
 ) {
-    let result = persist_mesh_batch(batch.operations(), replica, storage, content_key);
+    let result = persist_mesh_batch(batch.operations(), history, content_key);
     if result.is_ok() {
-        state.set_history(history_items(replica)).await;
+        state.set_history(history_items(history.replica())).await;
     }
     batch.complete(result.map_err(|error| error.to_string()));
 }
 
 fn persist_mesh_batch(
     raw_operations: &[Vec<u8>],
-    replica: &mut Replica,
-    storage: &mut EncryptedStorage,
+    history: &mut HistoryStore,
     content_key: &[u8; 32],
 ) -> anyhow::Result<()> {
     let codec = JsonV1Codec;
@@ -393,23 +365,18 @@ fn persist_mesh_batch(
         .map(|raw| codec.decode_op(raw).context("decode remote operation"))
         .collect::<anyhow::Result<Vec<StampedOperation>>>()?;
     for operation in &operations {
-        if let Operation::Add { payload, .. } = operation.operation() {
+        if let Operation::Add { payload, .. } | Operation::AddQuotaExempt { payload, .. } =
+            operation.operation()
+        {
             payload
                 .validate(content_key)
                 .context("validate remote clipboard payload identity")?;
         }
     }
 
-    let now_millis = unix_time_millis()?;
-    let mut next = replica.clone();
-    for operation in &operations {
-        next.ingest(operation, now_millis)
-            .context("apply remote history operation")?;
-    }
-    storage
-        .append_remote_operations(&operations, next.last_timestamp())
+    history
+        .ingest_batch(&operations, unix_time_millis()?)
         .context("persist remote operation batch")?;
-    *replica = next;
     Ok(())
 }
 

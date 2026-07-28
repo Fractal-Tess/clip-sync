@@ -222,6 +222,44 @@ fn history_store_persists_mutations_quota_and_restart_state() {
 }
 
 #[test]
+fn peer_batch_conflict_rolls_back_storage_and_live_projection() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("peer-batch.db");
+    let key = storage_key();
+    let peer = node(77);
+    let first_payload = payload(1, 3);
+    let first_id = content_id(&first_payload);
+    let second_payload = payload(2, 3);
+    let second_id = content_id(&second_payload);
+    let operation_id = OpId::new(peer, 1).unwrap();
+    let first = StampedOperation::new(
+        operation_id,
+        HlcTimestamp::new(100, 0),
+        Operation::Add {
+            content_id: first_id,
+            payload: first_payload,
+        },
+    );
+    let conflicting = StampedOperation::new(
+        operation_id,
+        HlcTimestamp::new(101, 0),
+        Operation::Add {
+            content_id: second_id,
+            payload: second_payload,
+        },
+    );
+
+    let mut history = HistoryStore::open(&path, &key).unwrap();
+    assert!(history.ingest_batch(&[first, conflicting], 200).is_err());
+    assert!(history.projection().visible_items().is_empty());
+    assert!(history.storage().load_operations().unwrap().is_empty());
+
+    drop(history);
+    let restarted = HistoryStore::open(&path, &key).unwrap();
+    assert!(restarted.projection().visible_items().is_empty());
+}
+
+#[test]
 fn peer_ingest_hlc_and_acknowledgements_survive_restart() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("peer.db");

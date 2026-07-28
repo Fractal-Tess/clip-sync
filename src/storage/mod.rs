@@ -1017,6 +1017,29 @@ impl HistoryStore {
         Ok(outcome)
     }
 
+    /// Ingests a peer batch atomically and publishes the reconstructed state
+    /// only after the complete encrypted transaction commits.
+    ///
+    /// # Errors
+    ///
+    /// Returns projection, clock, identity-conflict, or storage errors without
+    /// changing live state.
+    pub fn ingest_batch(
+        &mut self,
+        operations: &[StampedOperation],
+        now_millis: u64,
+    ) -> std::result::Result<Vec<ApplyOutcome>, HistoryError> {
+        let mut next = self.replica.clone();
+        let outcomes = operations
+            .iter()
+            .map(|operation| next.ingest(operation, now_millis))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        self.storage
+            .append_remote_operations(operations, next.last_timestamp())?;
+        self.replica = next;
+        Ok(outcomes)
+    }
+
     /// Monotonically persists a peer's anti-entropy acknowledgement.
     ///
     /// # Errors
