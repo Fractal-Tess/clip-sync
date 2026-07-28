@@ -7,9 +7,11 @@ pub mod discovery;
 pub mod ipc;
 pub mod mesh;
 pub mod model;
+pub mod payload;
 pub mod replica;
 pub mod replication;
 pub mod storage;
+pub mod transfer;
 pub mod transport;
 
 #[cfg(feature = "ui")]

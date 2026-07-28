@@ -5,11 +5,12 @@ use sha2::Sha256;
 use thiserror::Error;
 use zeroize::Zeroizing;
 
-use crate::{storage::StorageKey, transport::Psk};
+use crate::{payload::ChunkStoreKey, storage::StorageKey, transport::Psk};
 
 const SECRET_BYTES: usize = 32;
 const CONTENT_KEY_INFO: &[u8] = b"clip-sync/content-id-key/v1";
 const TRANSPORT_KEY_INFO: &[u8] = b"clip-sync/transport-auth-key/v1";
+const CHUNK_STORE_KEY_INFO: &[u8] = b"clip-sync/chunk-store/root-key/v1";
 const STORAGE_SALT: &[u8] = b"clip-sync/storage-salt/v1";
 
 /// High-entropy shared mesh secret loaded from an owner-only file.
@@ -102,6 +103,22 @@ impl MeshSecret {
         hkdf.expand(CONTENT_KEY_INFO, key.as_mut())
             .map_err(|_| SecretError::Derivation)?;
         Ok(key)
+    }
+
+    /// Derives the root key used by the encrypted chunk store.
+    ///
+    /// The store further separates this root into chunk encryption,
+    /// identifier, and catalog keys.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if HKDF expansion unexpectedly fails.
+    pub fn chunk_store_key(&self) -> Result<ChunkStoreKey, SecretError> {
+        let hkdf = Hkdf::<Sha256>::new(None, self.bytes.as_ref());
+        let mut key = Zeroizing::new([0; 32]);
+        hkdf.expand(CHUNK_STORE_KEY_INFO, key.as_mut())
+            .map_err(|_| SecretError::Derivation)?;
+        Ok(ChunkStoreKey::from_bytes(*key))
     }
 }
 
