@@ -22,6 +22,7 @@
           src = ./.;
           cargoLock.lockFile = ./Cargo.lock;
           cargoBuildFeatures = pkgs.lib.optionals withUi [ "ui" ];
+          RUST_MIN_STACK = "16777216";
           nativeBuildInputs = with pkgs; [
             perl
             pkg-config
