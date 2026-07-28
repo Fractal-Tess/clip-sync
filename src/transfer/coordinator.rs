@@ -108,6 +108,12 @@ impl TransferCoordinator {
         &mut self.store
     }
 
+    /// Returns the effective replicated limit for automatic clipboard capture.
+    #[must_use]
+    pub const fn automatic_capture_threshold_bytes(&self) -> u64 {
+        self.policy.automatic_capture_threshold_bytes
+    }
+
     /// Replaces the resource policy used for future explicit shares.
     ///
     /// In-flight transfers retain their already-durable quota classification.

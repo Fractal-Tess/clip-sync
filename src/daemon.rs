@@ -41,6 +41,20 @@ pub struct ShareCurrentClipboardResult {
     pub content_id: crate::model::ContentId,
 }
 
+/// Result of processing one backend-approved automatic clipboard capture.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AutomaticClipboardCaptureResult {
+    /// An ordinary MIME offer was retained inline in replicated history.
+    Payload { content_id: crate::model::ContentId },
+    /// A local file offer was retained as an encrypted file manifest.
+    Files {
+        transfer_id: TransferId,
+        content_id: crate::model::ContentId,
+    },
+    /// A file offer failed URI, path, type, mutation, size, or resource checks.
+    RejectedFiles,
+}
+
 /// Two-pass live-offer inspection: size/MIME metadata plus policy warning.
 #[derive(Clone, Debug)]
 pub struct LiveClipboardShareInspection {
@@ -250,6 +264,105 @@ pub async fn share_current_clipboard(
     Ok(ShareCurrentClipboardResult {
         transfer_id,
         content_id: payload.descriptor().content_id(),
+    })
+}
+
+/// Safely persists and publishes one automatic clipboard capture.
+///
+/// Offers containing `text/uri-list` never enter inline history. Their local
+/// roots are parsed, recursively preflighted against the effective automatic
+/// threshold, revalidated while being streamed, and published through the
+/// file-manifest transfer path. Safety and resource-policy failures return
+/// [`AutomaticClipboardCaptureResult::RejectedFiles`] without retaining the
+/// URI bytes.
+///
+/// Non-file offers retain every captured MIME representation.
+///
+/// # Errors
+///
+/// Returns payload, storage, chunk-store, operation publication, or quota
+/// errors. File-offer safety/policy rejection is reported as a successful
+/// [`AutomaticClipboardCaptureResult::RejectedFiles`] outcome.
+pub async fn capture_automatic_clipboard(
+    content: &ClipboardContent,
+    content_key: &[u8; 32],
+    transfers: &mut TransferCoordinator,
+    history: &mut HistoryStore,
+    mesh: &MeshHandle,
+    now_millis: u64,
+    cancellation: &CancellationToken,
+) -> anyhow::Result<AutomaticClipboardCaptureResult> {
+    let Some(uri_list) = content.bytes_for_mime("text/uri-list") else {
+        let payload = payload_from_clipboard(content, content_key)?;
+        let content_id = payload.descriptor().content_id();
+        let operations = history
+            .copy_and_enforce(payload, now_millis)
+            .context("persist clipboard history and quota operations")?;
+        for operation in &operations {
+            mesh.record_local(operation)
+                .await
+                .context("publish clipboard history operation to mesh")?;
+        }
+        return Ok(AutomaticClipboardCaptureResult::Payload { content_id });
+    };
+
+    let limits = FileSnapshotLimits {
+        max_logical_bytes: transfers.automatic_capture_threshold_bytes(),
+        ..FileSnapshotLimits::default()
+    };
+    let paths = match parse_file_uri_list(&uri_list, limits) {
+        Ok(paths) => paths,
+        Err(error) => {
+            tracing::debug!(%error, "automatic clipboard file URI list was rejected");
+            return Ok(AutomaticClipboardCaptureResult::RejectedFiles);
+        }
+    };
+    let available =
+        fs2::available_space(transfers.store().root()).context("inspect chunk-store free space")?;
+    let inspection = match transfers.inspect_files(&paths, limits, available, cancellation) {
+        Ok(inspection) => inspection,
+        Err(error) => {
+            tracing::debug!(%error, "automatic clipboard file preflight was rejected");
+            return Ok(AutomaticClipboardCaptureResult::RejectedFiles);
+        }
+    };
+    let payload = payload_from_clipboard(content, content_key)?;
+    let content_id = payload.descriptor().content_id();
+    let (transfer_id, begin) = match transfers.begin_file_share(
+        &paths,
+        content_id,
+        inspection,
+        false,
+        limits,
+        history,
+        now_millis,
+        cancellation,
+    ) {
+        Ok(begin) => begin,
+        Err(crate::transfer::TransferCoordinatorError::FileSnapshot(error)) => {
+            tracing::debug!(%error, "automatic clipboard file snapshot was rejected");
+            return Ok(AutomaticClipboardCaptureResult::RejectedFiles);
+        }
+        Err(crate::transfer::TransferCoordinatorError::SourceChanged) => {
+            tracing::debug!("automatic clipboard files changed during snapshot");
+            return Ok(AutomaticClipboardCaptureResult::RejectedFiles);
+        }
+        Err(error) => return Err(error).context("begin automatic clipboard file snapshot"),
+    };
+    mesh.record_local(&begin)
+        .await
+        .context("publish pending automatic clipboard file snapshot")?;
+    let complete = transfers
+        .complete_payload_share(transfer_id, history, now_millis)
+        .context("complete automatic clipboard file snapshot")?;
+    mesh.record_local(&complete)
+        .await
+        .context("publish completed automatic clipboard file snapshot")?;
+    enforce_and_publish_quota(history, mesh, now_millis).await?;
+    mesh.notify_transfers();
+    Ok(AutomaticClipboardCaptureResult::Files {
+        transfer_id,
+        content_id,
     })
 }
 
@@ -531,6 +644,7 @@ pub async fn run(paths: AppPaths, mut config: Config) -> anyhow::Result<()> {
                         &state,
                         content_key,
                         &mesh_handle,
+                        &mut transfers,
                     ).await?;
                 }
             }
@@ -1148,31 +1262,39 @@ async fn handle_clipboard_event(
     state: &DaemonState,
     content_key: &[u8; 32],
     mesh: &MeshHandle,
+    transfers: &mut TransferCoordinator,
 ) -> anyhow::Result<()> {
     match event {
         ClipboardEvent::Captured { content, .. } => {
-            let representations = content
-                .representations()
-                .iter()
-                .map(|representation| {
-                    Representation::new(representation.mime_type().as_str(), representation.bytes())
-                })
-                .collect::<Vec<_>>();
-            let payload = Payload::new(content_key, representations)
-                .context("build captured clipboard payload")?;
-            let operations = history
-                .copy_and_enforce(payload, unix_time_millis()?)
-                .context("persist clipboard history and quota operations")?;
-            for operation in &operations {
-                mesh.record_local(operation)
-                    .await
-                    .context("publish clipboard history operation to mesh")?;
-            }
+            let result = capture_automatic_clipboard(
+                &content,
+                content_key,
+                transfers,
+                history,
+                mesh,
+                unix_time_millis()?,
+                &CancellationToken::new(),
+            )
+            .await?;
             state.set_history(history_items(history.replica())).await;
-            tracing::debug!(
-                history_entries = history.projection().visible_items().len(),
-                "captured clipboard history entry"
-            );
+            match result {
+                AutomaticClipboardCaptureResult::Payload { .. } => {
+                    tracing::debug!(
+                        history_entries = history.projection().visible_items().len(),
+                        "captured clipboard history entry"
+                    );
+                }
+                AutomaticClipboardCaptureResult::Files { transfer_id, .. } => {
+                    tracing::debug!(
+                        %transfer_id,
+                        history_entries = history.projection().visible_items().len(),
+                        "captured clipboard file snapshot"
+                    );
+                }
+                AutomaticClipboardCaptureResult::RejectedFiles => {
+                    tracing::debug!("clipboard file offer was not captured");
+                }
+            }
         }
         ClipboardEvent::CaptureRejected { reason, .. } => {
             tracing::debug!(?reason, "clipboard offer was not captured");

@@ -1,7 +1,9 @@
-use std::fs;
+use std::{fs, net::UdpSocket};
 
 use clip_sync::{
     clipboard::types::{ClipboardContent, ClipboardRepresentation, MimeType},
+    daemon::{AutomaticClipboardCaptureResult, capture_automatic_clipboard},
+    mesh::{MeshHandle, MeshRuntime, MeshRuntimeConfig},
     model::{ContentId, Payload, Projection, Representation, StampedOperation},
     payload::{
         ChunkStore, ChunkStoreConfig, ChunkStoreKey, ExplicitSharePolicy, FileSnapshotLimits,
@@ -12,6 +14,7 @@ use clip_sync::{
         TransferCoordinator, TransferCoordinatorError, TransferPhase, TransferStateLimits,
         operation_transfer_id,
     },
+    transport::Psk,
 };
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
@@ -21,6 +24,7 @@ const CHUNK_BYTES: usize = 64 * 1024;
 const CONTENT_KEY: [u8; 32] = [0x31; 32];
 const CHUNK_KEY: [u8; 32] = [0x52; 32];
 const STORAGE_KEY: [u8; 32] = [0x73; 32];
+const PSK: [u8; 32] = [0x94; 32];
 
 struct Node {
     directory: TempDir,
@@ -63,6 +67,13 @@ impl Node {
 }
 
 fn open_transfers(directory: &TempDir) -> TransferCoordinator {
+    open_transfers_with_threshold(directory, 1024)
+}
+
+fn open_transfers_with_threshold(
+    directory: &TempDir,
+    automatic_capture_threshold_bytes: u64,
+) -> TransferCoordinator {
     let store = ChunkStore::open(
         directory.path().join("chunks"),
         &ChunkStoreKey::from_bytes(CHUNK_KEY),
@@ -82,7 +93,7 @@ fn open_transfers(directory: &TempDir) -> TransferCoordinator {
         store,
         materializer,
         ExplicitSharePolicy {
-            automatic_capture_threshold_bytes: 1024,
+            automatic_capture_threshold_bytes,
             mesh_quota_bytes: 8 * 1024 * 1024,
             maximum_explicit_share_bytes: 16 * 1024 * 1024,
             free_space_reserve_bytes: 0,
@@ -92,6 +103,44 @@ fn open_transfers(directory: &TempDir) -> TransferCoordinator {
             max_peers: 16,
         },
     )
+}
+
+fn spawn_mesh(node_id: clip_sync::model::NodeId) -> (MeshRuntime, MeshHandle, CancellationToken) {
+    let socket = UdpSocket::bind("127.0.0.1:0").expect("ephemeral UDP port");
+    let port = socket.local_addr().expect("local address").port();
+    drop(socket);
+    let shutdown = CancellationToken::new();
+    let config = MeshRuntimeConfig::new(node_id, "automatic-capture-test".to_owned(), port);
+    let (runtime, _persist, _chunks) = MeshRuntime::spawn_with_transfers(
+        config,
+        Psk::new(&PSK).expect("PSK"),
+        &[],
+        shutdown.clone(),
+    )
+    .expect("mesh runtime");
+    let handle = runtime.handle();
+    (runtime, handle, shutdown)
+}
+
+fn uri_clipboard(paths: &[&std::path::Path]) -> ClipboardContent {
+    let mut uri_list = paths
+        .iter()
+        .map(|path| {
+            Url::from_file_path(path)
+                .expect("absolute file URL")
+                .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\r\n");
+    uri_list.push_str("\r\n");
+    ClipboardContent::new_with_limit(
+        vec![ClipboardRepresentation::new(
+            MimeType::new("text/uri-list").expect("URI MIME"),
+            uri_list,
+        )],
+        16 * 1024 * 1024,
+    )
+    .expect("URI clipboard")
 }
 
 fn payload(bytes: Vec<u8>) -> Payload {
@@ -161,6 +210,272 @@ fn move_chunks(source: &Node, destination: &mut Node, maximum: usize) -> usize {
             .expect("import");
     }
     requests.len()
+}
+
+fn activate_file_snapshot(
+    node: &Node,
+    content_id: ContentId,
+) -> (clip_sync::payload::ManifestId, std::path::PathBuf, String) {
+    let activated = node
+        .transfers
+        .activate(
+            content_id,
+            node.history.projection(),
+            &CONTENT_KEY,
+            16 * 1024 * 1024,
+            &CancellationToken::new(),
+        )
+        .expect("file snapshot activation");
+    let manifest_id = activated
+        .materialized_manifest()
+        .expect("file materialization");
+    let root = node
+        .directory
+        .path()
+        .join("runtime/materialized")
+        .join(manifest_id.to_string());
+    let uri_bytes = activated
+        .content()
+        .bytes_for_mime("text/uri-list")
+        .expect("runtime URIs");
+    (
+        manifest_id,
+        root,
+        String::from_utf8_lossy(&uri_bytes).into_owned(),
+    )
+}
+
+fn assert_automatic_snapshot_bytes(root: &std::path::Path) {
+    assert_eq!(
+        fs::read(root.join("single.txt")).expect("restored single file"),
+        b"automatic file bytes"
+    );
+    assert_eq!(
+        fs::read(root.join("folder/nested/data.bin")).expect("restored nested file"),
+        b"automatic directory bytes"
+    );
+}
+
+fn cleanup_file_snapshot(
+    node: &Node,
+    manifest_id: clip_sync::payload::ManifestId,
+    root: &std::path::Path,
+) {
+    node.transfers
+        .cleanup_materialization(manifest_id)
+        .expect("materialization cleanup");
+    assert!(!root.exists());
+}
+
+#[tokio::test]
+async fn automatic_file_and_directory_capture_is_private_durable_and_remotely_materialized() {
+    let mut origin = Node::new();
+    let mut remote = Node::new();
+    let source_file = origin.directory.path().join("single.txt");
+    let source_directory = origin.directory.path().join("folder");
+    let source_file_path = source_file.to_string_lossy().into_owned();
+    let source_directory_path = source_directory.to_string_lossy().into_owned();
+    fs::create_dir(&source_directory).expect("source directory");
+    fs::create_dir(source_directory.join("nested")).expect("nested directory");
+    fs::write(&source_file, b"automatic file bytes").expect("source file");
+    fs::write(
+        source_directory.join("nested/data.bin"),
+        b"automatic directory bytes",
+    )
+    .expect("nested source file");
+    let clipboard = uri_clipboard(&[&source_file, &source_directory]);
+    let origin_path = origin.directory.path().to_string_lossy().into_owned();
+    let (runtime, mesh, shutdown) = spawn_mesh(origin.history.replica().node_id());
+
+    let result = capture_automatic_clipboard(
+        &clipboard,
+        &CONTENT_KEY,
+        &mut origin.transfers,
+        &mut origin.history,
+        &mesh,
+        100,
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("automatic file capture");
+    let (transfer_id, content_id) = match result {
+        AutomaticClipboardCaptureResult::Files {
+            transfer_id,
+            content_id,
+        } => (transfer_id, content_id),
+        other => panic!("expected file capture, got {other:?}"),
+    };
+    assert_eq!(
+        origin
+            .history
+            .projection()
+            .transfer(transfer_id)
+            .expect("transfer")
+            .phase(),
+        TransferPhase::Complete
+    );
+    assert!(
+        origin.history.projection().payload(content_id).is_none(),
+        "origin URI bytes must not be retained as inline history"
+    );
+    let operations = origin
+        .history
+        .storage()
+        .load_operations()
+        .expect("captured operations");
+    for operation in &operations {
+        let encoded = serde_json::to_string(operation).expect("encode operation");
+        assert!(
+            !encoded.contains(&origin_path),
+            "replicated operation leaked the origin path: {encoded}"
+        );
+    }
+
+    fs::remove_file(&source_file).expect("delete source file after capture");
+    fs::remove_dir_all(&source_directory).expect("delete source directory after capture");
+    let (local_manifest, local_root, local_uri) = activate_file_snapshot(&origin, content_id);
+    assert!(!local_uri.contains(&source_file_path));
+    assert!(!local_uri.contains(&source_directory_path));
+    assert_automatic_snapshot_bytes(&local_root);
+    cleanup_file_snapshot(&origin, local_manifest, &local_root);
+
+    remote.ingest(&operations);
+    assert!(move_chunks(&origin, &mut remote, 64) > 0);
+    let (remote_manifest, remote_root, remote_uri) = activate_file_snapshot(&remote, content_id);
+    assert_automatic_snapshot_bytes(&remote_root);
+    assert!(remote_uri.contains(remote_root.to_str().expect("UTF-8 runtime root")));
+    assert!(!remote_uri.contains(&origin_path));
+    cleanup_file_snapshot(&remote, remote_manifest, &remote_root);
+
+    shutdown.cancel();
+    runtime.wait().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn automatic_file_capture_rejects_unsafe_and_oversize_offers_without_history() {
+    use std::os::unix::{fs::symlink, net::UnixListener};
+
+    let directory = tempfile::tempdir().expect("node directory");
+    let mut history = HistoryStore::open(
+        directory.path().join("history.db"),
+        &StorageKey::from_bytes(STORAGE_KEY),
+    )
+    .expect("history");
+    let mut transfers = open_transfers_with_threshold(&directory, 32);
+    let (runtime, mesh, shutdown) = spawn_mesh(history.replica().node_id());
+    let outside = directory.path().join("outside.txt");
+    fs::write(&outside, b"outside").expect("outside file");
+    let symlink_root = directory.path().join("symlink.txt");
+    symlink(&outside, &symlink_root).expect("root symlink");
+    let escaping_directory = directory.path().join("escaping");
+    fs::create_dir(&escaping_directory).expect("escaping directory");
+    symlink(&outside, escaping_directory.join("escape")).expect("child symlink");
+    let socket_path = directory.path().join("special.sock");
+    let _listener = UnixListener::bind(&socket_path).expect("Unix socket");
+    let oversized = directory.path().join("oversized.bin");
+    fs::write(&oversized, vec![0x5a; 33]).expect("oversized source");
+
+    for (index, path) in [
+        symlink_root.as_path(),
+        escaping_directory.as_path(),
+        socket_path.as_path(),
+        oversized.as_path(),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let outcome = capture_automatic_clipboard(
+            &uri_clipboard(&[path]),
+            &CONTENT_KEY,
+            &mut transfers,
+            &mut history,
+            &mesh,
+            u64::try_from(index + 1).expect("timestamp"),
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("safe rejection");
+        assert_eq!(
+            outcome,
+            AutomaticClipboardCaptureResult::RejectedFiles,
+            "unsafe path was accepted: {}",
+            path.display()
+        );
+        assert!(history.projection().visible_items().is_empty());
+        assert!(transfers.progress().is_empty());
+    }
+    assert!(
+        history
+            .storage()
+            .load_operations()
+            .expect("operation log")
+            .is_empty()
+    );
+
+    shutdown.cancel();
+    runtime.wait().await;
+}
+
+#[tokio::test]
+async fn automatic_non_file_capture_preserves_all_mime_representations() {
+    let mut node = Node::new();
+    let content = ClipboardContent::new_with_limit(
+        vec![
+            ClipboardRepresentation::new(
+                MimeType::new("text/plain;charset=utf-8").expect("plain MIME"),
+                b"plain".to_vec(),
+            ),
+            ClipboardRepresentation::new(
+                MimeType::new("text/html").expect("HTML MIME"),
+                b"<b>plain</b>".to_vec(),
+            ),
+            ClipboardRepresentation::new(
+                MimeType::new("application/x-clip-sync-test").expect("custom MIME"),
+                vec![0, 1, 2, 3],
+            ),
+        ],
+        1024,
+    )
+    .expect("multi-MIME clipboard");
+    let (runtime, mesh, shutdown) = spawn_mesh(node.history.replica().node_id());
+
+    let outcome = capture_automatic_clipboard(
+        &content,
+        &CONTENT_KEY,
+        &mut node.transfers,
+        &mut node.history,
+        &mesh,
+        300,
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("automatic non-file capture");
+    let content_id = match outcome {
+        AutomaticClipboardCaptureResult::Payload { content_id } => content_id,
+        other => panic!("expected payload capture, got {other:?}"),
+    };
+    let retained = node
+        .history
+        .projection()
+        .payload(content_id)
+        .expect("retained payload");
+    assert_eq!(retained.representations().len(), 3);
+    for representation in content.representations() {
+        assert_eq!(
+            retained
+                .representations()
+                .iter()
+                .find(|retained| retained.mime() == representation.mime_type().as_str())
+                .expect("retained MIME")
+                .bytes(),
+            representation.bytes()
+        );
+    }
+    assert!(node.transfers.progress().is_empty());
+
+    shutdown.cancel();
+    runtime.wait().await;
 }
 
 #[test]
