@@ -1,5 +1,7 @@
 # clip-sync development plan
 
+> **Status:** Milestones 0–8 are implemented and validated. The live Hyprland Wayland test and disposable `vd`/`kiwi` NetBird smoke pass. Milestone 9 NixOS configuration is committed; actual host activation and the multi-day soak remain release gates.
+
 ## 1. Product definition
 
 `clip-sync` is a personal, masterless clipboard-history mesh for trusted Linux devices connected through NetBird.
