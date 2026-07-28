@@ -33,6 +33,7 @@
           cargoBuildFeatures = pkgs.lib.optionals withUi [ "ui" ];
           RUST_MIN_STACK = "16777216";
           nativeBuildInputs = with pkgs; [
+            makeWrapper
             perl
             pkg-config
           ];
@@ -44,6 +45,17 @@
               wayland
             ]
           );
+          postFixup = ''
+            wrapProgram "$out/bin/clip-sync" \
+              --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.netbird ]} \
+              ${pkgs.lib.optionalString withUi "--prefix LD_LIBRARY_PATH : ${
+                pkgs.lib.makeLibraryPath [
+                  pkgs.libGL
+                  pkgs.libxkbcommon
+                  pkgs.wayland
+                ]
+              }"}
+          '';
 
           meta = {
             description = "A masterless, encrypted clipboard-history mesh";
