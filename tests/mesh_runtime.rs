@@ -477,9 +477,22 @@ async fn repeated_suspend_resume_churn_keeps_runtime_state_bounded() {
         "listener churn recovery",
     )
     .await;
-    let status = node.handle.status();
-    assert_eq!(status.discovered_addresses, 0);
-    assert_eq!(status.active_connections, 0);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        let status = node.handle.status();
+        if status.listener_address == Some(SocketAddr::new(loopback(1), port))
+            && status.discovered_addresses == 0
+            && status.active_connections == 0
+            && status.last_listener_error.is_none()
+        {
+            break status;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "mesh runtime did not quiesce after discovery churn: {status:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
     assert!(status.last_listener_error.is_none());
 
     node.stop().await;
