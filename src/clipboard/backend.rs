@@ -78,7 +78,7 @@ pub enum BackendError {
 ///
 /// Implementations connect to the display server, probe for capabilities,
 /// and run an event loop that emits [`ClipboardEvent`]s.
-#[async_trait(?Send)]
+#[async_trait]
 pub trait ClipboardBackend: Send + Sync {
     /// Probes the compositor for data-control protocol support.
     ///

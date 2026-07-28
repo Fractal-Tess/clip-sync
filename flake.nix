@@ -4,7 +4,7 @@
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
   outputs =
-    { nixpkgs, ... }:
+    { self, nixpkgs, ... }:
     let
       systems = [
         "x86_64-linux"
@@ -12,7 +12,7 @@
       ];
       forAllSystems = nixpkgs.lib.genAttrs systems;
       packageFor =
-        system:
+        system: withUi:
         let
           pkgs = nixpkgs.legacyPackages.${system};
         in
@@ -21,10 +21,19 @@
           version = "0.1.0";
           src = ./.;
           cargoLock.lockFile = ./Cargo.lock;
+          cargoBuildFeatures = pkgs.lib.optionals withUi [ "ui" ];
           nativeBuildInputs = with pkgs; [
             perl
             pkg-config
           ];
+          buildInputs = pkgs.lib.optionals withUi (
+            with pkgs;
+            [
+              libGL
+              libxkbcommon
+              wayland
+            ]
+          );
 
           meta = {
             description = "A masterless, encrypted clipboard-history mesh";
@@ -37,12 +46,20 @@
     in
     {
       packages = forAllSystems (system: {
-        default = packageFor system;
+        default = packageFor system true;
+        daemon = packageFor system false;
+        with-ui = packageFor system true;
       });
 
       checks = forAllSystems (system: {
-        package = packageFor system;
+        package = packageFor system true;
+        daemon = packageFor system false;
       });
+
+      nixosModules.default = { pkgs, lib, ... }: {
+        imports = [ ./nix/module.nix ];
+        services.clip-sync.package = lib.mkDefault self.packages.${pkgs.system}.default;
+      };
 
       devShells = forAllSystems (
         system:

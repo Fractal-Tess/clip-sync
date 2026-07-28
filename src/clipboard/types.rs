@@ -133,6 +133,11 @@ impl OfferMimeList {
     ///
     /// Returns an error if the count exceeds [`MAX_MIME_TYPES_PER_OFFER`].
     pub fn new(types: Vec<MimeType>) -> Result<Self, OfferError> {
+        let mut seen = HashSet::with_capacity(types.len());
+        let types = types
+            .into_iter()
+            .filter(|mime_type| seen.insert(mime_type.clone()))
+            .collect::<Vec<_>>();
         if types.len() > MAX_MIME_TYPES_PER_OFFER {
             return Err(OfferError::TooManyMimeTypes {
                 count: types.len(),
@@ -572,6 +577,10 @@ impl BoundedMimeOffer {
             return;
         };
 
+        if self.types.contains(&mime_type) {
+            return;
+        }
+
         if self.types.len() == MAX_MIME_TYPES_PER_OFFER {
             self.truncated_count += 1;
             return;
@@ -734,6 +743,17 @@ mod tests {
             OfferMimeList::new(types).unwrap_err(),
             OfferError::TooManyMimeTypes { .. }
         ));
+    }
+
+    #[test]
+    fn duplicate_offer_mime_types_keep_the_first_occurrence() {
+        let plain = MimeType::new("text/plain").unwrap();
+        let html = MimeType::new("text/html").unwrap();
+        let list = OfferMimeList::new(vec![plain.clone(), plain, html]).unwrap();
+
+        assert_eq!(list.len(), 2);
+        assert_eq!(list.types()[0].as_str(), "text/plain");
+        assert_eq!(list.types()[1].as_str(), "text/html");
     }
 
     #[test]

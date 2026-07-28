@@ -65,18 +65,23 @@ pub async fn run(paths: AppPaths, config: Config) -> anyhow::Result<()> {
     let clipboard = WaylandBackend::new();
     let (clipboard_tx, mut clipboard_rx) = tokio::sync::mpsc::unbounded_channel();
     let clipboard_events = clipboard_tx.clone();
-    let clipboard_watch = clipboard.watch(
-        shutdown.clone(),
-        Box::new(move |event| {
-            let _ = clipboard_events.send(event);
-        }),
-    );
+    let clipboard_backend = clipboard.clone();
+    let clipboard_shutdown = shutdown.clone();
+    let mut clipboard_watch = tokio::spawn(async move {
+        clipboard_backend
+            .watch(
+                clipboard_shutdown,
+                Box::new(move |event| {
+                    let _ = clipboard_events.send(event);
+                }),
+            )
+            .await
+    });
 
     tracing::info!(socket = %paths.socket.display(), "clip-sync daemon started");
     let server = ipc::serve(&paths.socket, state.clone(), shutdown.clone());
     let termination = shutdown_signal();
     tokio::pin!(server);
-    tokio::pin!(clipboard_watch);
     tokio::pin!(termination);
     let mut server_finished = false;
     let mut clipboard_finished = false;
@@ -90,8 +95,10 @@ pub async fn run(paths: AppPaths, config: Config) -> anyhow::Result<()> {
             }
             result = &mut clipboard_watch, if !clipboard_finished => {
                 clipboard_finished = true;
-                if let Err(error) = result {
-                    tracing::warn!(%error, "Wayland clipboard monitoring stopped");
+                match result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => tracing::warn!(%error, "Wayland clipboard monitoring stopped"),
+                    Err(error) => tracing::warn!(%error, "Wayland clipboard task failed"),
                 }
             }
             command = command_rx.recv() => {
@@ -127,8 +134,12 @@ pub async fn run(paths: AppPaths, config: Config) -> anyhow::Result<()> {
     if !server_finished {
         server.await.context("stop local IPC")?;
     }
-    if !clipboard_finished && let Err(error) = clipboard_watch.await {
-        tracing::warn!(%error, "Wayland clipboard monitoring stopped");
+    if !clipboard_finished {
+        match clipboard_watch.await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => tracing::warn!(%error, "Wayland clipboard monitoring stopped"),
+            Err(error) => tracing::warn!(%error, "Wayland clipboard task failed"),
+        }
     }
     finish_task(discovery).await;
     tracing::info!("clip-sync daemon stopped");

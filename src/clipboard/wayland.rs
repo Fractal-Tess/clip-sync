@@ -81,7 +81,7 @@ impl WaylandBackend {
     }
 }
 
-#[async_trait(?Send)]
+#[async_trait]
 impl ClipboardBackend for WaylandBackend {
     async fn probe(&self) -> Result<ProbeResult, BackendError> {
         // Wayland connection + registry round-trip is blocking, so run it on
@@ -107,7 +107,24 @@ impl ClipboardBackend for WaylandBackend {
             *active = Some(command_tx);
         }
 
-        let result = run_wayland_watch(shutdown, command_rx, on_event).await;
+        let (done_tx, done_rx) = oneshot::channel();
+        std::thread::Builder::new()
+            .name("clip-sync-wayland".to_owned())
+            .spawn(move || {
+                let result = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|error| BackendError::Connection(error.to_string()))
+                    .and_then(|runtime| {
+                        runtime.block_on(run_wayland_watch(shutdown, command_rx, on_event))
+                    });
+                let _ = done_tx.send(result);
+            })
+            .map_err(|error| BackendError::Connection(error.to_string()))?;
+
+        let result = done_rx.await.map_err(|_| {
+            BackendError::Connection("Wayland event thread stopped unexpectedly".to_owned())
+        })?;
 
         if let Ok(mut active) = self.commands.lock() {
             *active = None;
