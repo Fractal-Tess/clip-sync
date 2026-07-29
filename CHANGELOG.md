@@ -21,5 +21,6 @@ All notable changes will be documented here. The project is pre-alpha; storage, 
 - Typed, quoted, bounded history search across CLI, IPC, and egui with deterministic newest-first results and an in-memory metadata index.
 - Keyboard-first singleton egui switcher, functional control center, and persistent StatusNotifier tray with launch actions.
 - Compact button-free switcher cards with four-line wrapped previews, bottom-aligned metadata footers, bounded lazy image previews, grid-aware keyboard navigation, `Enter` activation, `Ctrl+P` pinning, abbreviated comma-chainable filters, autocomplete, and remembered per-window size and position.
+- Image-focused activation that preserves complete encrypted MIME bundles in history while advertising only image representations to paste targets.
 - Crash-safe authenticated keyslots and offline `rekey` with interrupted-operation recovery.
 - Local security/audit checks, live Wayland validation, disposable two-node deployment testing, Nix UI/daemon packages, and a hardened NixOS user-service module.

@@ -1112,6 +1112,8 @@ async fn activate_history_item(
             let materialized = activated.materialized_manifest();
             (activated.into_content(), materialized)
         };
+    let clipboard_content = image_focused_activation_content(clipboard_content)
+        .context("prepare history item for clipboard activation")?;
     clipboard
         .set_clipboard_content(clipboard_content)
         .await
@@ -1125,6 +1127,33 @@ async fn activate_history_item(
         .context("publish clipboard activation to mesh")?;
     state.set_history(history_items(history.replica())).await;
     Ok(materialized_manifest)
+}
+
+fn image_focused_activation_content(
+    content: ClipboardContent,
+) -> Result<ClipboardContent, crate::clipboard::types::ClipboardContentError> {
+    if !content
+        .representations()
+        .iter()
+        .any(|representation| clipboard_mime_is_image(representation.mime_type().as_str()))
+    {
+        return Ok(content);
+    }
+
+    let representations = content
+        .representations()
+        .iter()
+        .filter(|representation| clipboard_mime_is_image(representation.mime_type().as_str()))
+        .cloned()
+        .collect();
+    ClipboardContent::new_with_max(representations, u64::MAX)
+}
+
+fn clipboard_mime_is_image(mime: &str) -> bool {
+    let essence = mime.split(';').next().unwrap_or(mime).trim();
+    essence
+        .get(..6)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("image/"))
 }
 
 fn schedule_materialization_cleanup(
@@ -2342,6 +2371,53 @@ mod tests {
 
         shutdown.cancel();
         runtime.wait().await;
+    }
+
+    #[test]
+    fn image_activation_excludes_url_and_browser_metadata() {
+        let content = ClipboardContent::new(vec![
+            ClipboardRepresentation::new(
+                MimeType::new("chromium/x-source-url").unwrap(),
+                b"file:///tmp/image.png".to_vec(),
+            ),
+            ClipboardRepresentation::new(
+                MimeType::new("image/png").unwrap(),
+                vec![0x89, b'P', b'N', b'G'],
+            ),
+            ClipboardRepresentation::new(
+                MimeType::new("text/html").unwrap(),
+                b"<img src=\"file:///tmp/image.png\">".to_vec(),
+            ),
+        ])
+        .unwrap();
+
+        let activated = image_focused_activation_content(content).unwrap();
+
+        assert_eq!(activated.representations().len(), 1);
+        assert_eq!(
+            activated.representations()[0].mime_type().as_str(),
+            "image/png"
+        );
+        assert_eq!(
+            activated.representations()[0].bytes(),
+            [0x89, b'P', b'N', b'G']
+        );
+    }
+
+    #[test]
+    fn non_image_activation_preserves_the_complete_bundle() {
+        let content = ClipboardContent::new(vec![
+            ClipboardRepresentation::new(MimeType::new("text/plain").unwrap(), b"plain".to_vec()),
+            ClipboardRepresentation::new(
+                MimeType::new("text/html").unwrap(),
+                b"<b>plain</b>".to_vec(),
+            ),
+        ])
+        .unwrap();
+
+        let activated = image_focused_activation_content(content.clone()).unwrap();
+
+        assert_eq!(activated, content);
     }
 
     #[test]
