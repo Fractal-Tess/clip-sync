@@ -1,14 +1,19 @@
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
     fs::{File, OpenOptions},
-    os::unix::net::{UnixListener as StdUnixListener, UnixStream as StdUnixStream},
+    io::Write as _,
+    os::unix::{
+        fs::OpenOptionsExt as _,
+        net::{UnixListener as StdUnixListener, UnixStream as StdUnixStream},
+    },
     path::{Path, PathBuf},
+    process::Command,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
         mpsc as std_mpsc,
     },
-    thread::JoinHandle,
+    thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
 
@@ -16,6 +21,7 @@ use eframe::egui::{
     self, Color32, CornerRadius, FontId, Frame, Key, Margin, RichText, ScrollArea, Stroke, Vec2,
 };
 use fs2::FileExt;
+use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -43,7 +49,8 @@ const ERROR: Color32 = Color32::from_rgb(242, 119, 119);
 const SUCCESS: Color32 = Color32::from_rgb(105, 219, 160);
 const SEARCH_DEBOUNCE: Duration = Duration::from_millis(120);
 const HISTORY_GRID_GAP: f32 = 8.0;
-const HISTORY_CARD_HEIGHT: f32 = 122.0;
+const SWITCHER_HISTORY_CARD_HEIGHT: f32 = 94.0;
+const CONTROL_HISTORY_CARD_HEIGHT: f32 = 122.0;
 const HISTORY_PREVIEW_HEIGHT: f32 = 46.0;
 const SWITCHER_FOOTER_HEIGHT: f32 = 44.0;
 const MAX_IMAGE_PREVIEW_WIDTH: u32 = 320;
@@ -53,6 +60,35 @@ const MAX_IMAGE_PREVIEW_HEIGHT: u32 = 180;
 pub enum UiMode {
     Switcher,
     Control,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+struct WindowGeometry {
+    x: Option<i32>,
+    y: Option<i32>,
+    width: u32,
+    height: u32,
+}
+
+impl WindowGeometry {
+    fn is_valid(self) -> bool {
+        let valid_position = match (self.x, self.y) {
+            (Some(x), Some(y)) => x.abs() <= 100_000 && y.abs() <= 100_000,
+            (None, None) => true,
+            _ => false,
+        };
+        valid_position
+            && (480..=16_384).contains(&self.width)
+            && (300..=16_384).contains(&self.height)
+    }
+}
+
+#[derive(Deserialize)]
+struct HyprlandClient {
+    address: String,
+    class: String,
+    at: [i32; 2],
+    size: [i32; 2],
 }
 
 /// Starts the optional native egui process using the caller's resolved XDG paths.
@@ -78,13 +114,30 @@ pub fn run(mode: UiMode, paths: AppPaths) -> Result<(), String> {
             true,
         ),
     };
+    prepare_window_state_directory(&paths.state_dir)?;
+    let window_state_path = window_state_path(&paths.state_dir, mode);
+    let saved_geometry = load_window_geometry(&window_state_path);
+    let restored_size = saved_geometry.map_or(size, |geometry| {
+        Vec2::new(
+            geometry_coordinate_to_f32(geometry.width),
+            geometry_coordinate_to_f32(geometry.height),
+        )
+    });
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_title(title)
+        .with_app_id(app_id)
+        .with_inner_size(restored_size)
+        .with_min_inner_size(Vec2::new(480.0, 300.0))
+        .with_decorations(decorations);
+    if let Some(geometry) = saved_geometry
+        && let (Some(x), Some(y)) = (geometry.x, geometry.y)
+    {
+        viewport =
+            viewport.with_position([geometry_position_to_f32(x), geometry_position_to_f32(y)]);
+        restore_hyprland_geometry(app_id, geometry);
+    }
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title(title)
-            .with_app_id(app_id)
-            .with_inner_size(size)
-            .with_min_inner_size(Vec2::new(480.0, 300.0))
-            .with_decorations(decorations),
+        viewport,
         ..Default::default()
     };
 
@@ -93,12 +146,231 @@ pub fn run(mode: UiMode, paths: AppPaths) -> Result<(), String> {
         options,
         Box::new(move |context| {
             configure_style(&context.egui_ctx);
-            let app = ClipSyncApp::new(mode, paths, context.egui_ctx.clone(), instance)
-                .map_err(std::io::Error::other)?;
+            let app = ClipSyncApp::new(
+                mode,
+                paths,
+                context.egui_ctx.clone(),
+                instance,
+                app_id,
+                window_state_path,
+                saved_geometry,
+            )
+            .map_err(std::io::Error::other)?;
             Ok(Box::new(app))
         }),
     )
     .map_err(|error| error.to_string())
+}
+
+fn window_state_path(state_dir: &Path, mode: UiMode) -> PathBuf {
+    let name = match mode {
+        UiMode::Switcher => "switcher-window.json",
+        UiMode::Control => "control-window.json",
+    };
+    state_dir.join(name)
+}
+
+fn prepare_window_state_directory(state_dir: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(state_dir).map_err(|error| {
+        format!(
+            "could not create UI state directory {}: {error}",
+            state_dir.display()
+        )
+    })?;
+    let metadata = std::fs::symlink_metadata(state_dir)
+        .map_err(|error| format!("could not inspect {}: {error}", state_dir.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(format!(
+            "refusing unsafe UI state directory {}",
+            state_dir.display()
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+
+        if metadata.uid() != rustix::process::getuid().as_raw() {
+            return Err(format!(
+                "refusing UI state directory not owned by this user: {}",
+                state_dir.display()
+            ));
+        }
+    }
+    set_private_mode(state_dir, 0o700)
+}
+
+fn load_window_geometry(path: &Path) -> Option<WindowGeometry> {
+    let metadata = std::fs::symlink_metadata(path).ok()?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return None;
+    }
+    let geometry = serde_json::from_slice::<WindowGeometry>(&std::fs::read(path).ok()?).ok()?;
+    geometry.is_valid().then_some(geometry)
+}
+
+fn save_window_geometry(path: &Path, geometry: WindowGeometry) -> Result<(), String> {
+    if !geometry.is_valid() {
+        return Err("refusing to persist invalid window geometry".to_owned());
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("window state path has no parent: {}", path.display()))?;
+    prepare_window_state_directory(parent)?;
+    let temporary = parent.join(format!(
+        ".window-state-{}-{}.tmp",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    let result = (|| {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temporary)
+            .map_err(|error| format!("could not create {}: {error}", temporary.display()))?;
+        let encoded = serde_json::to_vec(&geometry)
+            .map_err(|error| format!("could not encode window geometry: {error}"))?;
+        file.write_all(&encoded)
+            .map_err(|error| format!("could not write {}: {error}", temporary.display()))?;
+        file.sync_all()
+            .map_err(|error| format!("could not sync {}: {error}", temporary.display()))?;
+        std::fs::rename(&temporary, path).map_err(|error| {
+            format!("could not replace window state {}: {error}", path.display())
+        })?;
+        set_private_mode(path, 0o600)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
+}
+
+fn query_hyprland_geometry(app_id: &str) -> Option<WindowGeometry> {
+    let output = Command::new("hyprctl")
+        .args(["-j", "clients"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let clients = serde_json::from_slice::<Vec<HyprlandClient>>(&output.stdout).ok()?;
+    let client = clients.into_iter().find(|client| client.class == app_id)?;
+    let width = u32::try_from(client.size[0]).ok()?;
+    let height = u32::try_from(client.size[1]).ok()?;
+    let geometry = WindowGeometry {
+        x: Some(client.at[0]),
+        y: Some(client.at[1]),
+        width,
+        height,
+    };
+    geometry.is_valid().then_some(geometry)
+}
+
+fn restore_hyprland_geometry(app_id: &'static str, geometry: WindowGeometry) {
+    if std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_none() {
+        return;
+    }
+    thread::spawn(move || {
+        for _ in 0..20 {
+            let Some(client) = query_hyprland_client(app_id) else {
+                thread::sleep(Duration::from_millis(50));
+                continue;
+            };
+            let selector = format!("address:{}", client.address);
+            let resize = format!("exact {} {},{selector}", geometry.width, geometry.height);
+            let _ = Command::new("hyprctl")
+                .args(["dispatch", "resizewindowpixel", &resize])
+                .output();
+            if let (Some(x), Some(y)) = (geometry.x, geometry.y) {
+                let movement = format!("exact {x} {y},{selector}");
+                let _ = Command::new("hyprctl")
+                    .args(["dispatch", "movewindowpixel", &movement])
+                    .output();
+            }
+            return;
+        }
+    });
+}
+
+fn query_hyprland_client(app_id: &str) -> Option<HyprlandClient> {
+    let output = Command::new("hyprctl")
+        .args(["-j", "clients"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    serde_json::from_slice::<Vec<HyprlandClient>>(&output.stdout)
+        .ok()?
+        .into_iter()
+        .find(|client| client.class == app_id)
+}
+
+fn context_window_geometry(
+    context: &egui::Context,
+    previous: Option<WindowGeometry>,
+) -> Option<WindowGeometry> {
+    if let Some(rect) = context.input(|input| input.viewport().outer_rect)
+        && rect.is_finite()
+        && let (Some(x), Some(y), Some(width), Some(height)) = (
+            rounded_geometry_position(rect.min.x),
+            rounded_geometry_position(rect.min.y),
+            rounded_geometry_coordinate(rect.width()),
+            rounded_geometry_coordinate(rect.height()),
+        )
+    {
+        let geometry = WindowGeometry {
+            x: Some(x),
+            y: Some(y),
+            width,
+            height,
+        };
+        if geometry.is_valid() {
+            return Some(geometry);
+        }
+    }
+
+    let size = context.content_rect().size();
+    let geometry = WindowGeometry {
+        x: previous.and_then(|geometry| geometry.x),
+        y: previous.and_then(|geometry| geometry.y),
+        width: rounded_geometry_coordinate(size.x)?,
+        height: rounded_geometry_coordinate(size.y)?,
+    };
+    geometry.is_valid().then_some(geometry)
+}
+
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "validated geometry coordinates are far below f32's exact integer limit"
+)]
+fn geometry_coordinate_to_f32(value: u32) -> f32 {
+    value as f32
+}
+
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "validated window positions are far below f32's exact integer limit"
+)]
+fn geometry_position_to_f32(value: i32) -> f32 {
+    value as f32
+}
+
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "the finite value is range-checked before rounding"
+)]
+fn rounded_geometry_position(value: f32) -> Option<i32> {
+    (value.is_finite() && value.abs() <= 100_000.0).then(|| value.round() as i32)
+}
+
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "the finite positive value is range-checked before rounding"
+)]
+fn rounded_geometry_coordinate(value: f32) -> Option<u32> {
+    (value.is_finite() && (0.0..=16_384.0).contains(&value)).then(|| value.round() as u32)
 }
 
 fn configure_style(context: &egui::Context) {
@@ -307,6 +579,9 @@ struct ClipSyncApp {
     mode: UiMode,
     paths: AppPaths,
     context: egui::Context,
+    app_id: &'static str,
+    window_state_path: PathBuf,
+    window_geometry: Option<WindowGeometry>,
     _instance: UiInstance,
     ipc_worker: IpcWorker,
     event_rx: std_mpsc::Receiver<UiEvent>,
@@ -354,6 +629,9 @@ impl ClipSyncApp {
         paths: AppPaths,
         context: egui::Context,
         mut instance: UiInstance,
+        app_id: &'static str,
+        window_state_path: PathBuf,
+        window_geometry: Option<WindowGeometry>,
     ) -> Result<Self, String> {
         let (event_tx, event_rx) = std_mpsc::channel();
         instance.start_focus_listener(context.clone())?;
@@ -363,6 +641,9 @@ impl ClipSyncApp {
             mode,
             paths,
             context,
+            app_id,
+            window_state_path,
+            window_geometry,
             _instance: instance,
             ipc_worker,
             event_rx,
@@ -1055,6 +1336,11 @@ impl ClipSyncApp {
         let card_width = ((ui.available_width() - total_gap - 14.0) / columns_f32)
             .floor()
             .max(180.0);
+        let card_height = if allow_delete {
+            CONTROL_HISTORY_CARD_HEIGHT
+        } else {
+            SWITCHER_HISTORY_CARD_HEIGHT
+        };
         let mut action = None;
         let mut requested_previews = Vec::new();
         let grid_id = match self.mode {
@@ -1087,7 +1373,7 @@ impl ClipSyncApp {
                                     ui.vertical(|ui| {
                                         ui.spacing_mut().item_spacing.y = 3.0;
                                         ui.set_width((card_width - 16.0).max(160.0));
-                                        ui.set_min_height(HISTORY_CARD_HEIGHT - 16.0);
+                                        ui.set_min_height(card_height - 16.0);
                                         history_card_preview(ui, &item, preview);
 
                                         let mime = item
@@ -1119,20 +1405,20 @@ impl ClipSyncApp {
                                             )
                                             .truncate(),
                                         );
-                                        ui.horizontal(|ui| {
-                                            if ui
-                                                .add_enabled(
-                                                    !self.mutation_pending,
-                                                    egui::Button::new("Activate").small(),
-                                                )
-                                                .clicked()
-                                            {
-                                                action = Some(HistoryAction::Activate(
-                                                    item.content_id.clone(),
-                                                ));
-                                            }
-                                            if allow_delete
-                                                && ui
+                                        if allow_delete {
+                                            ui.horizontal(|ui| {
+                                                if ui
+                                                    .add_enabled(
+                                                        !self.mutation_pending,
+                                                        egui::Button::new("Activate").small(),
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    action = Some(HistoryAction::Activate(
+                                                        item.content_id.clone(),
+                                                    ));
+                                                }
+                                                if ui
                                                     .add_enabled(
                                                         !self.mutation_pending,
                                                         egui::Button::new(if item.pinned {
@@ -1143,25 +1429,25 @@ impl ClipSyncApp {
                                                         .small(),
                                                     )
                                                     .clicked()
-                                            {
-                                                action = Some(HistoryAction::Pin {
-                                                    content_id: item.content_id.clone(),
-                                                    pinned: !item.pinned,
-                                                });
-                                            }
-                                            if allow_delete
-                                                && ui
+                                                {
+                                                    action = Some(HistoryAction::Pin {
+                                                        content_id: item.content_id.clone(),
+                                                        pinned: !item.pinned,
+                                                    });
+                                                }
+                                                if ui
                                                     .add_enabled(
                                                         !self.mutation_pending,
                                                         egui::Button::new("Delete").small(),
                                                     )
                                                     .clicked()
-                                            {
-                                                action = Some(HistoryAction::Delete(
-                                                    item.content_id.clone(),
-                                                ));
-                                            }
-                                        });
+                                                {
+                                                    action = Some(HistoryAction::Delete(
+                                                        item.content_id.clone(),
+                                                    ));
+                                                }
+                                            });
+                                        }
                                     });
                                 });
                             let response = card.response.interact(egui::Sense::click());
@@ -1680,6 +1966,7 @@ impl ClipSyncApp {
 
 impl eframe::App for ClipSyncApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.window_geometry = context_window_geometry(ui.ctx(), self.window_geometry);
         ui.painter()
             .rect_filled(ui.max_rect(), CornerRadius::ZERO, BACKGROUND);
         self.poll_events();
@@ -1689,6 +1976,19 @@ impl eframe::App for ClipSyncApp {
             UiMode::Switcher => self.switcher(ui),
             UiMode::Control => self.control(ui),
         }
+    }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        let geometry = query_hyprland_geometry(self.app_id).or(self.window_geometry);
+        if let Some(geometry) = geometry
+            && let Err(error) = save_window_geometry(&self.window_state_path, geometry)
+        {
+            tracing::warn!(%error, "could not persist UI window geometry");
+        }
+    }
+
+    fn persist_egui_memory(&self) -> bool {
+        false
     }
 }
 
@@ -2716,6 +3016,70 @@ fn move_grid_selection(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn window_geometry_is_private_and_round_trips() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let path = window_state_path(temporary.path(), UiMode::Switcher);
+        let geometry = WindowGeometry {
+            x: Some(-1200),
+            y: Some(80),
+            width: 860,
+            height: 510,
+        };
+
+        save_window_geometry(&path, geometry).expect("save geometry");
+
+        assert_eq!(load_window_geometry(&path), Some(geometry));
+        assert_eq!(
+            std::fs::metadata(&path)
+                .expect("window state metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert_ne!(
+            window_state_path(temporary.path(), UiMode::Control),
+            window_state_path(temporary.path(), UiMode::Switcher)
+        );
+    }
+
+    #[test]
+    fn invalid_window_geometry_is_ignored() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let path = window_state_path(temporary.path(), UiMode::Control);
+        std::fs::write(&path, br#"{"x":10,"y":null,"width":1040,"height":700}"#)
+            .expect("write invalid geometry");
+
+        assert_eq!(load_window_geometry(&path), None);
+        assert!(
+            save_window_geometry(
+                &path,
+                WindowGeometry {
+                    x: None,
+                    y: None,
+                    width: 120,
+                    height: 100,
+                }
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn hyprland_client_geometry_deserializes() {
+        let client = serde_json::from_str::<HyprlandClient>(
+            r#"{"address":"0xabc","class":"clip-sync-switcher","at":[100,200],"size":[720,420]}"#,
+        )
+        .expect("Hyprland client");
+
+        assert_eq!(client.address, "0xabc");
+        assert_eq!(client.at, [100, 200]);
+        assert_eq!(client.size, [720, 420]);
+    }
 
     #[test]
     fn grid_selection_stays_within_rows_and_results() {

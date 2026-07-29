@@ -23,7 +23,7 @@ Most clipboard sync tools assume a central service or immediately replace every 
 - **Offline reconciliation.** Peers catch up after reconnecting.
 - **Private-network first.** The initial transport targets trusted devices connected through NetBird.
 - **Encrypted persistence.** Clipboard payloads and searchable metadata are designed to remain encrypted at rest.
-- **Keyboard first.** An optional egui switcher is planned for fast search and activation.
+- **Keyboard first.** The optional egui switcher provides fast search, grid navigation, pinning, and activation.
 
 ## Initial target
 
@@ -51,7 +51,7 @@ clip-sync doctor --json
 clip-sync rekey --old-key-file OLD --new-key-file NEW
 ```
 
-The UI commands will only be available when built with the optional `ui` Cargo feature.
+The UI commands will only be available when built with the optional `ui` Cargo feature. The switcher uses arrow keys for grid navigation, `Enter` to activate the selected item, `Ctrl+P` to pin or unpin it, and `Esc` to close. Switcher and Control Center dimensions and positions are remembered independently; Hyprland positioning is restored through `hyprctl` because the Wayland protocol does not expose client-controlled placement.
 
 History search combines case-insensitive free text with typed filters. Commas
 and whitespace chain filters conjunctively, quoted phrases preserve separators,
