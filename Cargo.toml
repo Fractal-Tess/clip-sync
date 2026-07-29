@@ -37,7 +37,7 @@ hmac = "0.13.0"
 hostname = "0.4.2"
 image = { version = "0.25.10", default-features = false, features = ["bmp", "gif", "jpeg", "png", "tiff", "webp"] }
 ipnet = { version = "2.12.0", features = ["serde"] }
-ksni = { version = "0.3.6", optional = true }
+ksni = { version = "0.3.6", default-features = false, features = ["async-io"], optional = true }
 prost = "0.14.4"
 quinn = { version = "0.11.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
 rcgen = { version = "0.14.8", default-features = false, features = ["crypto", "ring"] }

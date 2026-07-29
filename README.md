@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/logo.svg" alt="clip-sync logo" width="140" />
+  <img src="assets/logo.png" alt="clip-sync logo" width="140" />
 </p>
 
 <h1 align="center">clip-sync</h1>

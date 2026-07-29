@@ -6,7 +6,7 @@ All notable changes will be documented here. The project is pre-alpha; storage, 
 
 ### Added
 
-- Public product plan, security policy, contribution guide, scalable application/tray icon system, and branded mesh splash art.
+- Public product plan, security policy, contribution guide, multi-size application/tray icon system, and branded mesh splash art.
 - Deterministic operation model with HLC ordering and gap-aware frontiers.
 - Validated TOML configuration, NetBird discovery, and Protobuf Unix IPC.
 - SQLCipher encrypted operation log with restart recovery and private file permissions.
