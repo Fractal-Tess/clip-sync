@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/logo.png" alt="clip-sync logo" width="180" />
+  <img src="assets/logo.svg" alt="clip-sync logo" width="140" />
 </p>
 
 <h1 align="center">clip-sync</h1>
@@ -37,6 +37,7 @@ The current pre-release implements the complete Linux daily-driver path; real-de
 clip-sync daemon
 clip-sync ui switcher
 clip-sync ui control
+clip-sync ui tray
 clip-sync status --json
 clip-sync peers --json
 clip-sync history search 'd:kiwi,t:text,p:false,"error message"' --json
@@ -51,7 +52,7 @@ clip-sync doctor --json
 clip-sync rekey --old-key-file OLD --new-key-file NEW
 ```
 
-The UI commands will only be available when built with the optional `ui` Cargo feature. The switcher uses arrow keys for grid navigation, `Enter` to activate the selected item, `Ctrl+P` to pin or unpin it, and `Esc` to close. Switcher and Control Center dimensions and positions are remembered independently; Hyprland positioning is restored through `hyprctl` because the Wayland protocol does not expose client-controlled placement.
+The UI commands will only be available when built with the optional `ui` Cargo feature. The switcher uses arrow keys for grid navigation, `Enter` to activate the selected item, `Ctrl+P` to pin or unpin it, and `Esc` to close. Switcher and Control Center dimensions and positions are remembered independently; Hyprland positioning is restored through `hyprctl` because the Wayland protocol does not expose client-controlled placement. The singleton StatusNotifier tray opens the switcher on left click and exposes History Switcher, Control Center, and Quit Tray actions; quitting it does not stop synchronization.
 
 History search combines case-insensitive free text with typed filters. Commas
 and whitespace chain filters conjunctively, quoted phrases preserve separators,

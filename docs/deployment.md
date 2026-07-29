@@ -4,7 +4,7 @@
 
 The flake exports `nixosModules.default` and two packages:
 
-- `packages.<system>.default` / `with-ui`: daemon, CLI, and egui UI;
+- `packages.<system>.default` / `with-ui`: daemon, CLI, egui UI, and StatusNotifier tray;
 - `packages.<system>.daemon`: daemon and CLI without graphics dependencies.
 
 Add the flake input and module, then enable the user service:
@@ -18,10 +18,11 @@ Add the flake input and module, then enable the user service:
   imports = [ inputs.clip-sync.nixosModules.default ];
 
   services.clip-sync.enable = true;
+  # services.clip-sync.tray.enable = false; # for daemon-only or tray-less desktops
 }
 ```
 
-By default, each user service reads `%h/.config/clip-sync/config.toml`. The file may be a writable Stow symlink. The service starts with `graphical-session.target`, restarts on failure, uses a `0077` umask, and does not require NetBird to provide local history.
+By default, each user service reads `%h/.config/clip-sync/config.toml`. The file may be a writable Stow symlink. The daemon and tray start with `graphical-session.target`, restart on failure, use a `0077` umask, and do not require NetBird to provide local history. The tray opens the switcher on left click and can launch either UI; set `services.clip-sync.tray.enable = false` when selecting the daemon-only package or when no StatusNotifier host is available.
 
 The graphical session must import `WAYLAND_DISPLAY` into the systemd user manager. UWSM normally does this. Verify with:
 

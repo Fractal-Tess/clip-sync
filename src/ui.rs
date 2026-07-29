@@ -49,9 +49,9 @@ const ERROR: Color32 = Color32::from_rgb(242, 119, 119);
 const SUCCESS: Color32 = Color32::from_rgb(105, 219, 160);
 const SEARCH_DEBOUNCE: Duration = Duration::from_millis(120);
 const HISTORY_GRID_GAP: f32 = 8.0;
-const SWITCHER_HISTORY_CARD_HEIGHT: f32 = 94.0;
-const CONTROL_HISTORY_CARD_HEIGHT: f32 = 122.0;
-const HISTORY_PREVIEW_HEIGHT: f32 = 46.0;
+const SWITCHER_HISTORY_CARD_HEIGHT: f32 = 108.0;
+const CONTROL_HISTORY_CARD_HEIGHT: f32 = 132.0;
+const HISTORY_PREVIEW_HEIGHT: f32 = 58.0;
 const SWITCHER_FOOTER_HEIGHT: f32 = 44.0;
 const MAX_IMAGE_PREVIEW_WIDTH: u32 = 320;
 const MAX_IMAGE_PREVIEW_HEIGHT: u32 = 180;
@@ -123,9 +123,11 @@ pub fn run(mode: UiMode, paths: AppPaths) -> Result<(), String> {
             geometry_coordinate_to_f32(geometry.height),
         )
     });
+    let native_icon = decode_brand_icon()?;
     let mut viewport = egui::ViewportBuilder::default()
         .with_title(title)
         .with_app_id(app_id)
+        .with_icon(Arc::new(native_icon))
         .with_inner_size(restored_size)
         .with_min_inner_size(Vec2::new(480.0, 300.0))
         .with_decorations(decorations);
@@ -160,6 +162,33 @@ pub fn run(mode: UiMode, paths: AppPaths) -> Result<(), String> {
         }),
     )
     .map_err(|error| error.to_string())
+}
+
+fn decode_brand_icon() -> Result<egui::IconData, String> {
+    let image = image::load_from_memory(include_bytes!("../assets/icon-64.png"))
+        .map_err(|error| format!("could not decode embedded application icon: {error}"))?
+        .into_rgba8();
+    let (width, height) = image.dimensions();
+    Ok(egui::IconData {
+        rgba: image.into_raw(),
+        width,
+        height,
+    })
+}
+
+fn load_brand_texture(context: &egui::Context) -> Result<egui::TextureHandle, String> {
+    let image = image::load_from_memory(include_bytes!("../assets/icon-64.png"))
+        .map_err(|error| format!("could not decode embedded brand icon: {error}"))?
+        .into_rgba8();
+    let size = [
+        usize::try_from(image.width()).map_err(|_| "brand icon width does not fit usize")?,
+        usize::try_from(image.height()).map_err(|_| "brand icon height does not fit usize")?,
+    ];
+    Ok(context.load_texture(
+        "clip-sync-brand-icon",
+        egui::ColorImage::from_rgba_unmultiplied(size, image.as_raw()),
+        egui::TextureOptions::LINEAR,
+    ))
 }
 
 fn window_state_path(state_dir: &Path, mode: UiMode) -> PathBuf {
@@ -582,6 +611,7 @@ struct ClipSyncApp {
     app_id: &'static str,
     window_state_path: PathBuf,
     window_geometry: Option<WindowGeometry>,
+    brand_icon: egui::TextureHandle,
     _instance: UiInstance,
     ipc_worker: IpcWorker,
     event_rx: std_mpsc::Receiver<UiEvent>,
@@ -636,6 +666,7 @@ impl ClipSyncApp {
         let (event_tx, event_rx) = std_mpsc::channel();
         instance.start_focus_listener(context.clone())?;
         let ipc_worker = spawn_ipc_worker(paths.socket.clone(), event_tx, context.clone());
+        let brand_icon = load_brand_texture(&context)?;
 
         let mut app = Self {
             mode,
@@ -644,6 +675,7 @@ impl ClipSyncApp {
             app_id,
             window_state_path,
             window_geometry,
+            brand_icon,
             _instance: instance,
             ipc_worker,
             event_rx,
@@ -1005,7 +1037,7 @@ impl ClipSyncApp {
             .fill(BACKGROUND)
             .inner_margin(Margin::same(22))
             .show(ui, |ui| {
-                brand_header(ui, "history switcher");
+                brand_header(ui, &self.brand_icon, "history switcher");
                 ui.add_space(8.0);
 
                 let search = ui.add_sized(
@@ -1172,7 +1204,7 @@ impl ClipSyncApp {
             .inner_margin(Margin::same(20))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.heading(RichText::new("clip-sync").color(Color32::WHITE));
+                    ui.add(egui::Image::new(&self.brand_icon).fit_to_exact_size(Vec2::splat(24.0)));
                     ui.label(
                         RichText::new("CONTROL CENTER")
                             .color(CYAN)
@@ -1370,84 +1402,109 @@ impl ClipSyncApp {
                                 .corner_radius(CornerRadius::same(8))
                                 .inner_margin(Margin::same(8))
                                 .show(ui, |ui| {
+                                    let inner_size = Vec2::new(
+                                        (card_width - 16.0).max(160.0),
+                                        card_height - 16.0,
+                                    );
                                     ui.vertical(|ui| {
+                                        ui.set_min_size(inner_size);
+                                        ui.set_max_size(inner_size);
                                         ui.spacing_mut().item_spacing.y = 3.0;
-                                        ui.set_width((card_width - 16.0).max(160.0));
-                                        ui.set_min_height(card_height - 16.0);
-                                        history_card_preview(ui, &item, preview);
+                                        history_card_preview(
+                                            ui,
+                                            &item,
+                                            preview,
+                                            Vec2::new(inner_size.x, HISTORY_PREVIEW_HEIGHT),
+                                        );
 
-                                        let mime = item
-                                            .mime_types
-                                            .first()
-                                            .map_or("unknown", String::as_str);
-                                        ui.add(
-                                            egui::Label::new(
-                                                RichText::new(format!(
-                                                    "{mime} · {}{}",
-                                                    format_bytes(item.logical_size),
-                                                    if item.pinned { " · PIN" } else { "" }
-                                                ))
-                                                .color(MUTED)
-                                                .monospace()
-                                                .size(10.0),
-                                            )
-                                            .truncate(),
+                                        let footer_size = Vec2::new(
+                                            inner_size.x,
+                                            (inner_size.y - HISTORY_PREVIEW_HEIGHT - 3.0).max(0.0),
                                         );
-                                        ui.add(
-                                            egui::Label::new(
-                                                RichText::new(format!(
-                                                    "source {}",
-                                                    history_source_label(&item)
-                                                ))
-                                                .color(MUTED)
-                                                .monospace()
-                                                .size(10.0),
-                                            )
-                                            .truncate(),
-                                        );
-                                        if allow_delete {
-                                            ui.horizontal(|ui| {
-                                                if ui
-                                                    .add_enabled(
-                                                        !self.mutation_pending,
-                                                        egui::Button::new("Activate").small(),
+                                        ui.allocate_ui_with_layout(
+                                            footer_size,
+                                            egui::Layout::bottom_up(egui::Align::Min),
+                                            |ui| {
+                                                let mime = item
+                                                    .mime_types
+                                                    .first()
+                                                    .map_or("unknown", String::as_str);
+                                                ui.add(
+                                                    egui::Label::new(
+                                                        RichText::new(format!(
+                                                            "source {}",
+                                                            history_source_label(&item)
+                                                        ))
+                                                        .color(MUTED)
+                                                        .monospace()
+                                                        .size(10.0),
                                                     )
-                                                    .clicked()
-                                                {
-                                                    action = Some(HistoryAction::Activate(
-                                                        item.content_id.clone(),
-                                                    ));
-                                                }
-                                                if ui
-                                                    .add_enabled(
-                                                        !self.mutation_pending,
-                                                        egui::Button::new(if item.pinned {
-                                                            "Unpin"
-                                                        } else {
-                                                            "Pin"
-                                                        })
-                                                        .small(),
+                                                    .truncate(),
+                                                );
+                                                ui.add(
+                                                    egui::Label::new(
+                                                        RichText::new(format!(
+                                                            "{mime} · {}{}",
+                                                            format_bytes(item.logical_size),
+                                                            if item.pinned {
+                                                                " · PIN"
+                                                            } else {
+                                                                ""
+                                                            }
+                                                        ))
+                                                        .color(MUTED)
+                                                        .monospace()
+                                                        .size(10.0),
                                                     )
-                                                    .clicked()
-                                                {
-                                                    action = Some(HistoryAction::Pin {
-                                                        content_id: item.content_id.clone(),
-                                                        pinned: !item.pinned,
+                                                    .truncate(),
+                                                );
+                                                ui.separator();
+                                                if allow_delete {
+                                                    ui.horizontal(|ui| {
+                                                        if ui
+                                                            .add_enabled(
+                                                                !self.mutation_pending,
+                                                                egui::Button::new("Activate")
+                                                                    .small(),
+                                                            )
+                                                            .clicked()
+                                                        {
+                                                            action = Some(HistoryAction::Activate(
+                                                                item.content_id.clone(),
+                                                            ));
+                                                        }
+                                                        if ui
+                                                            .add_enabled(
+                                                                !self.mutation_pending,
+                                                                egui::Button::new(if item.pinned {
+                                                                    "Unpin"
+                                                                } else {
+                                                                    "Pin"
+                                                                })
+                                                                .small(),
+                                                            )
+                                                            .clicked()
+                                                        {
+                                                            action = Some(HistoryAction::Pin {
+                                                                content_id: item.content_id.clone(),
+                                                                pinned: !item.pinned,
+                                                            });
+                                                        }
+                                                        if ui
+                                                            .add_enabled(
+                                                                !self.mutation_pending,
+                                                                egui::Button::new("Delete").small(),
+                                                            )
+                                                            .clicked()
+                                                        {
+                                                            action = Some(HistoryAction::Delete(
+                                                                item.content_id.clone(),
+                                                            ));
+                                                        }
                                                     });
                                                 }
-                                                if ui
-                                                    .add_enabled(
-                                                        !self.mutation_pending,
-                                                        egui::Button::new("Delete").small(),
-                                                    )
-                                                    .clicked()
-                                                {
-                                                    action = Some(HistoryAction::Delete(
-                                                        item.content_id.clone(),
-                                                    ));
-                                                }
-                                            });
-                                        }
+                                            },
+                                        );
                                     });
                                 });
                             let response = card.response.interact(egui::Sense::click());
@@ -2710,8 +2767,8 @@ fn history_card_preview(
     ui: &mut egui::Ui,
     item: &HistoryItem,
     preview: Option<&ImagePreviewState>,
+    size: Vec2,
 ) {
-    let size = Vec2::new(ui.available_width(), HISTORY_PREVIEW_HEIGHT);
     if history_item_has_image(item) {
         ui.allocate_ui_with_layout(
             size,
@@ -2738,11 +2795,22 @@ fn history_card_preview(
             item.preview.trim()
         };
         ui.allocate_ui(size, |ui| {
-            ui.add(
-                egui::Label::new(RichText::new(title).color(Color32::WHITE).size(14.0)).truncate(),
-            );
+            let layout = history_text_layout(title, size.x);
+            let galley = ui.fonts_mut(|fonts| fonts.layout_job(layout));
+            ui.add(egui::Label::new(galley));
         });
     }
+}
+
+fn history_text_layout(text: &str, width: f32) -> egui::text::LayoutJob {
+    let mut layout = egui::text::LayoutJob::simple(
+        text.to_owned(),
+        FontId::proportional(12.0),
+        Color32::WHITE,
+        width,
+    );
+    layout.wrap.max_rows = 4;
+    layout
 }
 
 fn short_identifier(identifier: &str) -> String {
@@ -2754,16 +2822,10 @@ fn short_identifier(identifier: &str) -> String {
     short
 }
 
-fn brand_header(ui: &mut egui::Ui, subtitle: &str) {
+fn brand_header(ui: &mut egui::Ui, icon: &egui::TextureHandle, subtitle: &str) {
     ui.horizontal(|ui| {
-        ui.label(RichText::new("CLIP").strong().color(CYAN).size(13.0));
-        ui.label(
-            RichText::new("SYNC")
-                .strong()
-                .color(Color32::WHITE)
-                .size(13.0),
-        );
-        ui.add_space(6.0);
+        ui.add(egui::Image::new(icon).fit_to_exact_size(Vec2::splat(22.0)));
+        ui.add_space(2.0);
         ui.label(RichText::new(subtitle).color(MUTED).size(12.0));
     });
 }
@@ -3079,6 +3141,14 @@ mod tests {
         assert_eq!(client.address, "0xabc");
         assert_eq!(client.at, [100, 200]);
         assert_eq!(client.size, [720, 420]);
+    }
+
+    #[test]
+    fn history_text_wraps_to_four_rows() {
+        let layout = history_text_layout("a long clipboard preview", 180.0);
+
+        assert!((layout.wrap.max_width - 180.0).abs() < f32::EPSILON);
+        assert_eq!(layout.wrap.max_rows, 4);
     }
 
     #[test]

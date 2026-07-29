@@ -17,4 +17,6 @@ pub mod transfer;
 pub mod transport;
 
 #[cfg(feature = "ui")]
+pub mod tray;
+#[cfg(feature = "ui")]
 pub mod ui;

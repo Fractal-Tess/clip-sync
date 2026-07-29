@@ -20,6 +20,7 @@
             fileset = pkgs.lib.fileset.unions [
               ./Cargo.lock
               ./Cargo.toml
+              ./assets
               ./src
               ./tests
             ];

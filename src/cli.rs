@@ -98,6 +98,8 @@ enum UiCommand {
     Switcher,
     /// Open the full control center.
     Control,
+    /// Run the persistent system tray item.
+    Tray,
 }
 
 #[derive(Debug, Subcommand)]
@@ -249,11 +251,13 @@ impl Cli {
             Command::Rekey(args) => rekey_command(&paths, &args),
             #[cfg(feature = "ui")]
             Command::Ui { command } => {
-                let mode = match command {
-                    UiCommand::Switcher => crate::ui::UiMode::Switcher,
-                    UiCommand::Control => crate::ui::UiMode::Control,
-                };
-                crate::ui::run(mode, paths).map_err(anyhow::Error::msg)
+                match command {
+                    UiCommand::Switcher => crate::ui::run(crate::ui::UiMode::Switcher, paths)
+                        .map_err(anyhow::Error::msg),
+                    UiCommand::Control => crate::ui::run(crate::ui::UiMode::Control, paths)
+                        .map_err(anyhow::Error::msg),
+                    UiCommand::Tray => crate::tray::run(paths).await.map_err(anyhow::Error::msg),
+                }
             }
         }
     }
@@ -870,6 +874,19 @@ mod tests {
         ] {
             Cli::try_parse_from(arguments).expect("command should parse");
         }
+    }
+
+    #[cfg(feature = "ui")]
+    #[test]
+    fn cli_exposes_tray_command() {
+        let cli =
+            Cli::try_parse_from(["clip-sync", "ui", "tray"]).expect("tray command should parse");
+        assert!(matches!(
+            cli.command,
+            Command::Ui {
+                command: UiCommand::Tray
+            }
+        ));
     }
 
     #[test]
