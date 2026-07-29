@@ -30,7 +30,7 @@
           version = "0.1.0";
           src = rustSource;
           cargoLock.lockFile = ./Cargo.lock;
-          cargoBuildFeatures = pkgs.lib.optionals withUi [ "ui" ];
+          buildFeatures = pkgs.lib.optionals withUi [ "ui" ];
           RUST_MIN_STACK = "16777216";
           nativeBuildInputs = with pkgs; [
             makeWrapper
