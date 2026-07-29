@@ -107,7 +107,21 @@ windowrule = match:class ^(clip-sync-control)$, float on, center on, size 1040 7
 bind = $mainMod, H, exec, clip-sync ui switcher
 ```
 
-Remove any `wl-paste --watch cliphist store` autostart only after `scripts/test-live-wayland` and the two-node smoke test pass. To roll back, stop `clip-sync.service`, restore that autostart command, and point the hotkey back to the previous picker.
+Remove any `wl-paste --watch cliphist store` autostart only after `scripts/test-live-wayland` and the two-node smoke test pass. Keep `cliphist` installed during the initial soak so rollback does not depend on a network fetch.
+
+To roll back the current `vd`/`kiwi` deployment, stop both clip-sync user services, restore the pre-cutover picker and autostart from the NixOS repository, apply the dotfiles, and start the watcher for the current session:
+
+```console
+cd ~/nixos
+systemctl --user stop clip-sync clip-sync-tray
+git restore --source=e8ebc69^ -- \
+  dotfiles/desktop/.config/hypr/hyprconfigs/hyprautostart.conf \
+  scripts/session/clipboard
+~/nixos/scripts/system/dotfiles apply
+wl-paste --watch cliphist store &
+```
+
+The restored `SUPER+H` binding still invokes `~/nixos/scripts/session/clipboard`, which is then the cliphist/Rofi picker. Reapply the clip-sync commit and restart its services to roll forward.
 
 ## Validation
 
