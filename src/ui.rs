@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     fs::{File, OpenOptions},
     os::unix::net::{UnixListener as StdUnixListener, UnixStream as StdUnixStream},
     path::{Path, PathBuf},
@@ -42,9 +42,9 @@ const MUTED: Color32 = Color32::from_rgb(137, 154, 160);
 const ERROR: Color32 = Color32::from_rgb(242, 119, 119);
 const SUCCESS: Color32 = Color32::from_rgb(105, 219, 160);
 const SEARCH_DEBOUNCE: Duration = Duration::from_millis(120);
-const HISTORY_GRID_GAP: f32 = 10.0;
-const HISTORY_CARD_HEIGHT: f32 = 202.0;
-const HISTORY_PREVIEW_HEIGHT: f32 = 92.0;
+const HISTORY_GRID_GAP: f32 = 8.0;
+const HISTORY_CARD_HEIGHT: f32 = 122.0;
+const HISTORY_PREVIEW_HEIGHT: f32 = 46.0;
 const SWITCHER_FOOTER_HEIGHT: f32 = 44.0;
 const MAX_IMAGE_PREVIEW_WIDTH: u32 = 320;
 const MAX_IMAGE_PREVIEW_HEIGHT: u32 = 180;
@@ -311,7 +311,10 @@ struct ClipSyncApp {
     ipc_worker: IpcWorker,
     event_rx: std_mpsc::Receiver<UiEvent>,
     search: String,
-    pinned_only: bool,
+    autocomplete_selected: usize,
+    autocomplete_dismissed: bool,
+    known_devices: BTreeSet<String>,
+    known_types: BTreeSet<String>,
     selected_history: usize,
     scroll_selected_history: bool,
     selected_tab: ControlTab,
@@ -364,7 +367,10 @@ impl ClipSyncApp {
             ipc_worker,
             event_rx,
             search: String::new(),
-            pinned_only: false,
+            autocomplete_selected: 0,
+            autocomplete_dismissed: false,
+            known_devices: BTreeSet::new(),
+            known_types: BTreeSet::new(),
             selected_history: 0,
             scroll_selected_history: false,
             selected_tab: ControlTab::History,
@@ -433,13 +439,12 @@ impl ClipSyncApp {
     }
 
     fn history_query(&self) -> String {
-        build_history_query(&self.search, self.pinned_only)
+        self.search.clone()
     }
 
     fn schedule_history_refresh(&mut self) {
         self.history_loading = true;
         self.history_error = None;
-        self.history.clear();
         self.history_generation = self.history_generation.saturating_add(1);
         self.pending_history_refresh = Some(Instant::now() + SEARCH_DEBOUNCE);
         self.context.request_repaint_after(SEARCH_DEBOUNCE);
@@ -453,8 +458,13 @@ impl ClipSyncApp {
             return;
         }
         self.pending_history_refresh = None;
+        let query = self.history_query();
+        if should_defer_history_refresh(&query) {
+            self.history_loading = false;
+            return;
+        }
         self.send(UiCommand::History {
-            query: self.history_query(),
+            query,
             generation: self.history_generation,
         });
     }
@@ -510,6 +520,29 @@ impl ClipSyncApp {
                     match result {
                         Ok(history) => {
                             self.history = history.items;
+                            for item in &self.history {
+                                if !item.source_device.is_empty() {
+                                    self.known_devices.insert(item.source_device.clone());
+                                }
+                                for mime in &item.mime_types {
+                                    let normalized = mime.to_ascii_lowercase();
+                                    self.known_types.insert(normalized.clone());
+                                    if normalized.starts_with("image/") {
+                                        self.known_types.insert("image".to_owned());
+                                    }
+                                    if normalized.starts_with("text/")
+                                        || matches!(
+                                            normalized.as_str(),
+                                            "string" | "text" | "utf8_string"
+                                        )
+                                    {
+                                        self.known_types.insert("text".to_owned());
+                                    }
+                                    if normalized == "text/uri-list" {
+                                        self.known_types.insert("files".to_owned());
+                                    }
+                                }
+                            }
                             let visible_content_ids = self
                                 .history
                                 .iter()
@@ -671,12 +704,17 @@ impl ClipSyncApp {
         }
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "keyboard, autocomplete, and card actions share one switcher event pass"
+    )]
     fn switcher(&mut self, ui: &mut egui::Ui) {
-        let pressed_key = ui.input(switcher_key);
-        if pressed_key == SwitcherKey::Escape {
-            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
-            return;
-        }
+        let mut pressed_key = ui.input(switcher_key);
+        let autocomplete_tab = !self.autocomplete_dismissed
+            && filter_completion_context(&self.search).is_some()
+            && ui
+                .ctx()
+                .input_mut(|input| input.consume_key(egui::Modifiers::NONE, Key::Tab));
         if self.switcher_state == SwitcherState::Close {
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
             return;
@@ -689,39 +727,113 @@ impl ClipSyncApp {
                 brand_header(ui, "history switcher");
                 ui.add_space(8.0);
 
-                let mut search_changed = false;
-                let mut pinned_clicked = false;
-                ui.horizontal(|ui| {
-                    let search = ui.add_sized(
-                        [(ui.available_width() - 112.0).max(180.0), 42.0],
-                        egui::TextEdit::singleline(&mut self.search)
-                            .hint_text("Search or filter (device:, type:)")
-                            .font(FontId::proportional(16.0)),
-                    );
-                    if self.switcher_state == SwitcherState::NeedsFocus {
-                        search.request_focus();
-                        self.switcher_state = SwitcherState::Ready;
-                    }
-                    search_changed = search.changed();
-                    pinned_clicked = ui
-                        .add_sized(
-                            [102.0, 42.0],
-                            egui::Button::new("Pinned only").selected(self.pinned_only),
-                        )
-                        .clicked();
-                });
-                if pinned_clicked {
-                    self.pinned_only = !self.pinned_only;
+                let search = ui.add_sized(
+                    [ui.available_width(), 42.0],
+                    egui::TextEdit::singleline(&mut self.search)
+                        .hint_text("Search · d:device, t:type, p:true")
+                        .font(FontId::proportional(16.0)),
+                );
+                if self.switcher_state == SwitcherState::NeedsFocus {
+                    search.request_focus();
+                    self.switcher_state = SwitcherState::Ready;
                 }
-                if search_changed || pinned_clicked {
+                if search.changed() {
+                    self.autocomplete_selected = 0;
+                    self.autocomplete_dismissed = false;
                     self.selected_history = 0;
                     self.schedule_history_refresh();
                 }
 
+                let completion = filter_completion_context(&self.search);
+                let suggestions = completion.as_ref().map_or_else(Vec::new, |completion| {
+                    filter_suggestions(completion, &self.known_devices, &self.known_types)
+                });
+                let autocomplete_open = !self.autocomplete_dismissed && !suggestions.is_empty();
+                let mut accepted_suggestion = None;
+                if autocomplete_open {
+                    self.autocomplete_selected = self
+                        .autocomplete_selected
+                        .min(suggestions.len().saturating_sub(1));
+                    match pressed_key {
+                        SwitcherKey::Up => {
+                            self.autocomplete_selected =
+                                self.autocomplete_selected.saturating_sub(1);
+                            pressed_key = SwitcherKey::None;
+                        }
+                        SwitcherKey::Down => {
+                            self.autocomplete_selected = (self.autocomplete_selected + 1)
+                                .min(suggestions.len().saturating_sub(1));
+                            pressed_key = SwitcherKey::None;
+                        }
+                        SwitcherKey::Enter => {
+                            accepted_suggestion = Some(self.autocomplete_selected);
+                            pressed_key = SwitcherKey::None;
+                        }
+                        SwitcherKey::Escape => {
+                            self.autocomplete_dismissed = true;
+                            pressed_key = SwitcherKey::None;
+                        }
+                        SwitcherKey::None | SwitcherKey::Left | SwitcherKey::Right => {}
+                    }
+                    if autocomplete_tab {
+                        accepted_suggestion = Some(self.autocomplete_selected);
+                    }
+                    if let Some(clicked) = autocomplete_popup(
+                        ui,
+                        search.rect,
+                        completion.as_ref().expect("open autocomplete has context"),
+                        &suggestions,
+                        self.autocomplete_selected,
+                    ) {
+                        accepted_suggestion = Some(clicked);
+                    }
+                }
+                if let Some(index) = accepted_suggestion
+                    && let Some(completion) = completion.as_ref()
+                    && let Some(suggestion) = suggestions.get(index)
+                {
+                    apply_filter_suggestion(&mut self.search, completion, &suggestion.value);
+                    if let Some(mut state) =
+                        egui::text_edit::TextEditState::load(ui.ctx(), search.id)
+                    {
+                        let cursor = egui::text::CCursor::new(self.search.chars().count());
+                        state
+                            .cursor
+                            .set_char_range(Some(egui::text::CCursorRange::one(cursor)));
+                        state.store(ui.ctx(), search.id);
+                    }
+                    search.request_focus();
+                    self.autocomplete_selected = 0;
+                    self.autocomplete_dismissed = true;
+                    self.selected_history = 0;
+                    self.schedule_history_refresh();
+                }
+
+                if ui.input(|input| input.modifiers.ctrl && input.key_pressed(Key::P))
+                    && !self.mutation_pending
+                    && let Some(item) = self.history.get(self.selected_history)
+                {
+                    let content_id = item.content_id.clone();
+                    let action = if item.pinned {
+                        HistoryUpdateAction::Unpin
+                    } else {
+                        HistoryUpdateAction::Pin
+                    };
+                    self.mutation_pending = true;
+                    self.notice = None;
+                    self.send(UiCommand::HistoryUpdate {
+                        content_id,
+                        action,
+                        kind: MutationKind::Pin,
+                    });
+                }
+
+                let columns = history_column_count(ui.available_width(), self.mode);
                 match apply_switcher_key(
                     pressed_key,
                     &mut self.selected_history,
                     self.history.len(),
+                    columns,
                     self.history_loading || self.mutation_pending,
                 ) {
                     SwitcherIntent::None => {}
@@ -763,10 +875,12 @@ impl ClipSyncApp {
                     notice.show(ui);
                 }
                 ui.label(
-                    RichText::new("↑↓ navigate    Enter activate    Esc close")
-                        .monospace()
-                        .color(MUTED)
-                        .size(11.0),
+                    RichText::new(
+                        "←→↑↓ navigate    Enter activate    Ctrl+P pin/unpin    Esc close",
+                    )
+                    .monospace()
+                    .color(MUTED)
+                    .size(11.0),
                 );
             });
     }
@@ -845,20 +959,11 @@ impl ClipSyncApp {
     fn history_tab(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             let search = ui.add_sized(
-                [(ui.available_width() - 322.0).max(140.0), 36.0],
+                [(ui.available_width() - 210.0).max(140.0), 36.0],
                 egui::TextEdit::singleline(&mut self.search)
-                    .hint_text("Search or filter merged history"),
+                    .hint_text("Search · d:device, t:type, p:true"),
             );
-            let pinned_clicked = ui
-                .add_sized(
-                    [102.0, 36.0],
-                    egui::Button::new("Pinned only").selected(self.pinned_only),
-                )
-                .clicked();
-            if pinned_clicked {
-                self.pinned_only = !self.pinned_only;
-            }
-            if search.changed() || pinned_clicked {
+            if search.changed() {
                 self.selected_history = 0;
                 self.schedule_history_refresh();
             }
@@ -916,7 +1021,7 @@ impl ClipSyncApp {
         }
         ui.label(
             RichText::new(
-                "Filters: device:, type:, before:, pinned:, min-size:, max-size:. Quote phrases. Items with local payloads can be activated.",
+                "Filters: d:, t:, p:, before:, min-size:, max-size:. Chain with commas; quote phrases. Items with local payloads can be activated.",
             )
             .color(MUTED)
             .size(12.0),
@@ -977,42 +1082,48 @@ impl ClipSyncApp {
                                 })
                                 .stroke(Stroke::new(1.0, if selected { CYAN } else { BORDER }))
                                 .corner_radius(CornerRadius::same(8))
-                                .inner_margin(Margin::same(10))
+                                .inner_margin(Margin::same(8))
                                 .show(ui, |ui| {
                                     ui.vertical(|ui| {
-                                        ui.set_width((card_width - 20.0).max(160.0));
-                                        ui.set_min_height(HISTORY_CARD_HEIGHT - 20.0);
+                                        ui.spacing_mut().item_spacing.y = 3.0;
+                                        ui.set_width((card_width - 16.0).max(160.0));
+                                        ui.set_min_height(HISTORY_CARD_HEIGHT - 16.0);
                                         history_card_preview(ui, &item, preview);
 
                                         let mime = item
                                             .mime_types
                                             .first()
                                             .map_or("unknown", String::as_str);
-                                        ui.label(
-                                            RichText::new(format!(
-                                                "{mime} · {}{}",
-                                                format_bytes(item.logical_size),
-                                                if item.pinned { " · pinned" } else { "" }
-                                            ))
-                                            .color(MUTED)
-                                            .monospace()
-                                            .size(10.0),
+                                        ui.add(
+                                            egui::Label::new(
+                                                RichText::new(format!(
+                                                    "{mime} · {}{}",
+                                                    format_bytes(item.logical_size),
+                                                    if item.pinned { " · PIN" } else { "" }
+                                                ))
+                                                .color(MUTED)
+                                                .monospace()
+                                                .size(10.0),
+                                            )
+                                            .truncate(),
                                         );
-                                        ui.label(
-                                            RichText::new(format!(
-                                                "source {}",
-                                                short_identifier(&item.source_node)
-                                            ))
-                                            .color(MUTED)
-                                            .monospace()
-                                            .size(10.0),
+                                        ui.add(
+                                            egui::Label::new(
+                                                RichText::new(format!(
+                                                    "source {}",
+                                                    history_source_label(&item)
+                                                ))
+                                                .color(MUTED)
+                                                .monospace()
+                                                .size(10.0),
+                                            )
+                                            .truncate(),
                                         );
-                                        ui.add_space(2.0);
                                         ui.horizontal(|ui| {
                                             if ui
                                                 .add_enabled(
                                                     !self.mutation_pending,
-                                                    egui::Button::new("Activate"),
+                                                    egui::Button::new("Activate").small(),
                                                 )
                                                 .clicked()
                                             {
@@ -1020,16 +1131,18 @@ impl ClipSyncApp {
                                                     item.content_id.clone(),
                                                 ));
                                             }
-                                            if ui
-                                                .add_enabled(
-                                                    !self.mutation_pending,
-                                                    egui::Button::new(if item.pinned {
-                                                        "Unpin"
-                                                    } else {
-                                                        "Pin"
-                                                    }),
-                                                )
-                                                .clicked()
+                                            if allow_delete
+                                                && ui
+                                                    .add_enabled(
+                                                        !self.mutation_pending,
+                                                        egui::Button::new(if item.pinned {
+                                                            "Unpin"
+                                                        } else {
+                                                            "Pin"
+                                                        })
+                                                        .small(),
+                                                    )
+                                                    .clicked()
                                             {
                                                 action = Some(HistoryAction::Pin {
                                                     content_id: item.content_id.clone(),
@@ -1040,7 +1153,7 @@ impl ClipSyncApp {
                                                 && ui
                                                     .add_enabled(
                                                         !self.mutation_pending,
-                                                        egui::Button::new("Delete"),
+                                                        egui::Button::new("Delete").small(),
                                                     )
                                                     .clicked()
                                             {
@@ -1567,6 +1680,8 @@ impl ClipSyncApp {
 
 impl eframe::App for ClipSyncApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        ui.painter()
+            .rect_filled(ui.max_rect(), CornerRadius::ZERO, BACKGROUND);
         self.poll_events();
         self.dispatch_pending_history_refresh();
         self.dispatch_transfer_refresh();
@@ -2080,21 +2195,187 @@ fn preview_texture(
     ))
 }
 
-fn build_history_query(search: &str, pinned_only: bool) -> String {
-    if !pinned_only {
-        return search.to_owned();
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FilterCompletionKind {
+    Device,
+    Type,
+    Pinned,
+}
+
+struct FilterCompletion {
+    value_start: usize,
+    kind: FilterCompletionKind,
+    prefix: String,
+}
+
+struct FilterSuggestion {
+    value: String,
+    label: String,
+    detail: &'static str,
+}
+
+fn filter_completion_context(search: &str) -> Option<FilterCompletion> {
+    let mut token_start = 0;
+    let mut quote = None;
+    for (offset, character) in search.char_indices() {
+        match character {
+            '"' | '\'' if quote.is_none() => quote = Some(character),
+            character if quote == Some(character) => quote = None,
+            ',' if quote.is_none() => token_start = offset + character.len_utf8(),
+            character if quote.is_none() && character.is_whitespace() => {
+                token_start = offset + character.len_utf8();
+            }
+            _ => {}
+        }
     }
-    let query = search.trim();
-    if query.is_empty() {
-        "pinned:true".to_owned()
+    if quote.is_some() {
+        return None;
+    }
+    let token = search.get(token_start..)?;
+    let (name, value) = token.split_once(':')?;
+    let kind = match name.to_ascii_lowercase().as_str() {
+        "d" | "device" => FilterCompletionKind::Device,
+        "t" | "type" => FilterCompletionKind::Type,
+        "p" | "pinned" => FilterCompletionKind::Pinned,
+        _ => return None,
+    };
+    Some(FilterCompletion {
+        value_start: token_start + name.len() + 1,
+        kind,
+        prefix: value.to_ascii_lowercase(),
+    })
+}
+
+fn should_defer_history_refresh(search: &str) -> bool {
+    search
+        .split(|character: char| character.is_whitespace() || character == ',')
+        .filter_map(|token| token.split_once(':'))
+        .any(|(name, value)| match name.to_ascii_lowercase().as_str() {
+            "d" | "device" | "t" | "type" => value.is_empty(),
+            "p" | "pinned" => !matches!(value.to_ascii_lowercase().as_str(), "true" | "false"),
+            _ => false,
+        })
+}
+
+fn filter_suggestions(
+    completion: &FilterCompletion,
+    known_devices: &BTreeSet<String>,
+    known_types: &BTreeSet<String>,
+) -> Vec<FilterSuggestion> {
+    match completion.kind {
+        FilterCompletionKind::Device => known_devices
+            .iter()
+            .filter(|device| device.to_ascii_lowercase().starts_with(&completion.prefix))
+            .take(6)
+            .map(|device| FilterSuggestion {
+                value: device.clone(),
+                label: device.clone(),
+                detail: "device",
+            })
+            .collect(),
+        FilterCompletionKind::Type => {
+            let mut candidates = ["image", "text", "files"]
+                .into_iter()
+                .filter(|kind| kind.starts_with(&completion.prefix))
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            candidates.extend(
+                known_types
+                    .iter()
+                    .filter(|kind| {
+                        kind.starts_with(&completion.prefix)
+                            && !matches!(kind.as_str(), "image" | "text" | "files")
+                    })
+                    .take(6_usize.saturating_sub(candidates.len()))
+                    .cloned(),
+            );
+            candidates
+                .into_iter()
+                .map(|kind| FilterSuggestion {
+                    detail: if matches!(kind.as_str(), "image" | "text" | "files") {
+                        "type group"
+                    } else {
+                        "exact MIME"
+                    },
+                    value: kind.clone(),
+                    label: kind,
+                })
+                .collect()
+        }
+        FilterCompletionKind::Pinned => [
+            FilterSuggestion {
+                value: "true".to_owned(),
+                label: "pinned".to_owned(),
+                detail: "p:true",
+            },
+            FilterSuggestion {
+                value: "false".to_owned(),
+                label: "unpinned".to_owned(),
+                detail: "p:false",
+            },
+        ]
+        .into_iter()
+        .filter(|suggestion| suggestion.value.starts_with(&completion.prefix))
+        .collect(),
+    }
+}
+
+fn autocomplete_popup(
+    ui: &egui::Ui,
+    anchor: egui::Rect,
+    completion: &FilterCompletion,
+    suggestions: &[FilterSuggestion],
+    selected: usize,
+) -> Option<usize> {
+    let mut clicked = None;
+    egui::Area::new(egui::Id::new("history-filter-autocomplete"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(anchor.left_bottom() + Vec2::new(0.0, 4.0))
+        .show(ui.ctx(), |ui| {
+            Frame::popup(ui.style())
+                .fill(SURFACE)
+                .stroke(Stroke::new(1.0, BORDER))
+                .inner_margin(Margin::same(8))
+                .show(ui, |ui| {
+                    ui.set_width(anchor.width());
+                    let heading = match completion.kind {
+                        FilterCompletionKind::Device => "DEVICES",
+                        FilterCompletionKind::Type => "TYPES",
+                        FilterCompletionKind::Pinned => "PIN STATE",
+                    };
+                    ui.label(RichText::new(heading).monospace().color(MUTED).size(10.0));
+                    for (index, suggestion) in suggestions.iter().enumerate() {
+                        let text = format!("{}    {}", suggestion.label, suggestion.detail);
+                        if ui.selectable_label(index == selected, text).clicked() {
+                            clicked = Some(index);
+                        }
+                    }
+                    ui.label(
+                        RichText::new("↑↓ choose · Tab/Enter complete · Esc dismiss")
+                            .monospace()
+                            .color(MUTED)
+                            .size(9.0),
+                    );
+                });
+        });
+    clicked
+}
+
+fn apply_filter_suggestion(search: &mut String, completion: &FilterCompletion, value: &str) {
+    search.replace_range(completion.value_start.., value);
+}
+
+fn history_source_label(item: &HistoryItem) -> String {
+    if item.source_device.is_empty() {
+        short_identifier(&item.source_node)
     } else {
-        format!("{query} pinned:true")
+        item.source_device.clone()
     }
 }
 
 fn history_column_count(available_width: f32, mode: UiMode) -> usize {
     let three_column_threshold = match mode {
-        UiMode::Switcher => 900.0,
+        UiMode::Switcher => 640.0,
         UiMode::Control => 860.0,
     };
     if available_width >= three_column_threshold {
@@ -2157,7 +2438,9 @@ fn history_card_preview(
             item.preview.trim()
         };
         ui.allocate_ui(size, |ui| {
-            ui.add(egui::Label::new(RichText::new(title).color(Color32::WHITE).size(14.0)).wrap());
+            ui.add(
+                egui::Label::new(RichText::new(title).color(Color32::WHITE).size(14.0)).truncate(),
+            );
         });
     }
 }
@@ -2346,6 +2629,8 @@ fn format_unit(bytes: u64, unit: u64, suffix: &str) -> String {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SwitcherKey {
     None,
+    Left,
+    Right,
     Up,
     Down,
     Enter,
@@ -2363,6 +2648,10 @@ enum SwitcherIntent {
 fn switcher_key(input: &egui::InputState) -> SwitcherKey {
     if input.key_pressed(Key::Escape) {
         SwitcherKey::Escape
+    } else if input.key_pressed(Key::ArrowLeft) {
+        SwitcherKey::Left
+    } else if input.key_pressed(Key::ArrowRight) {
+        SwitcherKey::Right
     } else if input.key_pressed(Key::ArrowDown) {
         SwitcherKey::Down
     } else if input.key_pressed(Key::ArrowUp) {
@@ -2378,16 +2667,13 @@ fn apply_switcher_key(
     key: SwitcherKey,
     selection: &mut usize,
     item_count: usize,
+    columns: usize,
     activation_blocked: bool,
 ) -> SwitcherIntent {
     match key {
         SwitcherKey::Escape => SwitcherIntent::Close,
-        SwitcherKey::Up => {
-            *selection = move_selection(*selection, item_count, -1);
-            SwitcherIntent::Moved
-        }
-        SwitcherKey::Down => {
-            *selection = move_selection(*selection, item_count, 1);
+        SwitcherKey::Left | SwitcherKey::Right | SwitcherKey::Up | SwitcherKey::Down => {
+            *selection = move_grid_selection(*selection, item_count, columns, key);
             SwitcherIntent::Moved
         }
         SwitcherKey::Enter if item_count > 0 && !activation_blocked => {
@@ -2398,14 +2684,32 @@ fn apply_switcher_key(
     }
 }
 
-fn move_selection(current: usize, item_count: usize, direction: i32) -> usize {
-    if item_count == 0 {
+fn move_grid_selection(
+    current: usize,
+    item_count: usize,
+    columns: usize,
+    key: SwitcherKey,
+) -> usize {
+    if item_count == 0 || columns == 0 {
         return 0;
     }
-    match direction.cmp(&0) {
-        std::cmp::Ordering::Greater => (current + 1).min(item_count - 1),
-        std::cmp::Ordering::Less => current.saturating_sub(1),
-        std::cmp::Ordering::Equal => current.min(item_count - 1),
+    let current = current.min(item_count - 1);
+    match key {
+        SwitcherKey::Left if !current.is_multiple_of(columns) => current - 1,
+        SwitcherKey::Right
+            if !(current + 1).is_multiple_of(columns) && current + 1 < item_count =>
+        {
+            current + 1
+        }
+        SwitcherKey::Up if current >= columns => current - columns,
+        SwitcherKey::Down if current + columns < item_count => current + columns,
+        SwitcherKey::None
+        | SwitcherKey::Left
+        | SwitcherKey::Right
+        | SwitcherKey::Up
+        | SwitcherKey::Down
+        | SwitcherKey::Enter
+        | SwitcherKey::Escape => current,
     }
 }
 
@@ -2414,27 +2718,34 @@ mod tests {
     use super::*;
 
     #[test]
-    fn keyboard_selection_stays_within_results() {
-        assert_eq!(move_selection(0, 0, 1), 0);
-        assert_eq!(move_selection(0, 3, -1), 0);
-        assert_eq!(move_selection(0, 3, 1), 1);
-        assert_eq!(move_selection(2, 3, 1), 2);
+    fn grid_selection_stays_within_rows_and_results() {
+        assert_eq!(move_grid_selection(0, 0, 3, SwitcherKey::Down), 0);
+        assert_eq!(move_grid_selection(0, 6, 3, SwitcherKey::Left), 0);
+        assert_eq!(move_grid_selection(2, 6, 3, SwitcherKey::Right), 2);
+        assert_eq!(move_grid_selection(1, 6, 3, SwitcherKey::Down), 4);
+        assert_eq!(move_grid_selection(4, 6, 3, SwitcherKey::Up), 1);
+        assert_eq!(move_grid_selection(5, 6, 3, SwitcherKey::Down), 5);
     }
 
     #[test]
     fn switcher_keys_navigate_activate_and_close() {
         let mut selection = 0;
         assert_eq!(
-            apply_switcher_key(SwitcherKey::Down, &mut selection, 3, false),
+            apply_switcher_key(SwitcherKey::Down, &mut selection, 6, 3, false),
             SwitcherIntent::Moved
         );
-        assert_eq!(selection, 1);
+        assert_eq!(selection, 3);
         assert_eq!(
-            apply_switcher_key(SwitcherKey::Enter, &mut selection, 3, false),
+            apply_switcher_key(SwitcherKey::Right, &mut selection, 6, 3, false),
+            SwitcherIntent::Moved
+        );
+        assert_eq!(selection, 4);
+        assert_eq!(
+            apply_switcher_key(SwitcherKey::Enter, &mut selection, 6, 3, false),
             SwitcherIntent::Activate
         );
         assert_eq!(
-            apply_switcher_key(SwitcherKey::Escape, &mut selection, 3, false),
+            apply_switcher_key(SwitcherKey::Escape, &mut selection, 6, 3, false),
             SwitcherIntent::Close
         );
     }
@@ -2443,11 +2754,11 @@ mod tests {
     fn switcher_enter_is_blocked_for_loading_or_empty_results() {
         let mut selection = 0;
         assert_eq!(
-            apply_switcher_key(SwitcherKey::Enter, &mut selection, 1, true),
+            apply_switcher_key(SwitcherKey::Enter, &mut selection, 1, 3, true),
             SwitcherIntent::None
         );
         assert_eq!(
-            apply_switcher_key(SwitcherKey::Enter, &mut selection, 0, false),
+            apply_switcher_key(SwitcherKey::Enter, &mut selection, 0, 3, false),
             SwitcherIntent::None
         );
     }
@@ -2513,18 +2824,36 @@ mod tests {
     }
 
     #[test]
-    fn pinned_toggle_adds_a_deterministic_history_filter() {
-        assert_eq!(build_history_query("", true), "pinned:true");
+    fn abbreviated_filter_completion_handles_comma_chains() {
+        let completion = filter_completion_context("d:vd,t:im").expect("type completion");
+        assert_eq!(completion.kind, FilterCompletionKind::Type);
+        assert_eq!(completion.prefix, "im");
+        let mut search = "d:vd,t:im".to_owned();
+        apply_filter_suggestion(&mut search, &completion, "image");
+        assert_eq!(search, "d:vd,t:image");
+
+        assert!(should_defer_history_refresh("d:"));
+        assert!(should_defer_history_refresh("d:vd,p:t"));
+        assert!(!should_defer_history_refresh("d:vd,p:true"));
+    }
+
+    #[test]
+    fn pinned_completion_offers_true_and_false_values() {
+        let completion = filter_completion_context("P:").expect("pin completion");
+        let suggestions = filter_suggestions(&completion, &BTreeSet::new(), &BTreeSet::new());
         assert_eq!(
-            build_history_query("device:kiwi screenshot", true),
-            "device:kiwi screenshot pinned:true"
+            suggestions
+                .iter()
+                .map(|suggestion| suggestion.value.as_str())
+                .collect::<Vec<_>>(),
+            ["true", "false"]
         );
-        assert_eq!(build_history_query("  text  ", false), "  text  ");
     }
 
     #[test]
     fn history_grid_uses_two_or_three_columns() {
-        assert_eq!(history_column_count(700.0, UiMode::Switcher), 2);
+        assert_eq!(history_column_count(600.0, UiMode::Switcher), 2);
+        assert_eq!(history_column_count(700.0, UiMode::Switcher), 3);
         assert_eq!(history_column_count(1_000.0, UiMode::Switcher), 3);
         assert_eq!(history_column_count(800.0, UiMode::Control), 2);
         assert_eq!(history_column_count(900.0, UiMode::Control), 3);
@@ -2539,6 +2868,7 @@ mod tests {
             logical_size: 4,
             source_node: "node".to_owned(),
             pinned: false,
+            source_device: "vd".to_owned(),
             physical_millis: 0,
         };
         assert!(history_item_has_image(&item));

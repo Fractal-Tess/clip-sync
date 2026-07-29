@@ -178,6 +178,7 @@ pub struct MeshHandle {
     state: Arc<RwLock<AntiEntropyState>>,
     known_members: Arc<RwLock<BTreeSet<NodeId>>>,
     forgotten_devices: Arc<RwLock<BTreeSet<NodeId>>>,
+    device_hostnames: Arc<RwLock<BTreeMap<NodeId, String>>>,
     registry: Arc<Mutex<BTreeMap<NodeId, ActiveConnection>>>,
 }
 
@@ -225,6 +226,12 @@ impl MeshHandle {
         self.state.read().await.seen().clone()
     }
 
+    /// Returns authenticated device names observed during this daemon run.
+    #[must_use]
+    pub async fn device_hostnames(&self) -> BTreeMap<NodeId, String> {
+        self.device_hostnames.read().await.clone()
+    }
+
     /// Wakes live authenticated sessions after transfer state changes.
     pub fn notify_transfers(&self) {
         bump_revision(&self.revision);
@@ -232,6 +239,7 @@ impl MeshHandle {
 
     async fn forget_identity(&self, node_id: NodeId) {
         self.forgotten_devices.write().await.insert(node_id);
+        self.device_hostnames.write().await.remove(&node_id);
         if let Some(active) = self.registry.lock().await.remove(&node_id) {
             active
                 .connection
@@ -321,6 +329,10 @@ impl MeshRuntime {
         }
         let known_members = Arc::new(RwLock::new(initial_members));
         let forgotten_devices = Arc::new(RwLock::new(config.forgotten_devices.clone()));
+        let device_hostnames = Arc::new(RwLock::new(BTreeMap::from([(
+            config.node_id,
+            config.hostname.clone(),
+        )])));
         let registry = Arc::new(Mutex::new(BTreeMap::new()));
         let (discovery, discovery_rx) = watch::channel(None);
         let (revision, _) = watch::channel(0_u64);
@@ -339,6 +351,7 @@ impl MeshRuntime {
             state: state.clone(),
             known_members: known_members.clone(),
             forgotten_devices: forgotten_devices.clone(),
+            device_hostnames: device_hostnames.clone(),
             registry: registry.clone(),
         };
         let context = Arc::new(RuntimeContext {
@@ -352,6 +365,7 @@ impl MeshRuntime {
             registry,
             known_members,
             forgotten_devices,
+            device_hostnames,
         });
         let task = tokio::spawn(supervise(context, discovery_rx, shutdown));
         Ok((
@@ -388,6 +402,7 @@ struct RuntimeContext {
     registry: Arc<Mutex<BTreeMap<NodeId, ActiveConnection>>>,
     known_members: Arc<RwLock<BTreeSet<NodeId>>>,
     forgotten_devices: Arc<RwLock<BTreeSet<NodeId>>>,
+    device_hostnames: Arc<RwLock<BTreeMap<NodeId, String>>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -827,6 +842,12 @@ async fn run_connection(
         connection.close(CLOSE_FORGOTTEN.into(), b"device identity forgotten");
         return Err(MeshError::ForgottenNodeIdentity(peer.node_id));
     }
+
+    context
+        .device_hostnames
+        .write()
+        .await
+        .insert(peer.node_id, peer.hostname.clone());
 
     persist_and_record(
         &context,

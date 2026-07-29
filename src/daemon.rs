@@ -1,4 +1,4 @@
-use std::{fs, io::Cursor, time::Duration};
+use std::{collections::BTreeMap, fs, io::Cursor, time::Duration};
 
 use anyhow::Context;
 use tokio::task::JoinHandle;
@@ -511,6 +511,12 @@ pub async fn run(paths: AppPaths, mut config: Config) -> anyhow::Result<()> {
         config.clone(),
         command_tx,
     );
+    state
+        .set_device_names(BTreeMap::from([(
+            history.replica().node_id().to_string(),
+            hostname.clone(),
+        )]))
+        .await;
     state.set_history(history_items(history.replica())).await;
     state.set_devices(device_items(&history)).await;
     let shutdown = CancellationToken::new();
@@ -1303,6 +1309,7 @@ fn history_items(replica: &Replica) -> Vec<HistoryItem> {
                 source_node: view.last_activity().operation_id().node().to_string(),
                 pinned: view.pinned(),
                 physical_millis: view.last_activity().timestamp().physical_millis(),
+                source_device: String::new(),
             }
         })
         .collect()
@@ -1492,6 +1499,18 @@ struct MeshPersistenceContext<'a> {
 async fn handle_mesh_batch(batch: PersistBatch, context: &mut MeshPersistenceContext<'_>) {
     let result = persist_mesh_batch(&batch, context).await;
     if result.is_ok() {
+        context
+            .state
+            .set_device_names(
+                context
+                    .mesh
+                    .device_hostnames()
+                    .await
+                    .into_iter()
+                    .map(|(node_id, hostname)| (node_id.to_string(), hostname))
+                    .collect(),
+            )
+            .await;
         context
             .state
             .set_history(history_items(context.history.replica()))

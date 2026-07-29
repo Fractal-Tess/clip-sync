@@ -104,7 +104,7 @@ enum UiCommand {
 enum HistoryCommand {
     /// List newest history entries, optionally matching a query.
     List {
-        /// Free text and filters: device:, type:, before:, pinned:, min-size:, max-size:.
+        /// Free text and comma/space-separated filters: d:, t:, p:, before:, min-size:, max-size:.
         #[arg(value_name = "QUERY")]
         query: Option<String>,
         #[arg(long, default_value_t = 100)]
@@ -467,6 +467,7 @@ fn history_item_json(item: &crate::ipc::protocol::HistoryItem) -> serde_json::Va
         "mime_types": item.mime_types,
         "logical_size": item.logical_size,
         "source_node": item.source_node,
+        "source_device": item.source_device,
         "pinned": item.pinned,
         "physical_millis": item.physical_millis,
     })
@@ -893,7 +894,8 @@ mod tests {
                 preview: "preview".to_owned(),
                 mime_types: vec!["text/plain".to_owned()],
                 logical_size: 42,
-                source_node: "device".to_owned(),
+                source_node: "device-id".to_owned(),
+                source_device: "device".to_owned(),
                 pinned: true,
                 physical_millis: 1_704_067_200_000,
             }),
@@ -902,7 +904,8 @@ mod tests {
                 "preview": "preview",
                 "mime_types": ["text/plain"],
                 "logical_size": 42,
-                "source_node": "device",
+                "source_node": "device-id",
+                "source_device": "device",
                 "pinned": true,
                 "physical_millis": 1_704_067_200_000_u64,
             })

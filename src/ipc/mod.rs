@@ -3,6 +3,7 @@ pub mod protocol;
 #[cfg(target_os = "linux")]
 use std::os::fd::AsFd;
 use std::{
+    collections::BTreeMap,
     fs::{File, OpenOptions},
     path::{Path, PathBuf},
     sync::Arc,
@@ -92,6 +93,7 @@ struct DaemonStateInner {
     clipboard_status: RwLock<DiagnosticStatus>,
     mesh: RwLock<Option<MeshHandle>>,
     history: RwLock<HistorySearchIndex>,
+    device_names: RwLock<BTreeMap<String, String>>,
     devices: RwLock<Vec<DeviceItem>>,
     commands: mpsc::UnboundedSender<DaemonCommand>,
 }
@@ -164,6 +166,7 @@ impl DaemonState {
                 }),
                 mesh: RwLock::new(None),
                 history: RwLock::new(HistorySearchIndex::default()),
+                device_names: RwLock::new(BTreeMap::new()),
                 devices: RwLock::new(Vec::new()),
                 commands,
             }),
@@ -191,9 +194,20 @@ impl DaemonState {
         *self.inner.mesh.write().await = Some(mesh);
     }
 
-    pub async fn set_history(&self, history: Vec<HistoryItem>) {
+    pub async fn set_history(&self, mut history: Vec<HistoryItem>) {
+        let device_names = self.inner.device_names.read().await;
+        for item in &mut history {
+            if let Some(device_name) = device_names.get(&item.source_node) {
+                item.source_device = device_name.clone();
+            }
+        }
+        drop(device_names);
         let index = HistorySearchIndex::new(history);
         *self.inner.history.write().await = index;
+    }
+
+    pub async fn set_device_names(&self, device_names: BTreeMap<String, String>) {
+        *self.inner.device_names.write().await = device_names;
     }
 
     pub async fn set_devices(&self, devices: Vec<DeviceItem>) {
@@ -1226,6 +1240,7 @@ mod tests {
                     mime_types: vec!["text/plain".to_owned()],
                     logical_size: 14,
                     source_node: "kiwi".to_owned(),
+                    source_device: "kiwi".to_owned(),
                     pinned: false,
                     physical_millis: 2,
                 },
@@ -1235,6 +1250,7 @@ mod tests {
                     mime_types: vec!["image/png".to_owned()],
                     logical_size: 20,
                     source_node: "vd".to_owned(),
+                    source_device: "vd".to_owned(),
                     pinned: false,
                     physical_millis: 1,
                 },
@@ -1259,6 +1275,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn history_search_uses_authenticated_device_name_aliases() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let (commands, _command_rx) = mpsc::unbounded_channel();
+        let state = DaemonState::new(
+            "test-node".to_owned(),
+            temporary.path().join("config.toml"),
+            Config::default(),
+            commands,
+        );
+        state
+            .set_device_names(BTreeMap::from([("node-id".to_owned(), "vd".to_owned())]))
+            .await;
+        state
+            .set_history(vec![HistoryItem {
+                content_id: "content".to_owned(),
+                preview: "Screenshot".to_owned(),
+                mime_types: vec!["image/png".to_owned()],
+                logical_size: 10,
+                source_node: "node-id".to_owned(),
+                source_device: String::new(),
+                pinned: true,
+                physical_millis: 1,
+            }])
+            .await;
+
+        let response = state
+            .handle(Request {
+                protocol_version: IPC_PROTOCOL_VERSION,
+                request_id: 80,
+                body: Some(request::Body::History(HistoryRequest {
+                    query: "D:vd,T:image,P:true".to_owned(),
+                    limit: 100,
+                })),
+            })
+            .await;
+        let Some(response::Body::History(history)) = response.body else {
+            panic!("expected history response");
+        };
+        assert_eq!(history.items.len(), 1);
+        assert_eq!(history.items[0].source_device, "vd");
+    }
+
+    #[tokio::test]
     async fn history_search_applies_typed_filters_in_newest_first_order() {
         let temporary = tempfile::tempdir().expect("temporary directory");
         let (commands, _command_rx) = mpsc::unbounded_channel();
@@ -1275,7 +1334,8 @@ mod tests {
                     preview: "Release Notes".to_owned(),
                     mime_types: vec!["text/markdown".to_owned()],
                     logical_size: 4_096,
-                    source_node: "Office Laptop".to_owned(),
+                    source_node: "office-node".to_owned(),
+                    source_device: "Office Laptop".to_owned(),
                     pinned: true,
                     physical_millis: 1_704_067_199_000,
                 },
@@ -1284,7 +1344,8 @@ mod tests {
                     preview: "Release Notes".to_owned(),
                     mime_types: vec!["text/markdown".to_owned()],
                     logical_size: 4_500,
-                    source_node: "Office Laptop".to_owned(),
+                    source_node: "office-node".to_owned(),
+                    source_device: "Office Laptop".to_owned(),
                     pinned: true,
                     physical_millis: 1_704_067_199_500,
                 },
@@ -1293,7 +1354,8 @@ mod tests {
                     preview: "Release Notes".to_owned(),
                     mime_types: vec!["text/markdown".to_owned()],
                     logical_size: 4_500,
-                    source_node: "Phone".to_owned(),
+                    source_node: "phone-node".to_owned(),
+                    source_device: "Phone".to_owned(),
                     pinned: true,
                     physical_millis: 1_704_067_199_900,
                 },
@@ -1376,6 +1438,7 @@ mod tests {
                 mime_types: vec!["text/plain".to_owned()],
                 logical_size: index,
                 source_node: format!("device-{}", index % 8),
+                source_device: format!("host-{}", index % 8),
                 pinned: index % 10 == 0,
                 physical_millis: index,
             })

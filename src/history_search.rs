@@ -29,9 +29,9 @@ impl fmt::Debug for HistoryQuery {
 impl HistoryQuery {
     /// Parses free text and typed history filters.
     ///
-    /// Free-text terms are conjunctive. Repeated `device:` and `type:` filters
-    /// are also conjunctive. Supported filters are `device:`, `type:`, `before:`,
-    /// `pinned:`, `min-size:`, and `max-size:`.
+    /// Free-text terms are conjunctive. Commas and whitespace separate filters.
+    /// Repeated `device:` and `type:` filters are also conjunctive. `d:`, `t:`,
+    /// and `p:` abbreviate `device:`, `type:`, and `pinned:` respectively.
     ///
     /// # Errors
     ///
@@ -74,8 +74,8 @@ impl HistoryQuery {
         };
         let name = name.to_ascii_lowercase();
         match name.as_str() {
-            "device" => self.devices.push(non_empty_normalized(token, value)?),
-            "type" => self.types.push(non_empty_normalized(token, value)?),
+            "device" | "d" => self.devices.push(non_empty_normalized(token, value)?),
+            "type" | "t" => self.types.push(non_empty_normalized(token, value)?),
             "before" => {
                 require_value(token, value)?;
                 let before = parse_before(value)
@@ -85,7 +85,7 @@ impl HistoryQuery {
                         .map_or(before, |current| current.min(before)),
                 );
             }
-            "pinned" => {
+            "pinned" | "p" => {
                 let pinned = match value.to_ascii_lowercase().as_str() {
                     "true" => true,
                     "false" => false,
@@ -124,6 +124,7 @@ struct IndexedHistoryItem {
     item: HistoryItem,
     preview: String,
     source_node: String,
+    source_device: String,
     mime_types: Vec<String>,
     content_id: String,
 }
@@ -133,6 +134,7 @@ impl IndexedHistoryItem {
         Self {
             preview: normalize(&item.preview),
             source_node: normalize(&item.source_node),
+            source_device: normalize(&item.source_device),
             mime_types: item
                 .mime_types
                 .iter()
@@ -154,18 +156,17 @@ impl IndexedHistoryItem {
             && query
                 .max_size
                 .is_none_or(|maximum| self.item.logical_size <= maximum)
-            && query
-                .devices
-                .iter()
-                .all(|device| self.source_node.contains(device))
-            && query.types.iter().all(|kind| {
-                self.mime_types
-                    .iter()
-                    .any(|mime_type| mime_type.contains(kind))
+            && query.devices.iter().all(|device| {
+                self.source_node.contains(device) || self.source_device.contains(device)
             })
+            && query
+                .types
+                .iter()
+                .all(|kind| matches_type(&self.mime_types, kind))
             && query.terms.iter().all(|term| {
                 self.preview.contains(term)
                     || self.source_node.contains(term)
+                    || self.source_device.contains(term)
                     || self.content_id.contains(term)
                     || self
                         .mime_types
@@ -230,7 +231,7 @@ fn tokenize(input: &str) -> Result<Vec<Token>, QueryError> {
     let mut tokens = Vec::new();
     let mut chars = input.char_indices().peekable();
     while let Some(&(offset, character)) = chars.peek() {
-        if character.is_whitespace() {
+        if character.is_whitespace() || character == ',' {
             chars.next();
             continue;
         }
@@ -238,7 +239,7 @@ fn tokenize(input: &str) -> Result<Vec<Token>, QueryError> {
         let mut value = String::new();
         let mut quote = None;
         while let Some(&(position, character)) = chars.peek() {
-            if quote.is_none() && character.is_whitespace() {
+            if quote.is_none() && (character.is_whitespace() || character == ',') {
                 break;
             }
             chars.next();
@@ -286,6 +287,17 @@ fn normalize(value: &str) -> String {
     value.to_lowercase()
 }
 
+fn matches_type(mime_types: &[String], kind: &str) -> bool {
+    mime_types.iter().any(|mime_type| match kind {
+        "file" | "files" => mime_type == "text/uri-list",
+        "image" => mime_type.starts_with("image/"),
+        "text" => {
+            mime_type.starts_with("text/")
+                || matches!(mime_type.as_str(), "string" | "text" | "utf8_string")
+        }
+        _ => mime_type.contains(kind),
+    })
+}
 fn parse_before(value: &str) -> Option<u64> {
     if value.bytes().all(|byte| byte.is_ascii_digit()) {
         return value.parse().ok();
@@ -385,8 +397,9 @@ mod tests {
             preview: preview.to_owned(),
             mime_types: vec![mime_type.to_owned()],
             logical_size: size,
-            source_node: device.to_owned(),
+            source_node: format!("node-{device}"),
             pinned,
+            source_device: device.to_owned(),
             physical_millis: millis,
         }
     }
@@ -429,6 +442,58 @@ mod tests {
 
         let unix_millis = HistoryQuery::parse("before:1704067200000").unwrap();
         assert_eq!(index.search(&unix_millis, 100)[0].content_id, "old");
+    }
+
+    #[test]
+    fn abbreviated_comma_filters_match_device_type_and_pin_state() {
+        let index = HistorySearchIndex::new(vec![
+            item("match", "Screenshot", "image/png", 10, "vd", true, 2),
+            item(
+                "wrong-device",
+                "Screenshot",
+                "image/png",
+                10,
+                "kiwi",
+                true,
+                1,
+            ),
+            item("wrong-type", "Text", "text/plain", 10, "vd", true, 3),
+        ]);
+
+        let query = HistoryQuery::parse("D:vd,t:image,P:true").expect("valid aliases");
+        let results = index.search(&query, 100);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].content_id, "match");
+    }
+
+    #[test]
+    fn quoted_and_escaped_commas_remain_filter_values() {
+        let index = HistorySearchIndex::new(vec![item(
+            "match",
+            "Text",
+            "text/plain",
+            10,
+            "office,laptop",
+            false,
+            1,
+        )]);
+
+        assert_eq!(
+            index.search(
+                &HistoryQuery::parse(r#"d:"office,laptop",t:text"#).unwrap(),
+                100
+            )[0]
+            .content_id,
+            "match"
+        );
+        assert_eq!(
+            index.search(
+                &HistoryQuery::parse(r"d:office\,laptop,t:text").unwrap(),
+                100
+            )[0]
+            .content_id,
+            "match"
+        );
     }
 
     #[test]

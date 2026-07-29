@@ -39,7 +39,7 @@ clip-sync ui switcher
 clip-sync ui control
 clip-sync status --json
 clip-sync peers --json
-clip-sync history search 'device:kiwi type:text pinned:false "error message"' --json
+clip-sync history search 'd:kiwi,t:text,p:false,"error message"' --json
 clip-sync history pin <content-id> --json
 clip-sync history delete <content-id> --json
 clip-sync share-clipboard --confirm --json
@@ -53,13 +53,14 @@ clip-sync rekey --old-key-file OLD --new-key-file NEW
 
 The UI commands will only be available when built with the optional `ui` Cargo feature.
 
-History search combines case-insensitive free text with typed filters. Terms and
-repeated filters are conjunctive, quoted phrases preserve spaces, and results
-are always newest first:
+History search combines case-insensitive free text with typed filters. Commas
+and whitespace chain filters conjunctively, quoted phrases preserve separators,
+and results are always newest first. `d:`, `t:`, and `p:` abbreviate `device:`,
+`type:`, and `pinned:`:
 
 ```console
-clip-sync history search '"release notes" device:kiwi type:text pinned:true'
-clip-sync history search 'before:2026-07-29T12:00:00Z min-size:4KiB max-size:2MB'
+clip-sync history search '"release notes",d:kiwi,t:text,p:true'
+clip-sync history search 'before:2026-07-29T12:00:00Z,min-size:4KiB,max-size:2MB'
 clip-sync history search 'before:1785326400000'
 ```
 

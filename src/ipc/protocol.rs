@@ -1,6 +1,6 @@
 use prost::{Enumeration, Message, Oneof};
 
-pub const IPC_PROTOCOL_VERSION: u32 = 4;
+pub const IPC_PROTOCOL_VERSION: u32 = 5;
 
 #[derive(Clone, PartialEq, Message)]
 pub struct Request {
@@ -228,6 +228,8 @@ pub struct HistoryItem {
     pub pinned: bool,
     #[prost(uint64, tag = "7")]
     pub physical_millis: u64,
+    #[prost(string, tag = "8")]
+    pub source_device: String,
 }
 
 #[derive(Clone, PartialEq, Eq, Message)]
