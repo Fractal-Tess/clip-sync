@@ -1,6 +1,6 @@
 use prost::{Enumeration, Message, Oneof};
 
-pub const IPC_PROTOCOL_VERSION: u32 = 3;
+pub const IPC_PROTOCOL_VERSION: u32 = 4;
 
 #[derive(Clone, PartialEq, Message)]
 pub struct Request {
@@ -10,7 +10,7 @@ pub struct Request {
     pub request_id: u64,
     #[prost(
         oneof = "request::Body",
-        tags = "10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21"
+        tags = "10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22"
     )]
     pub body: Option<request::Body>,
 }
@@ -18,7 +18,7 @@ pub struct Request {
 pub mod request {
     use super::{
         ActivateRequest, ConfigRequest, DiagnosticsRequest, ForgetDeviceRequest, HistoryRequest,
-        HistoryUpdateRequest, Oneof, PeersRequest, ShareClipboardRequest,
+        HistoryUpdateRequest, ImagePreviewRequest, Oneof, PeersRequest, ShareClipboardRequest,
         SharedSettingUpdateRequest, StatusRequest, TransferCancelRequest, TransfersRequest,
     };
 
@@ -48,6 +48,8 @@ pub mod request {
         ForgetDevice(ForgetDeviceRequest),
         #[prost(message, tag = "21")]
         SharedSettingUpdate(SharedSettingUpdateRequest),
+        #[prost(message, tag = "22")]
+        ImagePreview(ImagePreviewRequest),
     }
 }
 
@@ -82,6 +84,12 @@ pub struct HistoryRequest {
 
 #[derive(Clone, PartialEq, Eq, Message)]
 pub struct ActivateRequest {
+    #[prost(string, tag = "1")]
+    pub content_id: String,
+}
+
+#[derive(Clone, PartialEq, Eq, Message)]
+pub struct ImagePreviewRequest {
     #[prost(string, tag = "1")]
     pub content_id: String,
 }
@@ -137,14 +145,18 @@ pub struct Response {
     pub protocol_version: u32,
     #[prost(uint64, tag = "2")]
     pub request_id: u64,
-    #[prost(oneof = "response::Body", tags = "10, 11, 12, 13, 14, 15, 16, 17, 18")]
+    #[prost(
+        oneof = "response::Body",
+        tags = "10, 11, 12, 13, 14, 15, 16, 17, 18, 19"
+    )]
     pub body: Option<response::Body>,
 }
 
 pub mod response {
     use super::{
-        ConfigResponse, DiagnosticsResponse, ErrorResponse, HistoryResponse, MutationResponse,
-        Oneof, PeersResponse, ShareClipboardResponse, StatusResponse, TransfersResponse,
+        ConfigResponse, DiagnosticsResponse, ErrorResponse, HistoryResponse, ImagePreviewResponse,
+        MutationResponse, Oneof, PeersResponse, ShareClipboardResponse, StatusResponse,
+        TransfersResponse,
     };
 
     #[derive(Clone, PartialEq, Oneof)]
@@ -167,6 +179,8 @@ pub mod response {
         Transfers(TransfersResponse),
         #[prost(message, tag = "18")]
         ShareClipboard(ShareClipboardResponse),
+        #[prost(message, tag = "19")]
+        ImagePreview(ImagePreviewResponse),
     }
 }
 
@@ -214,6 +228,20 @@ pub struct HistoryItem {
     pub pinned: bool,
     #[prost(uint64, tag = "7")]
     pub physical_millis: u64,
+}
+
+#[derive(Clone, PartialEq, Eq, Message)]
+pub struct ImagePreviewResponse {
+    #[prost(string, tag = "1")]
+    pub content_id: String,
+    #[prost(string, tag = "2")]
+    pub mime_type: String,
+    #[prost(uint32, tag = "3")]
+    pub width: u32,
+    #[prost(uint32, tag = "4")]
+    pub height: u32,
+    #[prost(bytes = "vec", tag = "5")]
+    pub rgba: Vec<u8>,
 }
 
 #[derive(Clone, PartialEq, Eq, Message)]

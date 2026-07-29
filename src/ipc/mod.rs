@@ -31,9 +31,10 @@ use crate::{
     history_search::{HistoryQuery, HistorySearchIndex},
     ipc::protocol::{
         ConfigResponse, DeviceItem, DiagnosticCheck, DiagnosticsResponse, ErrorResponse,
-        HistoryItem, HistoryResponse, HistoryUpdateAction, IPC_PROTOCOL_VERSION, MutationResponse,
-        PeerItem, PeersResponse, Request, Response, ShareClipboardResponse, SharedSettingKind,
-        StatusResponse, TransferItem, TransfersResponse, request, response,
+        HistoryItem, HistoryResponse, HistoryUpdateAction, IPC_PROTOCOL_VERSION,
+        ImagePreviewResponse, MutationResponse, PeerItem, PeersResponse, Request, Response,
+        ShareClipboardResponse, SharedSettingKind, StatusResponse, TransferItem, TransfersResponse,
+        request, response,
     },
     mesh::{MESH_PROTOCOL_VERSION, MeshHandle},
     transfer::TRANSFER_PROTOCOL_VERSION,
@@ -134,6 +135,10 @@ pub enum DaemonCommand {
         setting: SharedSettingKind,
         value: u64,
         reply: oneshot::Sender<Result<(), String>>,
+    },
+    ImagePreview {
+        content_id: String,
+        reply: oneshot::Sender<Result<ImagePreviewResponse, String>>,
     },
 }
 
@@ -296,6 +301,25 @@ impl DaemonState {
                     .await
                     .search(&query, history_request.limit);
                 response::Body::History(HistoryResponse { items })
+            }
+            Some(request::Body::ImagePreview(preview)) => {
+                let content_id = preview.content_id;
+                let (reply, result) = oneshot::channel();
+                if self
+                    .inner
+                    .commands
+                    .send(DaemonCommand::ImagePreview { content_id, reply })
+                    .is_err()
+                {
+                    return command_processor_unavailable(request_id);
+                }
+                match result.await {
+                    Ok(Ok(preview)) => response::Body::ImagePreview(preview),
+                    Ok(Err(message)) => {
+                        return error_response(request_id, "image_preview_unavailable", message);
+                    }
+                    Err(_) => return command_processor_stopped(request_id),
+                }
             }
             Some(request::Body::Activate(activate)) => {
                 let content_id = activate.content_id;
@@ -1466,6 +1490,53 @@ mod tests {
         };
         assert!(mutation.ok);
         assert_eq!(mutation.resource_id.as_deref(), Some("content-id"));
+    }
+
+    #[tokio::test]
+    async fn image_preview_round_trips_through_daemon_command() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let (commands, mut command_rx) = mpsc::unbounded_channel();
+        let state = DaemonState::new(
+            "test-node".to_owned(),
+            temporary.path().join("config.toml"),
+            Config::default(),
+            commands,
+        );
+        let handler = tokio::spawn(async move {
+            state
+                .handle(Request {
+                    protocol_version: IPC_PROTOCOL_VERSION,
+                    request_id: 91,
+                    body: Some(request::Body::ImagePreview(protocol::ImagePreviewRequest {
+                        content_id: "content-id".to_owned(),
+                    })),
+                })
+                .await
+        });
+
+        let DaemonCommand::ImagePreview { content_id, reply } =
+            command_rx.recv().await.expect("image preview command")
+        else {
+            panic!("expected image preview command");
+        };
+        assert_eq!(content_id, "content-id");
+        reply
+            .send(Ok(protocol::ImagePreviewResponse {
+                content_id,
+                mime_type: "image/png".to_owned(),
+                width: 2,
+                height: 1,
+                rgba: vec![255; 8],
+            }))
+            .expect("image preview reply");
+
+        let response = handler.await.expect("handler task");
+        let Some(response::Body::ImagePreview(preview)) = response.body else {
+            panic!("expected image preview response");
+        };
+        assert_eq!(preview.content_id, "content-id");
+        assert_eq!((preview.width, preview.height), (2, 1));
+        assert_eq!(preview.rgba, vec![255; 8]);
     }
 
     #[tokio::test]

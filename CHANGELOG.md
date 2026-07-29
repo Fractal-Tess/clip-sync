@@ -20,5 +20,6 @@ All notable changes will be documented here. The project is pre-alpha; storage, 
 - Full JSON CLI and IPC parity for status, peers, diagnostics, history, sharing, transfers, settings, and devices.
 - Typed, quoted, bounded history search across CLI, IPC, and egui with deterministic newest-first results and an in-memory metadata index.
 - Keyboard-first singleton egui switcher and functional control center.
+- Two-to-three-column history grids with bounded lazy image previews, pin controls, and a pinned-only view.
 - Crash-safe authenticated keyslots and offline `rekey` with interrupted-operation recovery.
 - Local security/audit checks, live Wayland validation, disposable two-node deployment testing, Nix UI/daemon packages, and a hardened NixOS user-service module.

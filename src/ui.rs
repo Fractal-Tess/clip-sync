@@ -1,4 +1,5 @@
 use std::{
+    collections::{HashMap, HashSet},
     fs::{File, OpenOptions},
     os::unix::net::{UnixListener as StdUnixListener, UnixStream as StdUnixStream},
     path::{Path, PathBuf},
@@ -24,11 +25,11 @@ use crate::{
         protocol::{
             ActivateRequest, ConfigRequest, ConfigResponse, DiagnosticCheck, DiagnosticsRequest,
             DiagnosticsResponse, ForgetDeviceRequest, HistoryItem, HistoryRequest, HistoryResponse,
-            HistoryUpdateAction, HistoryUpdateRequest, IPC_PROTOCOL_VERSION, MutationResponse,
-            PeerItem, PeersRequest, PeersResponse, Request, Response, ShareClipboardRequest,
-            ShareClipboardResponse, SharedSettingKind, SharedSettingUpdateRequest, StatusRequest,
-            StatusResponse, TransferCancelRequest, TransferItem, TransfersRequest,
-            TransfersResponse, request, response,
+            HistoryUpdateAction, HistoryUpdateRequest, IPC_PROTOCOL_VERSION, ImagePreviewRequest,
+            ImagePreviewResponse, MutationResponse, PeerItem, PeersRequest, PeersResponse, Request,
+            Response, ShareClipboardRequest, ShareClipboardResponse, SharedSettingKind,
+            SharedSettingUpdateRequest, StatusRequest, StatusResponse, TransferCancelRequest,
+            TransferItem, TransfersRequest, TransfersResponse, request, response,
         },
     },
 };
@@ -41,6 +42,12 @@ const MUTED: Color32 = Color32::from_rgb(137, 154, 160);
 const ERROR: Color32 = Color32::from_rgb(242, 119, 119);
 const SUCCESS: Color32 = Color32::from_rgb(105, 219, 160);
 const SEARCH_DEBOUNCE: Duration = Duration::from_millis(120);
+const HISTORY_GRID_GAP: f32 = 10.0;
+const HISTORY_CARD_HEIGHT: f32 = 202.0;
+const HISTORY_PREVIEW_HEIGHT: f32 = 92.0;
+const SWITCHER_FOOTER_HEIGHT: f32 = 44.0;
+const MAX_IMAGE_PREVIEW_WIDTH: u32 = 320;
+const MAX_IMAGE_PREVIEW_HEIGHT: u32 = 180;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UiMode {
@@ -304,6 +311,7 @@ struct ClipSyncApp {
     ipc_worker: IpcWorker,
     event_rx: std_mpsc::Receiver<UiEvent>,
     search: String,
+    pinned_only: bool,
     selected_history: usize,
     scroll_selected_history: bool,
     selected_tab: ControlTab,
@@ -312,6 +320,7 @@ struct ClipSyncApp {
     history_loading: bool,
     pending_history_refresh: Option<Instant>,
     history: Vec<HistoryItem>,
+    image_previews: HashMap<String, ImagePreviewState>,
     status: Option<StatusResponse>,
     peers: Option<PeersResponse>,
     config: Option<serde_json::Value>,
@@ -355,6 +364,7 @@ impl ClipSyncApp {
             ipc_worker,
             event_rx,
             search: String::new(),
+            pinned_only: false,
             selected_history: 0,
             scroll_selected_history: false,
             selected_tab: ControlTab::History,
@@ -367,6 +377,7 @@ impl ClipSyncApp {
             history_loading: true,
             pending_history_refresh: None,
             history: Vec::new(),
+            image_previews: HashMap::new(),
             status: None,
             peers: None,
             config: None,
@@ -416,9 +427,13 @@ impl ClipSyncApp {
         self.pending_history_refresh = None;
         self.history_generation = self.history_generation.saturating_add(1);
         self.send(UiCommand::History {
-            query: self.search.clone(),
+            query: self.history_query(),
             generation: self.history_generation,
         });
+    }
+
+    fn history_query(&self) -> String {
+        build_history_query(&self.search, self.pinned_only)
     }
 
     fn schedule_history_refresh(&mut self) {
@@ -439,7 +454,7 @@ impl ClipSyncApp {
         }
         self.pending_history_refresh = None;
         self.send(UiCommand::History {
-            query: self.search.clone(),
+            query: self.history_query(),
             generation: self.history_generation,
         });
     }
@@ -495,6 +510,14 @@ impl ClipSyncApp {
                     match result {
                         Ok(history) => {
                             self.history = history.items;
+                            let visible_content_ids = self
+                                .history
+                                .iter()
+                                .map(|item| item.content_id.as_str())
+                                .collect::<HashSet<_>>();
+                            self.image_previews.retain(|content_id, _| {
+                                visible_content_ids.contains(content_id.as_str())
+                            });
                             self.selected_history = self
                                 .selected_history
                                 .min(self.history.len().saturating_sub(1));
@@ -506,6 +529,22 @@ impl ClipSyncApp {
                             self.refresh_status();
                         }
                     }
+                }
+                UiEvent::ImagePreview { content_id, result } => {
+                    if !self
+                        .history
+                        .iter()
+                        .any(|item| item.content_id == content_id)
+                    {
+                        self.image_previews.remove(&content_id);
+                        continue;
+                    }
+                    let preview = result
+                        .and_then(|preview| preview_texture(&self.context, &content_id, &preview));
+                    self.image_previews.insert(
+                        content_id,
+                        preview.map_or(ImagePreviewState::Unavailable, ImagePreviewState::Ready),
+                    );
                 }
                 UiEvent::Peers(result) => match result {
                     Ok(peers) => {
@@ -650,17 +689,31 @@ impl ClipSyncApp {
                 brand_header(ui, "history switcher");
                 ui.add_space(8.0);
 
-                let search = ui.add_sized(
-                    [ui.available_width(), 42.0],
-                    egui::TextEdit::singleline(&mut self.search)
-                        .hint_text("Search or filter (device:, type:, pinned:)")
-                        .font(FontId::proportional(16.0)),
-                );
-                if self.switcher_state == SwitcherState::NeedsFocus {
-                    search.request_focus();
-                    self.switcher_state = SwitcherState::Ready;
+                let mut search_changed = false;
+                let mut pinned_clicked = false;
+                ui.horizontal(|ui| {
+                    let search = ui.add_sized(
+                        [(ui.available_width() - 112.0).max(180.0), 42.0],
+                        egui::TextEdit::singleline(&mut self.search)
+                            .hint_text("Search or filter (device:, type:)")
+                            .font(FontId::proportional(16.0)),
+                    );
+                    if self.switcher_state == SwitcherState::NeedsFocus {
+                        search.request_focus();
+                        self.switcher_state = SwitcherState::Ready;
+                    }
+                    search_changed = search.changed();
+                    pinned_clicked = ui
+                        .add_sized(
+                            [102.0, 42.0],
+                            egui::Button::new("Pinned only").selected(self.pinned_only),
+                        )
+                        .clicked();
+                });
+                if pinned_clicked {
+                    self.pinned_only = !self.pinned_only;
                 }
-                if search.changed() {
+                if search_changed || pinned_clicked {
                     self.selected_history = 0;
                     self.schedule_history_refresh();
                 }
@@ -689,30 +742,32 @@ impl ClipSyncApp {
                 }
 
                 ui.add_space(6.0);
-                if let Some(error) = self.daemon_error.clone() {
-                    let socket = self.paths.socket.clone();
-                    unavailable_panel(ui, &socket, &error, || self.retry_connection());
-                } else if let Some(error) = &self.history_error {
-                    message_panel(ui, error, ERROR);
-                } else if self.history_loading && self.history.is_empty() {
-                    message_panel(ui, "Loading history…", MUTED);
-                } else if self.history.is_empty() {
-                    message_panel(ui, "No matching clipboard history", MUTED);
-                } else {
-                    self.history_list(ui, false);
-                }
+                let history_height = (ui.available_height() - SWITCHER_FOOTER_HEIGHT).max(80.0);
+                ui.allocate_ui(Vec2::new(ui.available_width(), history_height), |ui| {
+                    if let Some(error) = self.daemon_error.clone() {
+                        let socket = self.paths.socket.clone();
+                        unavailable_panel(ui, &socket, &error, || self.retry_connection());
+                    } else if let Some(error) = &self.history_error {
+                        message_panel(ui, error, ERROR);
+                    } else if self.history_loading && self.history.is_empty() {
+                        message_panel(ui, "Loading history…", MUTED);
+                    } else if self.history.is_empty() {
+                        message_panel(ui, "No matching clipboard history", MUTED);
+                    } else {
+                        self.history_grid(ui, false);
+                    }
+                });
 
+                ui.add_space(10.0);
                 if let Some(notice) = &self.notice {
                     notice.show(ui);
                 }
-                ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
-                    ui.label(
-                        RichText::new("↑↓ navigate    Enter activate    Esc close")
-                            .monospace()
-                            .color(MUTED)
-                            .size(11.0),
-                    );
-                });
+                ui.label(
+                    RichText::new("↑↓ navigate    Enter activate    Esc close")
+                        .monospace()
+                        .color(MUTED)
+                        .size(11.0),
+                );
             });
     }
 
@@ -790,11 +845,20 @@ impl ClipSyncApp {
     fn history_tab(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             let search = ui.add_sized(
-                [ui.available_width() - 210.0, 36.0],
+                [(ui.available_width() - 322.0).max(140.0), 36.0],
                 egui::TextEdit::singleline(&mut self.search)
                     .hint_text("Search or filter merged history"),
             );
-            if search.changed() {
+            let pinned_clicked = ui
+                .add_sized(
+                    [102.0, 36.0],
+                    egui::Button::new("Pinned only").selected(self.pinned_only),
+                )
+                .clicked();
+            if pinned_clicked {
+                self.pinned_only = !self.pinned_only;
+            }
+            if search.changed() || pinned_clicked {
                 self.selected_history = 0;
                 self.schedule_history_refresh();
             }
@@ -871,100 +935,153 @@ impl ClipSyncApp {
                 MUTED,
             );
         } else {
-            self.history_list(ui, true);
+            self.history_grid(ui, true);
         }
     }
 
     #[allow(
         clippy::too_many_lines,
-        reason = "the list keeps row rendering and its keyboard/mutation actions together"
+        reason = "the grid keeps card rendering and its keyboard/mutation actions together"
     )]
-    fn history_list(&mut self, ui: &mut egui::Ui, show_actions: bool) {
+    fn history_grid(&mut self, ui: &mut egui::Ui, allow_delete: bool) {
+        let columns = history_column_count(ui.available_width(), self.mode);
+        let columns_f32 = f32::from(u16::try_from(columns).expect("history columns fit in u16"));
+        let total_gap = HISTORY_GRID_GAP * (columns_f32 - 1.0);
+        let card_width = ((ui.available_width() - total_gap - 14.0) / columns_f32)
+            .floor()
+            .max(180.0);
         let mut action = None;
+        let mut requested_previews = Vec::new();
+        let grid_id = match self.mode {
+            UiMode::Switcher => "switcher-history-grid",
+            UiMode::Control => "control-history-grid",
+        };
+
         ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                for (index, item) in self.history.iter().enumerate() {
-                    let selected = index == self.selected_history;
-                    let row = Frame::new()
-                        .fill(if selected {
-                            Color32::from_rgb(24, 48, 54)
-                        } else {
-                            SURFACE
-                        })
-                        .stroke(Stroke::new(1.0, if selected { CYAN } else { BORDER }))
-                        .corner_radius(CornerRadius::same(7))
-                        .inner_margin(Margin::same(12))
-                        .show(ui, |ui| {
-                            let response = ui
-                                .horizontal(|ui| {
+                egui::Grid::new(grid_id)
+                    .num_columns(columns)
+                    .spacing(Vec2::splat(HISTORY_GRID_GAP))
+                    .show(ui, |ui| {
+                        for index in 0..self.history.len() {
+                            let item = self.history[index].clone();
+                            let selected = index == self.selected_history;
+                            let has_image = history_item_has_image(&item);
+                            let preview = self.image_previews.get(&item.content_id);
+                            let card = Frame::new()
+                                .fill(if selected {
+                                    Color32::from_rgb(24, 48, 54)
+                                } else {
+                                    SURFACE
+                                })
+                                .stroke(Stroke::new(1.0, if selected { CYAN } else { BORDER }))
+                                .corner_radius(CornerRadius::same(8))
+                                .inner_margin(Margin::same(10))
+                                .show(ui, |ui| {
                                     ui.vertical(|ui| {
-                                        ui.set_min_width(
-                                            (ui.available_width()
-                                                - if show_actions { 220.0 } else { 20.0 })
-                                            .max(120.0),
-                                        );
-                                        let title = if item.preview.trim().is_empty() {
-                                            "Binary clipboard content"
-                                        } else {
-                                            item.preview.trim()
-                                        };
-                                        ui.label(
-                                            RichText::new(title).color(Color32::WHITE).size(14.0),
-                                        );
+                                        ui.set_width((card_width - 20.0).max(160.0));
+                                        ui.set_min_height(HISTORY_CARD_HEIGHT - 20.0);
+                                        history_card_preview(ui, &item, preview);
+
                                         let mime = item
                                             .mime_types
                                             .first()
                                             .map_or("unknown", String::as_str);
                                         ui.label(
                                             RichText::new(format!(
-                                                "{} · {} · {}{}",
-                                                item.source_node,
-                                                mime,
+                                                "{mime} · {}{}",
                                                 format_bytes(item.logical_size),
                                                 if item.pinned { " · pinned" } else { "" }
                                             ))
                                             .color(MUTED)
                                             .monospace()
-                                            .size(11.0),
+                                            .size(10.0),
                                         );
+                                        ui.label(
+                                            RichText::new(format!(
+                                                "source {}",
+                                                short_identifier(&item.source_node)
+                                            ))
+                                            .color(MUTED)
+                                            .monospace()
+                                            .size(10.0),
+                                        );
+                                        ui.add_space(2.0);
+                                        ui.horizontal(|ui| {
+                                            if ui
+                                                .add_enabled(
+                                                    !self.mutation_pending,
+                                                    egui::Button::new("Activate"),
+                                                )
+                                                .clicked()
+                                            {
+                                                action = Some(HistoryAction::Activate(
+                                                    item.content_id.clone(),
+                                                ));
+                                            }
+                                            if ui
+                                                .add_enabled(
+                                                    !self.mutation_pending,
+                                                    egui::Button::new(if item.pinned {
+                                                        "Unpin"
+                                                    } else {
+                                                        "Pin"
+                                                    }),
+                                                )
+                                                .clicked()
+                                            {
+                                                action = Some(HistoryAction::Pin {
+                                                    content_id: item.content_id.clone(),
+                                                    pinned: !item.pinned,
+                                                });
+                                            }
+                                            if allow_delete
+                                                && ui
+                                                    .add_enabled(
+                                                        !self.mutation_pending,
+                                                        egui::Button::new("Delete"),
+                                                    )
+                                                    .clicked()
+                                            {
+                                                action = Some(HistoryAction::Delete(
+                                                    item.content_id.clone(),
+                                                ));
+                                            }
+                                        });
                                     });
-                                    if show_actions {
-                                        if ui.button("Activate").clicked() {
-                                            action = Some(HistoryAction::Activate(
-                                                item.content_id.clone(),
-                                            ));
-                                        }
-                                        if ui
-                                            .button(if item.pinned { "Unpin" } else { "Pin" })
-                                            .clicked()
-                                        {
-                                            action = Some(HistoryAction::Pin {
-                                                content_id: item.content_id.clone(),
-                                                pinned: !item.pinned,
-                                            });
-                                        }
-                                        if ui.button("Delete").clicked() {
-                                            action = Some(HistoryAction::Delete(
-                                                item.content_id.clone(),
-                                            ));
-                                        }
-                                    }
-                                })
-                                .response;
+                                });
+                            let response = card.response.interact(egui::Sense::click());
                             if response.clicked() {
                                 self.selected_history = index;
                             }
-                            if !show_actions && response.double_clicked() {
+                            if !allow_delete && response.double_clicked() {
                                 action = Some(HistoryAction::Activate(item.content_id.clone()));
                             }
-                        });
-                    if selected && self.scroll_selected_history {
-                        row.response.scroll_to_me(Some(egui::Align::Center));
-                    }
-                }
+                            if selected && self.scroll_selected_history {
+                                response.scroll_to_me(Some(egui::Align::Center));
+                            }
+                            if has_image && preview.is_none() && ui.is_rect_visible(response.rect) {
+                                requested_previews.push(item.content_id);
+                            }
+                            if (index + 1) % columns == 0 {
+                                ui.end_row();
+                            }
+                        }
+                    });
+                ui.add_space(18.0);
             });
         self.scroll_selected_history = false;
+
+        for content_id in requested_previews {
+            if self
+                .image_previews
+                .insert(content_id.clone(), ImagePreviewState::Loading)
+                .is_none()
+            {
+                self.send(UiCommand::ImagePreview { content_id });
+            }
+        }
 
         if self.mutation_pending {
             return;
@@ -1489,6 +1606,12 @@ impl ControlTab {
     }
 }
 
+enum ImagePreviewState {
+    Loading,
+    Ready(egui::TextureHandle),
+    Unavailable,
+}
+
 enum HistoryAction {
     Activate(String),
     Pin { content_id: String, pinned: bool },
@@ -1535,6 +1658,9 @@ enum UiCommand {
         query: String,
         generation: u64,
     },
+    ImagePreview {
+        content_id: String,
+    },
     Peers,
     Config,
     Diagnostics,
@@ -1568,6 +1694,10 @@ enum UiEvent {
     History {
         generation: u64,
         result: Result<HistoryResponse, String>,
+    },
+    ImagePreview {
+        content_id: String,
+        result: Result<ImagePreviewResponse, String>,
     },
     Peers(Result<PeersResponse, String>),
     Config(Result<ConfigResponse, String>),
@@ -1682,6 +1812,12 @@ impl UiCommand {
                 request::Body::History(HistoryRequest { query, limit: 200 }),
                 EventTarget::History(generation),
             ),
+            Self::ImagePreview { content_id } => (
+                request::Body::ImagePreview(ImagePreviewRequest {
+                    content_id: content_id.clone(),
+                }),
+                EventTarget::ImagePreview(content_id),
+            ),
             Self::Peers => (request::Body::Peers(PeersRequest {}), EventTarget::Peers),
             Self::Config => (request::Body::Config(ConfigRequest {}), EventTarget::Config),
             Self::Diagnostics => (
@@ -1733,6 +1869,7 @@ impl UiCommand {
 enum EventTarget {
     Status,
     History(u64),
+    ImagePreview(String),
     Peers,
     Config,
     Diagnostics,
@@ -1748,6 +1885,10 @@ impl EventTarget {
             Self::History(generation) => UiEvent::History {
                 generation,
                 result: expect_history(result),
+            },
+            Self::ImagePreview(content_id) => UiEvent::ImagePreview {
+                content_id,
+                result: expect_image_preview(result),
             },
             Self::Peers => UiEvent::Peers(expect_peers(result)),
             Self::Config => UiEvent::Config(expect_config(result)),
@@ -1856,6 +1997,13 @@ fn expect_history(result: Result<Response, String>) -> Result<HistoryResponse, S
     }
 }
 
+fn expect_image_preview(result: Result<Response, String>) -> Result<ImagePreviewResponse, String> {
+    match response_error(result?)? {
+        response::Body::ImagePreview(value) => Ok(value),
+        _ => Err("daemon returned an unexpected image-preview response".to_owned()),
+    }
+}
+
 fn expect_peers(result: Result<Response, String>) -> Result<PeersResponse, String> {
     match response_error(result?)? {
         response::Body::Peers(value) => Ok(value),
@@ -1896,6 +2044,131 @@ fn expect_mutation(result: Result<Response, String>) -> Result<MutationResponse,
         response::Body::Mutation(value) => Ok(value),
         _ => Err("daemon returned an unexpected mutation response".to_owned()),
     }
+}
+
+fn preview_texture(
+    context: &egui::Context,
+    requested_content_id: &str,
+    preview: &ImagePreviewResponse,
+) -> Result<egui::TextureHandle, String> {
+    if preview.content_id != requested_content_id {
+        return Err("image preview content ID did not match its request".to_owned());
+    }
+    if preview.width == 0
+        || preview.height == 0
+        || preview.width > MAX_IMAGE_PREVIEW_WIDTH
+        || preview.height > MAX_IMAGE_PREVIEW_HEIGHT
+    {
+        return Err("image preview dimensions are invalid".to_owned());
+    }
+    let width = usize::try_from(preview.width)
+        .map_err(|_| "image preview width does not fit in memory".to_owned())?;
+    let height = usize::try_from(preview.height)
+        .map_err(|_| "image preview height does not fit in memory".to_owned())?;
+    let expected = width
+        .checked_mul(height)
+        .and_then(|pixels| pixels.checked_mul(4))
+        .ok_or_else(|| "image preview dimensions overflow".to_owned())?;
+    if preview.rgba.len() != expected {
+        return Err("image preview pixel data has the wrong length".to_owned());
+    }
+    let image = egui::ColorImage::from_rgba_unmultiplied([width, height], &preview.rgba);
+    Ok(context.load_texture(
+        format!("clip-sync-preview-{requested_content_id}"),
+        image,
+        egui::TextureOptions::LINEAR,
+    ))
+}
+
+fn build_history_query(search: &str, pinned_only: bool) -> String {
+    if !pinned_only {
+        return search.to_owned();
+    }
+    let query = search.trim();
+    if query.is_empty() {
+        "pinned:true".to_owned()
+    } else {
+        format!("{query} pinned:true")
+    }
+}
+
+fn history_column_count(available_width: f32, mode: UiMode) -> usize {
+    let three_column_threshold = match mode {
+        UiMode::Switcher => 900.0,
+        UiMode::Control => 860.0,
+    };
+    if available_width >= three_column_threshold {
+        3
+    } else {
+        2
+    }
+}
+
+fn history_item_has_image(item: &HistoryItem) -> bool {
+    item.mime_types.iter().any(|mime| {
+        matches!(
+            mime.split(';')
+                .next()
+                .unwrap_or(mime)
+                .trim()
+                .to_ascii_lowercase()
+                .as_str(),
+            "image/png"
+                | "image/jpeg"
+                | "image/jpg"
+                | "image/gif"
+                | "image/webp"
+                | "image/bmp"
+                | "image/x-ms-bmp"
+                | "image/tiff"
+        )
+    })
+}
+
+fn history_card_preview(
+    ui: &mut egui::Ui,
+    item: &HistoryItem,
+    preview: Option<&ImagePreviewState>,
+) {
+    let size = Vec2::new(ui.available_width(), HISTORY_PREVIEW_HEIGHT);
+    if history_item_has_image(item) {
+        ui.allocate_ui_with_layout(
+            size,
+            egui::Layout::centered_and_justified(egui::Direction::LeftToRight),
+            |ui| match preview {
+                Some(ImagePreviewState::Ready(texture)) => {
+                    ui.add(egui::Image::new(texture).max_size(size));
+                }
+                Some(ImagePreviewState::Loading) => {
+                    ui.spinner();
+                }
+                Some(ImagePreviewState::Unavailable) => {
+                    ui.label(RichText::new("Preview unavailable").color(MUTED).size(12.0));
+                }
+                None => {
+                    ui.label(RichText::new("Loading preview…").color(MUTED).size(12.0));
+                }
+            },
+        );
+    } else {
+        let title = if item.preview.trim().is_empty() {
+            "Binary clipboard content"
+        } else {
+            item.preview.trim()
+        };
+        ui.allocate_ui(size, |ui| {
+            ui.add(egui::Label::new(RichText::new(title).color(Color32::WHITE).size(14.0)).wrap());
+        });
+    }
+}
+
+fn short_identifier(identifier: &str) -> String {
+    const VISIBLE_CHARS: usize = 12;
+    let mut short = identifier.chars().take(VISIBLE_CHARS).collect::<String>();
+    if identifier.chars().count() > VISIBLE_CHARS {
+        short.push('…');
+    }
+    short
 }
 
 fn brand_header(ui: &mut egui::Ui, subtitle: &str) {
@@ -2237,5 +2510,39 @@ mod tests {
         assert_eq!(format_bytes(12), "12 B");
         assert_eq!(format_bytes(1536), "1.5 KiB");
         assert_eq!(format_bytes(20 * 1024 * 1024), "20.0 MiB");
+    }
+
+    #[test]
+    fn pinned_toggle_adds_a_deterministic_history_filter() {
+        assert_eq!(build_history_query("", true), "pinned:true");
+        assert_eq!(
+            build_history_query("device:kiwi screenshot", true),
+            "device:kiwi screenshot pinned:true"
+        );
+        assert_eq!(build_history_query("  text  ", false), "  text  ");
+    }
+
+    #[test]
+    fn history_grid_uses_two_or_three_columns() {
+        assert_eq!(history_column_count(700.0, UiMode::Switcher), 2);
+        assert_eq!(history_column_count(1_000.0, UiMode::Switcher), 3);
+        assert_eq!(history_column_count(800.0, UiMode::Control), 2);
+        assert_eq!(history_column_count(900.0, UiMode::Control), 3);
+    }
+
+    #[test]
+    fn raster_mime_types_request_image_previews() {
+        let mut item = HistoryItem {
+            content_id: "content".to_owned(),
+            preview: String::new(),
+            mime_types: vec!["image/png".to_owned()],
+            logical_size: 4,
+            source_node: "node".to_owned(),
+            pinned: false,
+            physical_millis: 0,
+        };
+        assert!(history_item_has_image(&item));
+        item.mime_types = vec!["image/svg+xml".to_owned()];
+        assert!(!history_item_has_image(&item));
     }
 }

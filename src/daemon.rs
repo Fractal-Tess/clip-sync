@@ -1,4 +1,4 @@
-use std::{fs, time::Duration};
+use std::{fs, io::Cursor, time::Duration};
 
 use anyhow::Context;
 use tokio::task::JoinHandle;
@@ -17,7 +17,8 @@ use crate::{
     ipc::{
         self, DaemonCommand, DaemonState,
         protocol::{
-            DeviceItem, HistoryItem, ShareClipboardResponse, SharedSettingKind, TransferItem,
+            DeviceItem, HistoryItem, ImagePreviewResponse, ShareClipboardResponse,
+            SharedSettingKind, TransferItem,
         },
     },
     mesh::{
@@ -33,6 +34,12 @@ use crate::{
     storage::{CompactionReport, HistoryStore},
     transfer::{TransferCoordinator, TransferId, TransferStateLimits},
 };
+
+const IMAGE_PREVIEW_WIDTH: u32 = 320;
+const IMAGE_PREVIEW_HEIGHT: u32 = 180;
+const MAX_IMAGE_PREVIEW_SOURCE_BYTES: u64 = 32 * 1024 * 1024;
+const MAX_IMAGE_PREVIEW_DIMENSION: u32 = 8192;
+const MAX_IMAGE_PREVIEW_DECODE_BYTES: u64 = 128 * 1024 * 1024;
 
 /// Stable daemon-layer result consumed by future IPC/UI adapters.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -842,6 +849,11 @@ async fn handle_daemon_command(
             }
             let _ = reply.send(result);
         }
+        DaemonCommand::ImagePreview { content_id, reply } => {
+            let result =
+                image_preview(&content_id, history, transfers).map_err(|error| error.to_string());
+            let _ = reply.send(result);
+        }
     }
 }
 
@@ -1128,6 +1140,107 @@ fn schedule_materialization_cleanup(
             }
         }
     });
+}
+
+fn image_preview(
+    encoded_content_id: &str,
+    history: &HistoryStore,
+    transfers: &TransferCoordinator,
+) -> anyhow::Result<ImagePreviewResponse> {
+    let content_id = encoded_content_id
+        .parse()
+        .context("content ID is invalid")?;
+    if !history.projection().is_visible(content_id) {
+        anyhow::bail!("history item is deleted");
+    }
+
+    let (mime_type, bytes) = if let Some(payload) = history.projection().payload(content_id) {
+        let representation = payload
+            .representations()
+            .iter()
+            .find(|representation| image_format_for_mime(representation.mime()).is_some())
+            .context("history item has no supported raster image")?;
+        let source_size = u64::try_from(representation.bytes().len())
+            .context("image preview source size does not fit in u64")?;
+        if source_size > MAX_IMAGE_PREVIEW_SOURCE_BYTES {
+            anyhow::bail!("image is too large to preview safely");
+        }
+        (
+            representation.mime().to_owned(),
+            representation.bytes().to_vec(),
+        )
+    } else {
+        let (_, _, manifest) = history
+            .projection()
+            .completed_manifest_for_content(content_id)
+            .context("image payload is not available locally")?;
+        let crate::payload::StoredManifest::MimeBundle(bundle) = manifest else {
+            anyhow::bail!("history item has no supported raster image");
+        };
+        let representation = bundle
+            .representations()
+            .iter()
+            .find(|representation| image_format_for_mime(representation.mime()).is_some())
+            .context("history item has no supported raster image")?;
+        if representation.blob().logical_size() > MAX_IMAGE_PREVIEW_SOURCE_BYTES {
+            anyhow::bail!("image is too large to preview safely");
+        }
+        let capacity = usize::try_from(representation.blob().logical_size())
+            .context("image preview source size does not fit in memory")?;
+        let mut bytes = Vec::with_capacity(capacity);
+        transfers
+            .store()
+            .read_blob(representation.blob(), &mut bytes, &CancellationToken::new())
+            .context("read encrypted image preview source")?;
+        (representation.mime().to_owned(), bytes)
+    };
+
+    decode_image_preview(encoded_content_id, mime_type, bytes)
+}
+
+fn decode_image_preview(
+    content_id: &str,
+    mime_type: String,
+    bytes: Vec<u8>,
+) -> anyhow::Result<ImagePreviewResponse> {
+    let format = image_format_for_mime(&mime_type).context("unsupported raster image type")?;
+    let mut reader = image::ImageReader::with_format(Cursor::new(bytes), format);
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(MAX_IMAGE_PREVIEW_DIMENSION);
+    limits.max_image_height = Some(MAX_IMAGE_PREVIEW_DIMENSION);
+    limits.max_alloc = Some(MAX_IMAGE_PREVIEW_DECODE_BYTES);
+    reader.limits(limits);
+    let image = reader.decode().context("decode clipboard image preview")?;
+    let thumbnail = image
+        .thumbnail(IMAGE_PREVIEW_WIDTH, IMAGE_PREVIEW_HEIGHT)
+        .to_rgba8();
+    let (width, height) = thumbnail.dimensions();
+    Ok(ImagePreviewResponse {
+        content_id: content_id.to_owned(),
+        mime_type,
+        width,
+        height,
+        rgba: thumbnail.into_raw(),
+    })
+}
+
+fn image_format_for_mime(mime: &str) -> Option<image::ImageFormat> {
+    match mime
+        .split(';')
+        .next()
+        .unwrap_or(mime)
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "image/png" => Some(image::ImageFormat::Png),
+        "image/jpeg" | "image/jpg" => Some(image::ImageFormat::Jpeg),
+        "image/gif" => Some(image::ImageFormat::Gif),
+        "image/webp" => Some(image::ImageFormat::WebP),
+        "image/bmp" | "image/x-ms-bmp" => Some(image::ImageFormat::Bmp),
+        "image/tiff" => Some(image::ImageFormat::Tiff),
+        _ => None,
+    }
 }
 
 fn history_items(replica: &Replica) -> Vec<HistoryItem> {
@@ -2210,6 +2323,33 @@ mod tests {
 
         shutdown.cancel();
         runtime.wait().await;
+    }
+
+    #[test]
+    fn raster_image_preview_is_bounded_rgba() {
+        let source = image::RgbaImage::from_pixel(640, 360, image::Rgba([20, 80, 140, 255]));
+        let mut encoded = Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(source)
+            .write_to(&mut encoded, image::ImageFormat::Png)
+            .unwrap();
+
+        let preview =
+            decode_image_preview("content-id", "image/png".to_owned(), encoded.into_inner())
+                .unwrap();
+
+        assert_eq!(preview.content_id, "content-id");
+        assert_eq!(preview.mime_type, "image/png");
+        assert_eq!((preview.width, preview.height), (320, 180));
+        assert_eq!(preview.rgba.len(), 320 * 180 * 4);
+    }
+
+    #[test]
+    fn vector_images_are_not_offered_as_raster_previews() {
+        assert_eq!(image_format_for_mime("image/svg+xml"), None);
+        assert_eq!(
+            image_format_for_mime("image/jpeg; charset=binary"),
+            Some(image::ImageFormat::Jpeg)
+        );
     }
 
     #[cfg(unix)]
