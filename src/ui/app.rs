@@ -90,7 +90,11 @@ pub(super) struct ClipSyncApp {
     notice: Option<Notice>,
     pending_scopes: HashSet<PendingScope>,
     transfer_refresh_pending: bool,
+    peers_refresh_pending: bool,
+    config_refresh_pending: bool,
+    diagnostics_refresh_pending: bool,
     last_transfer_refresh: Instant,
+    last_management_refresh: Instant,
     share_inspection: Option<ShareClipboardResponse>,
     share_generation: ShareGenerationState,
     pending_transfer_cancel: Option<String>,
@@ -171,9 +175,13 @@ impl ClipSyncApp {
             notice: None,
             pending_scopes: HashSet::new(),
             transfer_refresh_pending: false,
+            peers_refresh_pending: false,
+            config_refresh_pending: false,
+            diagnostics_refresh_pending: false,
             last_transfer_refresh: Instant::now()
                 .checked_sub(Duration::from_secs(1))
                 .unwrap_or_else(Instant::now),
+            last_management_refresh: Instant::now(),
             share_inspection: None,
             share_generation: ShareGenerationState::default(),
             pending_transfer_cancel: None,
@@ -202,6 +210,9 @@ impl ClipSyncApp {
         }
         let share_generation = command.share_generation();
         let transfers = matches!(&command, UiCommand::Transfers);
+        let peers = matches!(&command, UiCommand::Peers);
+        let config = matches!(&command, UiCommand::Config);
+        let diagnostics = matches!(&command, UiCommand::Diagnostics);
         if let Err(error) = self.ipc_worker.send(command) {
             if let Some(scope) = pending_scope {
                 self.finish_pending(scope);
@@ -211,6 +222,15 @@ impl ClipSyncApp {
             }
             if transfers {
                 self.transfer_refresh_pending = false;
+            }
+            if peers {
+                self.peers_refresh_pending = false;
+            }
+            if config {
+                self.config_refresh_pending = false;
+            }
+            if diagnostics {
+                self.diagnostics_refresh_pending = false;
             }
             self.daemon_error = Some(error);
         }
@@ -364,17 +384,44 @@ impl ClipSyncApp {
         match tab {
             ControlTab::History => self.refresh_history(),
             ControlTab::Transfers => self.refresh_transfers(),
-            ControlTab::Peers => self.send(UiCommand::Peers),
-            ControlTab::Settings => self.send(UiCommand::Config),
-            ControlTab::Diagnostics => self.send(UiCommand::Diagnostics),
+            ControlTab::Peers => self.refresh_peers(),
+            ControlTab::Settings => self.refresh_config(),
+            ControlTab::Diagnostics => self.refresh_diagnostics(),
         }
     }
 
     pub(super) fn refresh_control_data(&mut self) {
-        self.send(UiCommand::Peers);
-        self.send(UiCommand::Config);
-        self.send(UiCommand::Diagnostics);
+        self.refresh_peers();
+        self.refresh_config();
+        self.refresh_diagnostics();
         self.refresh_transfers();
+    }
+
+    pub(super) fn refresh_peers(&mut self) {
+        if self.peers_refresh_pending {
+            return;
+        }
+        self.peers_refresh_pending = true;
+        self.last_management_refresh = Instant::now();
+        self.send(UiCommand::Peers);
+    }
+
+    pub(super) fn refresh_config(&mut self) {
+        if self.config_refresh_pending {
+            return;
+        }
+        self.config_refresh_pending = true;
+        self.last_management_refresh = Instant::now();
+        self.send(UiCommand::Config);
+    }
+
+    pub(super) fn refresh_diagnostics(&mut self) {
+        if self.diagnostics_refresh_pending {
+            return;
+        }
+        self.diagnostics_refresh_pending = true;
+        self.last_management_refresh = Instant::now();
+        self.send(UiCommand::Diagnostics);
     }
 
     pub(super) fn refresh_transfers(&mut self) {
@@ -384,6 +431,42 @@ impl ClipSyncApp {
         self.transfer_refresh_pending = true;
         self.last_transfer_refresh = Instant::now();
         self.send(UiCommand::Transfers);
+    }
+
+    pub(super) fn dispatch_management_refresh(&mut self, minimized: bool) {
+        if minimized || self.presentation != Presentation::Management {
+            return;
+        }
+        if matches!(
+            self.selected_tab,
+            ControlTab::History | ControlTab::Transfers
+        ) {
+            return;
+        }
+        let pending = match self.selected_tab {
+            ControlTab::Peers => self.peers_refresh_pending,
+            ControlTab::Settings => self.config_refresh_pending,
+            ControlTab::Diagnostics => self.diagnostics_refresh_pending,
+            ControlTab::History | ControlTab::Transfers => false,
+        };
+        if pending {
+            self.context.request_repaint_after(Duration::from_secs(1));
+            return;
+        }
+        let cadence = Duration::from_secs(5);
+        let remaining = cadence.saturating_sub(self.last_management_refresh.elapsed());
+        if !remaining.is_zero() {
+            self.context.request_repaint_after(remaining);
+            return;
+        }
+        match self.selected_tab {
+            ControlTab::Peers => self.refresh_peers(),
+            ControlTab::Settings => self.refresh_config(),
+            ControlTab::Diagnostics => self.refresh_diagnostics(),
+            ControlTab::History | ControlTab::Transfers => unreachable!("filtered above"),
+        }
+        self.refresh_status();
+        self.context.request_repaint_after(cadence);
     }
 
     pub(super) fn dispatch_transfer_refresh(&mut self) {
@@ -410,6 +493,9 @@ impl ClipSyncApp {
         }
     }
 }
+
+#[cfg(test)]
+pub(in crate::ui) use management::{diagnostic_card, peer_card, peer_card_header};
 
 mod delete;
 mod events;

@@ -41,6 +41,10 @@ pub(super) fn history_items(replica: &Replica) -> Vec<HistoryItem> {
                 || transfer.map_or(0, |(_, _, manifest)| manifest.logical_size()),
                 |payload| payload.descriptor().logical_size(),
             );
+            let origin = replica
+                .projection()
+                .origin_event_for_content(view.content_id())
+                .unwrap_or_else(|| view.last_activity());
             HistoryItem {
                 content_id: view.content_id().to_string(),
                 preview: payload.map_or_else(
@@ -62,10 +66,11 @@ pub(super) fn history_items(replica: &Replica) -> Vec<HistoryItem> {
                 ),
                 mime_types,
                 logical_size,
-                source_node: view.last_activity().operation_id().node().to_string(),
+                source_node: origin.operation_id().node().to_string(),
                 pinned: view.pinned(),
                 physical_millis: view.last_activity().timestamp().physical_millis(),
                 source_device: String::new(),
+                origin_millis: Some(origin.timestamp().physical_millis()),
             }
         })
         .collect()

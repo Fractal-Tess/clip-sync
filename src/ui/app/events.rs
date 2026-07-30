@@ -10,7 +10,7 @@ use crate::ui::{
         ImagePreviewState, MutationKind, PendingScope, ShareCompletion, UiCommand, UiEvent,
         activation_result_closes, preview_texture,
     },
-    style::{Notice, config_pointer_u64},
+    style::{Notice, config_pointer_u64, format_bytes_input},
 };
 
 impl ClipSyncApp {
@@ -116,42 +116,54 @@ impl ClipSyncApp {
                         preview.map_or(ImagePreviewState::Unavailable, ImagePreviewState::Ready),
                     );
                 }
-                UiEvent::Peers(result) => match result {
-                    Ok(peers) => {
-                        self.peers = Some(peers);
-                        self.peers_error = None;
-                    }
-                    Err(error) => self.peers_error = Some(error),
-                },
-                UiEvent::Config(result) => match result {
-                    Ok(config) => match serde_json::from_slice(&config.redacted_json) {
-                        Ok(config) => {
-                            if self.mesh_quota_input.is_empty() {
-                                self.mesh_quota_input =
-                                    config_pointer_u64(&config, "/shared/mesh_quota_bytes")
-                                        .map_or_else(String::new, |value| value.to_string());
-                            }
-                            if self.capture_threshold_input.is_empty() {
-                                self.capture_threshold_input =
-                                    config_pointer_u64(&config, "/shared/capture_threshold_bytes")
-                                        .map_or_else(String::new, |value| value.to_string());
-                            }
-                            self.config = Some(config);
-                            self.config_error = None;
+                UiEvent::Peers(result) => {
+                    self.peers_refresh_pending = false;
+                    match result {
+                        Ok(peers) => {
+                            self.peers = Some(peers);
+                            self.peers_error = None;
                         }
-                        Err(error) => {
-                            self.config_error = Some(format!("invalid config response: {error}"));
-                        }
-                    },
-                    Err(error) => self.config_error = Some(error),
-                },
-                UiEvent::Diagnostics(result) => match result {
-                    Ok(diagnostics) => {
-                        self.diagnostics = diagnostics.checks;
-                        self.diagnostics_error = None;
+                        Err(error) => self.peers_error = Some(error),
                     }
-                    Err(error) => self.diagnostics_error = Some(error),
-                },
+                }
+                UiEvent::Config(result) => {
+                    self.config_refresh_pending = false;
+                    match result {
+                        Ok(config) => match serde_json::from_slice(&config.redacted_json) {
+                            Ok(config) => {
+                                if self.mesh_quota_input.is_empty() {
+                                    self.mesh_quota_input =
+                                        config_pointer_u64(&config, "/shared/mesh_quota_bytes")
+                                            .map_or_else(String::new, format_bytes_input);
+                                }
+                                if self.capture_threshold_input.is_empty() {
+                                    self.capture_threshold_input = config_pointer_u64(
+                                        &config,
+                                        "/shared/capture_threshold_bytes",
+                                    )
+                                    .map_or_else(String::new, |value| value.to_string());
+                                }
+                                self.config = Some(config);
+                                self.config_error = None;
+                            }
+                            Err(error) => {
+                                self.config_error =
+                                    Some(format!("invalid config response: {error}"));
+                            }
+                        },
+                        Err(error) => self.config_error = Some(error),
+                    }
+                }
+                UiEvent::Diagnostics(result) => {
+                    self.diagnostics_refresh_pending = false;
+                    match result {
+                        Ok(diagnostics) => {
+                            self.diagnostics = diagnostics.checks;
+                            self.diagnostics_error = None;
+                        }
+                        Err(error) => self.diagnostics_error = Some(error),
+                    }
+                }
                 UiEvent::Transfers(result) => {
                     self.transfer_refresh_pending = false;
                     self.last_transfer_refresh = Instant::now();

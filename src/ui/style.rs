@@ -2,8 +2,6 @@ use std::{path::Path, time::Duration};
 
 use eframe::egui::{self, Color32, CornerRadius, Frame, Margin, RichText, Stroke, Vec2};
 
-use crate::ipc::protocol::PeerItem;
-
 pub(super) const BACKGROUND: Color32 = Color32::from_rgb(12, 17, 20);
 pub(super) const SURFACE: Color32 = Color32::from_rgb(20, 28, 32);
 pub(super) const BORDER: Color32 = Color32::from_rgb(44, 63, 70);
@@ -119,28 +117,6 @@ pub(super) fn message_panel(ui: &mut egui::Ui, message: &str, color: Color32) {
         });
 }
 
-pub(super) fn peer_row(ui: &mut egui::Ui, peer: &PeerItem) {
-    Frame::new()
-        .fill(SURFACE)
-        .stroke(Stroke::new(1.0, BORDER))
-        .corner_radius(CornerRadius::same(7))
-        .inner_margin(Margin::same(12))
-        .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.colored_label(if peer.connected { SUCCESS } else { MUTED }, "●");
-                ui.strong(&peer.hostname);
-                ui.label(RichText::new(&peer.address).color(MUTED).monospace());
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(if peer.connected {
-                        "connected"
-                    } else {
-                        "offline"
-                    });
-                });
-            });
-        });
-}
-
 pub(super) fn setting_row(ui: &mut egui::Ui, name: &str, value: String) {
     Frame::new()
         .fill(SURFACE)
@@ -201,6 +177,77 @@ pub(super) fn config_seconds(config: &serde_json::Value, pointer: &str) -> Strin
         || "unavailable".to_owned(),
         |value| format!("{value} seconds"),
     )
+}
+
+pub(super) fn management_grid_columns(width: f32) -> usize {
+    if width >= NARROW_NAVIGATION_THRESHOLD {
+        2
+    } else {
+        1
+    }
+}
+
+pub(super) fn parse_byte_size(input: &str) -> Option<u64> {
+    let input = input.trim();
+    let split_at = input
+        .find(|character: char| !character.is_ascii_digit() && character != '.')
+        .unwrap_or(input.len());
+    let number = &input[..split_at];
+    let suffix = input[split_at..].trim().to_ascii_lowercase();
+    let multiplier = match suffix.as_str() {
+        "" | "b" => 1_u64,
+        "kb" => 1_000,
+        "kib" => 1_024,
+        "mb" => 1_000_000,
+        "mib" => 1_048_576,
+        "gb" => 1_000_000_000,
+        "gib" => 1_073_741_824,
+        _ => return None,
+    };
+    let decimal = number.split_once('.');
+    let (whole, fraction) = decimal.map_or((number, ""), |parts| parts);
+    if whole.is_empty()
+        || decimal.is_some_and(|(_, fraction)| fraction.is_empty())
+        || (multiplier == 1 && decimal.is_some())
+        || !whole.bytes().all(|byte| byte.is_ascii_digit())
+        || !fraction.bytes().all(|byte| byte.is_ascii_digit())
+        || fraction.len() > 6
+    {
+        return None;
+    }
+    let whole = whole.parse::<u64>().ok()?.checked_mul(multiplier)?;
+    if fraction.is_empty() {
+        return Some(whole);
+    }
+    let scale = 10_u64.checked_pow(u32::try_from(fraction.len()).ok()?)?;
+    let fractional_bytes = fraction.parse::<u64>().ok()?.checked_mul(multiplier)?;
+    if !fractional_bytes.is_multiple_of(scale) {
+        return None;
+    }
+    whole.checked_add(fractional_bytes / scale)
+}
+
+pub(super) fn format_bytes_input(bytes: u64) -> String {
+    const UNITS: [(u64, &str); 3] = [
+        (1024 * 1024 * 1024, "GiB"),
+        (1024 * 1024, "MiB"),
+        (1024, "KiB"),
+    ];
+    for (unit, suffix) in UNITS {
+        if bytes >= unit && bytes.is_multiple_of(unit) {
+            return format!("{} {suffix}", bytes / unit);
+        }
+    }
+    format!("{bytes} B")
+}
+
+pub(super) fn format_bytes_exact(bytes: u64) -> String {
+    let readable = format_bytes(bytes);
+    if parse_byte_size(&readable) == Some(bytes) {
+        readable
+    } else {
+        format!("{readable} ({bytes} B exact)")
+    }
 }
 
 pub(super) fn format_bytes(bytes: u64) -> String {

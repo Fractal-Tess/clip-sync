@@ -230,6 +230,8 @@ pub struct HistoryItem {
     pub physical_millis: u64,
     #[prost(string, tag = "8")]
     pub source_device: String,
+    #[prost(uint64, optional, tag = "9")]
+    pub origin_millis: Option<u64>,
 }
 
 #[derive(Clone, PartialEq, Eq, Message)]
@@ -308,6 +310,20 @@ pub struct PeerItem {
     pub address: String,
     #[prost(bool, tag = "3")]
     pub connected: bool,
+    #[prost(message, optional, tag = "4")]
+    pub stats: Option<PeerStats>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Message)]
+pub struct PeerStats {
+    #[prost(uint64, tag = "1")]
+    pub shared_items: u64,
+    #[prost(uint64, tag = "2")]
+    pub shared_bytes: u64,
+    #[prost(uint64, tag = "3")]
+    pub pinned_items: u64,
+    #[prost(uint64, optional, tag = "4")]
+    pub last_shared_millis: Option<u64>,
 }
 
 #[derive(Clone, PartialEq, Message)]

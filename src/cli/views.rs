@@ -38,6 +38,7 @@ pub(super) fn history_item_json(item: &crate::ipc::protocol::HistoryItem) -> ser
         "source_device": item.source_device,
         "pinned": item.pinned,
         "physical_millis": item.physical_millis,
+        "origin_millis": item.origin_millis,
     })
 }
 
@@ -54,6 +55,20 @@ pub(super) fn share_json(
         "transfer_id": &result.transfer_id,
         "content_id": &result.content_id,
         "message": &result.message,
+    })
+}
+
+pub(super) fn peer_json(peer: &crate::ipc::protocol::PeerItem) -> serde_json::Value {
+    serde_json::json!({
+        "hostname": peer.hostname,
+        "address": peer.address,
+        "connected": peer.connected,
+        "stats": peer.stats.map(|stats| serde_json::json!({
+            "shared_items": stats.shared_items,
+            "shared_bytes": stats.shared_bytes,
+            "pinned_items": stats.pinned_items,
+            "last_shared_millis": stats.last_shared_millis,
+        })),
     })
 }
 

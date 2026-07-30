@@ -10,15 +10,23 @@ use std::{
 };
 
 use super::{
-    Presentation, global_shortcut::*, history::*, ipc_types::*, ipc_worker::*,
-    signal_closes_presentation, singleton::*, style::*, window::*,
+    Presentation,
+    app::{diagnostic_card, peer_card, peer_card_header},
+    global_shortcut::*,
+    history::*,
+    ipc_types::*,
+    ipc_worker::*,
+    signal_closes_presentation,
+    singleton::*,
+    style::*,
+    window::*,
 };
 use crate::{
     config::AppPaths,
     ipc::protocol::{
-        HistoryItem, HistoryRequest, HistoryResponse, IPC_PROTOCOL_VERSION, MutationResponse,
-        Request, Response, ShareClipboardRequest, ShareClipboardResponse, StatusResponse, request,
-        response,
+        DiagnosticCheck, HistoryItem, HistoryRequest, HistoryResponse, IPC_PROTOCOL_VERSION,
+        MutationResponse, PeerItem, PeerStats, Request, Response, ShareClipboardRequest,
+        ShareClipboardResponse, StatusResponse, request, response,
     },
 };
 use eframe::egui::{self, Frame, Key, Margin, Vec2};
@@ -37,6 +45,7 @@ fn history_item(content_id: &str) -> HistoryItem {
         pinned: false,
         source_device: "vd".to_owned(),
         physical_millis: 0,
+        origin_millis: Some(0),
     }
 }
 
@@ -69,6 +78,7 @@ mod global_shortcut;
 mod history_model;
 mod history_widgets;
 mod ipc;
+mod management;
 mod presentation;
 mod singleton;
 mod window;

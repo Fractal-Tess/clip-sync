@@ -401,6 +401,7 @@ mod tests {
             pinned,
             source_device: device.to_owned(),
             physical_millis: millis,
+            origin_millis: Some(millis),
         }
     }
 

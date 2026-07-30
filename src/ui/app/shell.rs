@@ -66,9 +66,6 @@ impl ClipSyncApp {
         });
         ui.add_space(6.0);
         let navigation = navigation_bar(ui, self.selected_tab);
-        if navigation.refresh {
-            self.retry_connection();
-        }
         if let Some(tab) = navigation.destination {
             self.navigate_to(tab);
         }
@@ -104,6 +101,7 @@ impl eframe::App for ClipSyncApp {
         }
         self.dispatch_pending_history_refresh(history_poll_eligible);
         self.dispatch_live_history_refresh(minimized);
+        self.dispatch_management_refresh(minimized);
         self.dispatch_transfer_refresh();
         self.shell(ui);
     }

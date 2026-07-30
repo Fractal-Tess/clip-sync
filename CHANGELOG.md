@@ -30,4 +30,5 @@ All notable changes will be documented here. The project is pre-alpha; storage, 
 
 ### Changed
 
+- Refined the unified management UI with a compact 30 px History search row, automatic refresh without a redundant global button, categorized responsive peer cards with retained-history statistics, human-readable mesh quota input, and a responsive diagnostics grid.
 - Split oversized UI, daemon, IPC, storage, mesh, clipboard, payload, CLI, model, envelope, transfer, and integration-test implementations into cohesive submodules, keeping files near 500 lines where the boundaries improve maintainability; production UI modules now use explicit imports and re-exports instead of a broad private glob prelude.

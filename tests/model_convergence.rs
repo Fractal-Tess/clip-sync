@@ -179,6 +179,47 @@ fn add_rejects_a_payload_with_a_different_content_id() {
 }
 
 #[test]
+fn content_origin_remains_the_add_author_after_remote_activation() {
+    let origin = node(1);
+    let activator = node(2);
+    let content = payload("text/plain", b"value");
+    let content_id = content.descriptor().content_id();
+    let mut projection = Projection::default();
+    projection
+        .apply(&stamp(
+            origin,
+            1,
+            10,
+            0,
+            Operation::Add {
+                content_id,
+                payload: content,
+            },
+        ))
+        .unwrap();
+    projection
+        .apply(&stamp(activator, 1, 20, 0, Operation::Touch { content_id }))
+        .unwrap();
+
+    assert_eq!(projection.origin_node_for_content(content_id), Some(origin));
+    assert_eq!(
+        projection
+            .origin_event_for_content(content_id)
+            .expect("origin event")
+            .timestamp()
+            .physical_millis(),
+        10
+    );
+    assert_eq!(
+        projection.visible_items()[0]
+            .last_activity()
+            .operation_id()
+            .node(),
+        activator
+    );
+}
+
+#[test]
 fn old_add_cannot_resurrect_but_new_activity_can() {
     let origin = node(1);
     let peer = node(2);

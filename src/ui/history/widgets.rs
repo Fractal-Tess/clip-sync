@@ -59,7 +59,6 @@ impl ControlTab {
 
 pub(in crate::ui) struct NavigationBarResponse {
     pub(in crate::ui) destination: Option<ControlTab>,
-    pub(in crate::ui) refresh: bool,
     #[cfg_attr(not(test), allow(dead_code))]
     pub(in crate::ui) control_rects: Vec<egui::Rect>,
 }
@@ -70,7 +69,6 @@ pub(in crate::ui) fn navigation_bar(
 ) -> NavigationBarResponse {
     let compact = ui.available_width() < NARROW_NAVIGATION_THRESHOLD;
     let mut destination = None;
-    let mut refresh = false;
     let mut control_rects = Vec::new();
     ui.horizontal(|ui| {
         if compact {
@@ -96,15 +94,9 @@ pub(in crate::ui) fn navigation_bar(
                 }
             });
         }
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let response = ui.small_button("Refresh");
-            control_rects.push(response.rect);
-            refresh = response.clicked();
-        });
     });
     NavigationBarResponse {
         destination,
-        refresh,
         control_rects,
     }
 }
@@ -194,7 +186,7 @@ pub(in crate::ui) fn history_search_row(
     ui.horizontal(|ui| {
         search_response = Some(
             ui.add_sized(
-                [search_width, 38.0],
+                [search_width, 30.0],
                 egui::TextEdit::singleline(search_text)
                     .hint_text("Search · d:device, t:type, p:true")
                     .font(FontId::proportional(15.0)),
@@ -203,14 +195,14 @@ pub(in crate::ui) fn history_search_row(
         if management {
             share_response = Some(
                 ui.add_enabled_ui(share_disabled_reason.is_none(), |ui| {
-                    ui.add_sized([share_width, 38.0], egui::Button::new("Share clipboard"))
+                    ui.add_sized([share_width, 30.0], egui::Button::new("Share clipboard"))
                 })
                 .inner
                 .on_disabled_hover_text(share_disabled_reason.unwrap_or_default()),
             );
         }
         help_response = Some(
-            ui.add_sized([help_width, 38.0], egui::Button::new("Filter help"))
+            ui.add_sized([help_width, 30.0], egui::Button::new("Filter help"))
                 .on_hover_text(history_filter_help()),
         );
     });

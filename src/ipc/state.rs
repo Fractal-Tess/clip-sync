@@ -27,9 +27,18 @@ pub(super) struct DaemonStateInner {
     pub(super) clipboard_status: RwLock<DiagnosticStatus>,
     pub(super) mesh: RwLock<Option<MeshHandle>>,
     pub(super) history: RwLock<HistorySearchIndex>,
+    pub(super) peer_history_stats: RwLock<BTreeMap<String, PeerHistoryStats>>,
     pub(super) device_names: RwLock<BTreeMap<String, String>>,
     pub(super) devices: RwLock<Vec<DeviceItem>>,
     pub(super) commands: mpsc::UnboundedSender<DaemonCommand>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct PeerHistoryStats {
+    pub(super) shared_items: u64,
+    pub(super) shared_bytes: u64,
+    pub(super) pinned_items: u64,
+    pub(super) last_shared_millis: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -100,6 +109,7 @@ impl DaemonState {
                 }),
                 mesh: RwLock::new(None),
                 history: RwLock::new(HistorySearchIndex::default()),
+                peer_history_stats: RwLock::new(BTreeMap::new()),
                 device_names: RwLock::new(BTreeMap::new()),
                 devices: RwLock::new(Vec::new()),
                 commands,
@@ -136,8 +146,22 @@ impl DaemonState {
             }
         }
         drop(device_names);
+        let mut stats = BTreeMap::<String, PeerHistoryStats>::new();
+        for item in &history {
+            let entry = stats.entry(item.source_node.clone()).or_default();
+            entry.shared_items = entry.shared_items.saturating_add(1);
+            entry.shared_bytes = entry.shared_bytes.saturating_add(item.logical_size);
+            entry.pinned_items = entry.pinned_items.saturating_add(u64::from(item.pinned));
+            let origin_millis = item.origin_millis.unwrap_or(item.physical_millis);
+            entry.last_shared_millis = Some(
+                entry
+                    .last_shared_millis
+                    .map_or(origin_millis, |current| current.max(origin_millis)),
+            );
+        }
         let index = HistorySearchIndex::new(history);
         *self.inner.history.write().await = index;
+        *self.inner.peer_history_stats.write().await = stats;
     }
 
     pub async fn set_device_names(&self, device_names: BTreeMap<String, String>) {

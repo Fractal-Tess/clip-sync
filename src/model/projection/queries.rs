@@ -4,7 +4,8 @@ use crate::{
 };
 
 use super::super::{
-    ContentId, EffectiveSharedSettings, NodeId, Payload, SeenOps, SettingValue, SharedSetting,
+    ContentId, EffectiveSharedSettings, EventKey, NodeId, Payload, SeenOps, SettingValue,
+    SharedSetting,
 };
 use super::{ContentState, ContentView, Projection, QuotaPlan, TransferView, transfer_view};
 
@@ -115,6 +116,27 @@ impl Projection {
             })
             .max_by_key(|(activity, id, _, _)| (*activity, *id))
             .map(|(_, id, manifest_id, manifest)| (id, manifest_id, manifest))
+    }
+
+    /// Originating event for a retained content item.
+    #[must_use]
+    pub fn origin_event_for_content(&self, content_id: ContentId) -> Option<EventKey> {
+        if let Some(payload) = self.content.get(&content_id)?.payload.as_ref() {
+            return Some(payload.event);
+        }
+        let (transfer_id, _, _) = self.manifest_for_content(content_id)?;
+        self.transfers
+            .get(&transfer_id)?
+            .begin
+            .as_ref()
+            .map(|begin| begin.event)
+    }
+
+    /// Originating device for a retained content item.
+    #[must_use]
+    pub fn origin_node_for_content(&self, content_id: ContentId) -> Option<NodeId> {
+        self.origin_event_for_content(content_id)
+            .map(|event| event.operation_id().node())
     }
 
     #[must_use]

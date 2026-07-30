@@ -241,6 +241,7 @@ fn raster_mime_types_request_image_previews() {
         pinned: false,
         source_device: "vd".to_owned(),
         physical_millis: 0,
+        origin_millis: Some(0),
     };
     assert!(history_item_has_image(&item));
     item.mime_types = vec!["image/svg+xml".to_owned()];

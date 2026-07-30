@@ -6,7 +6,7 @@ use crate::{
 use super::{
     commands::{DeviceCommand, OutputArgs},
     support::{daemon_request, daemon_response_error, mutation_response, unexpected_response},
-    views::print_json,
+    views::{peer_json, print_json},
 };
 
 pub(super) async fn peers(paths: &AppPaths, output: OutputArgs) -> anyhow::Result<()> {
@@ -14,17 +14,7 @@ pub(super) async fn peers(paths: &AppPaths, output: OutputArgs) -> anyhow::Resul
         daemon_request(paths, 2, request::Body::Peers(PeersRequest {}), output.json).await?;
     match response.body {
         Some(response::Body::Peers(peers)) if output.json => {
-            let peer_items = peers
-                .peers
-                .into_iter()
-                .map(|peer| {
-                    serde_json::json!({
-                        "hostname": peer.hostname,
-                        "address": peer.address,
-                        "connected": peer.connected,
-                    })
-                })
-                .collect::<Vec<_>>();
+            let peer_items = peers.peers.iter().map(peer_json).collect::<Vec<_>>();
             print_json(&serde_json::json!({
                 "local_hostname": peers.local_hostname,
                 "local_address": peers.local_address,
@@ -58,7 +48,21 @@ pub(super) async fn peers(paths: &AppPaths, output: OutputArgs) -> anyhow::Resul
                 } else {
                     "offline"
                 };
-                println!("{}  {}  {status}", peer.hostname, peer.address);
+                if let Some(stats) = peer.stats {
+                    println!(
+                        "{}  {}  {status}  {} items  {} bytes  {} pinned",
+                        peer.hostname,
+                        peer.address,
+                        stats.shared_items,
+                        stats.shared_bytes,
+                        stats.pinned_items
+                    );
+                } else {
+                    println!(
+                        "{}  {}  {status}  stats unavailable",
+                        peer.hostname, peer.address
+                    );
+                }
             }
             if !peers.devices.is_empty() {
                 println!("mesh devices:");

@@ -8,8 +8,8 @@ pub(super) use model::{
     history_filter_help, history_item_has_image, history_poll_allowed, history_poll_cadence,
     history_refresh_delay, history_refresh_on_focus_regain, history_shortcuts_allowed,
     history_visible_grid_rows, pending_history_refresh_due, presentation_switcher_key,
-    preserve_history_selection, replace_history_snapshot, should_defer_history_refresh,
-    should_dispatch_coalesced_history, switcher_key,
+    preserve_history_selection, relative_history_time, replace_history_snapshot,
+    should_defer_history_refresh, should_dispatch_coalesced_history, switcher_key,
 };
 #[cfg(test)]
 pub(super) use model::{

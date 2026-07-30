@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use serde::Serialize;
 
 use crate::{
@@ -10,11 +12,44 @@ use crate::{
 use super::{
     protocol::{
         ConfigResponse, DiagnosticCheck, DiagnosticsResponse, ErrorResponse, HistoryRequest,
-        HistoryResponse, IPC_PROTOCOL_VERSION, PeerItem, PeersResponse, Response, StatusResponse,
-        response,
+        HistoryResponse, IPC_PROTOCOL_VERSION, PeerItem, PeerStats, PeersResponse, Response,
+        StatusResponse, response,
     },
-    state::DaemonState,
+    state::{DaemonState, PeerHistoryStats},
 };
+
+fn authenticated_peer_stats(
+    discovered_hostname: &str,
+    allow_short_match: bool,
+    device_names: &BTreeMap<String, String>,
+    history_stats: &BTreeMap<String, PeerHistoryStats>,
+) -> Option<PeerStats> {
+    let discovered = discovered_hostname
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    let discovered_short = discovered.split('.').next().unwrap_or(&discovered);
+    let mut matches = device_names.iter().filter(|(_, authenticated_hostname)| {
+        let authenticated = authenticated_hostname
+            .trim_end_matches('.')
+            .to_ascii_lowercase();
+        authenticated == discovered
+            || (allow_short_match
+                && !authenticated.contains('.')
+                && discovered.contains('.')
+                && authenticated == discovered_short)
+    });
+    let (node_id, _) = matches.next()?;
+    if matches.next().is_some() {
+        return None;
+    }
+    let stats = history_stats.get(node_id).copied().unwrap_or_default();
+    Some(PeerStats {
+        shared_items: stats.shared_items,
+        shared_bytes: stats.shared_bytes,
+        pinned_items: stats.pinned_items,
+        last_shared_millis: stats.last_shared_millis,
+    })
+}
 
 impl DaemonState {
     pub(super) async fn status_response(&self) -> response::Body {
@@ -107,14 +142,32 @@ impl DaemonState {
     pub(super) async fn peers_response(&self) -> response::Body {
         let discovery = self.inner.discovery.read().await;
         let discovery_error = self.inner.discovery_error.read().await.clone();
+        let history_stats = self.inner.peer_history_stats.read().await;
+        let device_names = self.inner.device_names.read().await;
         let peers = discovery.as_ref().map_or_else(Vec::new, |snapshot| {
+            let mut short_name_counts = BTreeMap::<String, usize>::new();
+            for peer in &snapshot.peers {
+                let hostname = peer.hostname.trim_end_matches('.').to_ascii_lowercase();
+                let short = hostname.split('.').next().unwrap_or(&hostname).to_owned();
+                *short_name_counts.entry(short).or_default() += 1;
+            }
             snapshot
                 .peers
                 .iter()
-                .map(|peer| PeerItem {
-                    hostname: peer.hostname.clone(),
-                    address: peer.address.to_string(),
-                    connected: peer.connected,
+                .map(|peer| {
+                    let hostname = peer.hostname.trim_end_matches('.').to_ascii_lowercase();
+                    let short = hostname.split('.').next().unwrap_or(&hostname);
+                    PeerItem {
+                        hostname: peer.hostname.clone(),
+                        address: peer.address.to_string(),
+                        connected: peer.connected,
+                        stats: authenticated_peer_stats(
+                            &peer.hostname,
+                            short_name_counts.get(short) == Some(&1),
+                            &device_names,
+                            &history_stats,
+                        ),
+                    }
                 })
                 .collect()
         });

@@ -3,17 +3,33 @@ use std::{
     time::{Duration, Instant},
 };
 
+use prost::Message;
 use tokio::sync::mpsc;
 
 use crate::{
     config::Config,
+    discovery::{DiscoveredPeer, DiscoverySnapshot},
     ipc::{
         DaemonState,
         protocol::{
-            self, HistoryItem, HistoryRequest, IPC_PROTOCOL_VERSION, Request, request, response,
+            self, HistoryItem, HistoryRequest, IPC_PROTOCOL_VERSION, PeersRequest, Request,
+            request, response,
         },
     },
 };
+
+#[test]
+fn legacy_v5_peer_items_decode_with_unavailable_stats() {
+    let mut legacy = Vec::new();
+    legacy.extend([0x0a, 0x04]);
+    legacy.extend(b"kiwi");
+    legacy.extend([0x12, 0x0a]);
+    legacy.extend(b"100.64.0.2");
+    legacy.extend([0x18, 0x01]);
+    let peer = protocol::PeerItem::decode(legacy.as_slice()).expect("legacy peer item");
+    assert!(peer.connected);
+    assert!(peer.stats.is_none());
+}
 
 #[tokio::test]
 async fn history_search_is_bounded_and_case_insensitive() {
@@ -36,6 +52,7 @@ async fn history_search_is_bounded_and_case_insensitive() {
                 source_device: "kiwi".to_owned(),
                 pinned: false,
                 physical_millis: 2,
+                origin_millis: Some(2),
             },
             HistoryItem {
                 content_id: "beta".to_owned(),
@@ -46,6 +63,7 @@ async fn history_search_is_bounded_and_case_insensitive() {
                 source_device: "vd".to_owned(),
                 pinned: false,
                 physical_millis: 1,
+                origin_millis: Some(1),
             },
         ])
         .await;
@@ -65,6 +83,186 @@ async fn history_search_is_bounded_and_case_insensitive() {
     };
     assert_eq!(history.items.len(), 1);
     assert_eq!(history.items[0].content_id, "alpha");
+}
+
+#[tokio::test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one fixture verifies valid, mismatched, and ambiguous authenticated identities"
+)]
+async fn peer_history_stats_use_authenticated_device_names() {
+    let temporary = tempfile::tempdir().expect("temporary directory");
+    let (commands, _command_rx) = mpsc::unbounded_channel();
+    let state = DaemonState::new(
+        "test-node".to_owned(),
+        temporary.path().join("config.toml"),
+        Config::default(),
+        commands,
+    );
+    state
+        .set_device_names(BTreeMap::from([("node-id".to_owned(), "Kiwi".to_owned())]))
+        .await;
+    state
+        .set_history(vec![
+            HistoryItem {
+                content_id: "one".to_owned(),
+                preview: "first".to_owned(),
+                mime_types: vec!["text/plain".to_owned()],
+                logical_size: 1_024,
+                source_node: "node-id".to_owned(),
+                source_device: String::new(),
+                pinned: true,
+                physical_millis: 10,
+                origin_millis: Some(5),
+            },
+            HistoryItem {
+                content_id: "two".to_owned(),
+                preview: "second".to_owned(),
+                mime_types: vec!["text/plain".to_owned()],
+                logical_size: 2_048,
+                source_node: "node-id".to_owned(),
+                source_device: String::new(),
+                pinned: false,
+                physical_millis: 20,
+                origin_millis: Some(8),
+            },
+        ])
+        .await;
+
+    state
+        .set_discovery(DiscoverySnapshot {
+            local_address: "100.64.0.1".parse().expect("local IP"),
+            local_hostname: "vd.netbird.cloud".to_owned(),
+            peers: vec![DiscoveredPeer {
+                hostname: "kiwi.netbird.cloud".to_owned(),
+                address: "100.64.0.2".parse().expect("peer IP"),
+                connected: true,
+            }],
+        })
+        .await;
+    let response = state
+        .handle(Request {
+            protocol_version: IPC_PROTOCOL_VERSION,
+            request_id: 81,
+            body: Some(request::Body::Peers(PeersRequest {})),
+        })
+        .await;
+    let Some(response::Body::Peers(peers)) = response.body else {
+        panic!("expected peers response");
+    };
+    assert_eq!(peers.peers.len(), 1);
+    let peer_counts = peers.peers[0].stats.expect("authenticated peer stats");
+    assert_eq!(peer_counts.shared_items, 2);
+    assert_eq!(peer_counts.shared_bytes, 3_072);
+    assert_eq!(peer_counts.pinned_items, 1);
+    assert_eq!(peer_counts.last_shared_millis, Some(8));
+
+    state
+        .set_device_names(BTreeMap::from([(
+            "other-node".to_owned(),
+            "kiwi.office".to_owned(),
+        )]))
+        .await;
+    let response = state
+        .handle(Request {
+            protocol_version: IPC_PROTOCOL_VERSION,
+            request_id: 82,
+            body: Some(request::Body::Peers(PeersRequest {})),
+        })
+        .await;
+    let Some(response::Body::Peers(peers)) = response.body else {
+        panic!("expected peers response");
+    };
+    assert!(
+        peers.peers[0].stats.is_none(),
+        "a different FQDN with the same short name must not receive stats"
+    );
+
+    state
+        .set_device_names(BTreeMap::from([
+            ("node-id".to_owned(), "Kiwi".to_owned()),
+            ("other-node".to_owned(), "KIWI".to_owned()),
+        ]))
+        .await;
+    let response = state
+        .handle(Request {
+            protocol_version: IPC_PROTOCOL_VERSION,
+            request_id: 83,
+            body: Some(request::Body::Peers(PeersRequest {})),
+        })
+        .await;
+    let Some(response::Body::Peers(peers)) = response.body else {
+        panic!("expected peers response");
+    };
+    assert!(
+        peers.peers[0].stats.is_none(),
+        "ambiguous authenticated names must not receive stats"
+    );
+
+    state
+        .set_device_names(BTreeMap::from([("node-id".to_owned(), "Kiwi".to_owned())]))
+        .await;
+    state
+        .set_discovery(DiscoverySnapshot {
+            local_address: "100.64.0.1".parse().expect("local IP"),
+            local_hostname: "vd.netbird.cloud".to_owned(),
+            peers: vec![
+                DiscoveredPeer {
+                    hostname: "kiwi.netbird.cloud".to_owned(),
+                    address: "100.64.0.2".parse().expect("peer IP"),
+                    connected: true,
+                },
+                DiscoveredPeer {
+                    hostname: "kiwi.office".to_owned(),
+                    address: "100.64.0.3".parse().expect("peer IP"),
+                    connected: false,
+                },
+            ],
+        })
+        .await;
+    let response = state
+        .handle(Request {
+            protocol_version: IPC_PROTOCOL_VERSION,
+            request_id: 84,
+            body: Some(request::Body::Peers(PeersRequest {})),
+        })
+        .await;
+    let Some(response::Body::Peers(peers)) = response.body else {
+        panic!("expected peers response");
+    };
+    assert!(
+        peers.peers.iter().all(|peer| peer.stats.is_none()),
+        "a short authenticated name must not match multiple discovered peers"
+    );
+
+    state
+        .set_device_names(BTreeMap::from([(
+            "empty-node".to_owned(),
+            "empty".to_owned(),
+        )]))
+        .await;
+    state
+        .set_discovery(DiscoverySnapshot {
+            local_address: "100.64.0.1".parse().expect("local IP"),
+            local_hostname: "vd.netbird.cloud".to_owned(),
+            peers: vec![DiscoveredPeer {
+                hostname: "empty.netbird.cloud".to_owned(),
+                address: "100.64.0.4".parse().expect("peer IP"),
+                connected: true,
+            }],
+        })
+        .await;
+    let response = state
+        .handle(Request {
+            protocol_version: IPC_PROTOCOL_VERSION,
+            request_id: 85,
+            body: Some(request::Body::Peers(PeersRequest {})),
+        })
+        .await;
+    let Some(response::Body::Peers(peers)) = response.body else {
+        panic!("expected peers response");
+    };
+    assert_eq!(peers.peers[0].stats, Some(protocol::PeerStats::default()));
 }
 
 #[tokio::test]
@@ -90,6 +288,7 @@ async fn history_search_uses_authenticated_device_name_aliases() {
             source_device: String::new(),
             pinned: true,
             physical_millis: 1,
+            origin_millis: Some(1),
         }])
         .await;
 
@@ -131,6 +330,7 @@ async fn history_search_applies_typed_filters_in_newest_first_order() {
                 source_device: "Office Laptop".to_owned(),
                 pinned: true,
                 physical_millis: 1_704_067_199_000,
+                origin_millis: Some(1_704_067_199_000),
             },
             HistoryItem {
                 content_id: "new".to_owned(),
@@ -141,6 +341,7 @@ async fn history_search_applies_typed_filters_in_newest_first_order() {
                 source_device: "Office Laptop".to_owned(),
                 pinned: true,
                 physical_millis: 1_704_067_199_500,
+                origin_millis: Some(1_704_067_199_500),
             },
             HistoryItem {
                 content_id: "wrong-device".to_owned(),
@@ -151,6 +352,7 @@ async fn history_search_applies_typed_filters_in_newest_first_order() {
                 source_device: "Phone".to_owned(),
                 pinned: true,
                 physical_millis: 1_704_067_199_900,
+                origin_millis: Some(1_704_067_199_900),
             },
         ])
         .await;
@@ -234,6 +436,7 @@ async fn large_history_search_stays_responsive_and_bounded() {
             source_device: format!("host-{}", index % 8),
             pinned: index % 10 == 0,
             physical_millis: index,
+            origin_millis: Some(index),
         })
         .collect();
     state.set_history(items).await;

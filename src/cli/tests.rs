@@ -2,7 +2,7 @@ use clap::Parser;
 
 use super::{
     Cli,
-    views::{StatusOutput, error_json, history_item_json, share_json, transfer_json},
+    views::{StatusOutput, error_json, history_item_json, peer_json, share_json, transfer_json},
 };
 
 #[cfg(feature = "ui")]
@@ -85,6 +85,7 @@ fn history_json_fields_are_stable() {
             source_device: "device".to_owned(),
             pinned: true,
             physical_millis: 1_704_067_200_000,
+            origin_millis: Some(1_704_067_200_000),
         }),
         serde_json::json!({
             "content_id": "content",
@@ -95,6 +96,7 @@ fn history_json_fields_are_stable() {
             "source_device": "device",
             "pinned": true,
             "physical_millis": 1_704_067_200_000_u64,
+            "origin_millis": 1_704_067_200_000_u64,
         })
     );
 }
@@ -122,6 +124,35 @@ fn status_json_fields_are_stable() {
             "discovered_peers": 2,
         })
     );
+}
+
+#[test]
+fn peer_json_stats_are_additive_and_explicitly_unavailable() {
+    use crate::ipc::protocol::{PeerItem, PeerStats};
+
+    let mut peer = PeerItem {
+        hostname: "kiwi.netbird.cloud".to_owned(),
+        address: "100.64.0.2".to_owned(),
+        connected: true,
+        stats: None,
+    };
+    assert_eq!(
+        peer_json(&peer),
+        serde_json::json!({
+            "hostname": "kiwi.netbird.cloud",
+            "address": "100.64.0.2",
+            "connected": true,
+            "stats": null,
+        })
+    );
+    peer.stats = Some(PeerStats {
+        shared_items: 12,
+        shared_bytes: 4_096,
+        pinned_items: 2,
+        last_shared_millis: Some(99),
+    });
+    assert_eq!(peer_json(&peer)["stats"]["shared_items"], 12);
+    assert_eq!(peer_json(&peer)["stats"]["last_shared_millis"], 99);
 }
 
 #[test]
