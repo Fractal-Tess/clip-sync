@@ -13,6 +13,9 @@ use tokio::sync::mpsc;
 
 use crate::config::AppPaths;
 
+const QUICK_UI_ROUTE: &str = "switcher";
+const MANAGEMENT_UI_ROUTE: &str = "control";
+
 struct TrayInstance {
     _lock: File,
 }
@@ -107,7 +110,7 @@ impl ksni::Tray for ClipSyncTray {
     }
 
     fn activate(&mut self, _x: i32, _y: i32) {
-        self.launcher.launch("switcher");
+        self.launcher.launch(QUICK_UI_ROUTE);
     }
 
     fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
@@ -116,13 +119,13 @@ impl ksni::Tray for ClipSyncTray {
         vec![
             StandardItem {
                 label: "History Switcher".to_owned(),
-                activate: Box::new(|tray: &mut Self| tray.launcher.launch("switcher")),
+                activate: Box::new(|tray: &mut Self| tray.launcher.launch(QUICK_UI_ROUTE)),
                 ..Default::default()
             }
             .into(),
             StandardItem {
                 label: "Control Center".to_owned(),
-                activate: Box::new(|tray: &mut Self| tray.launcher.launch("control")),
+                activate: Box::new(|tray: &mut Self| tray.launcher.launch(MANAGEMENT_UI_ROUTE)),
                 ..Default::default()
             }
             .into(),
@@ -194,6 +197,12 @@ pub async fn run(paths: AppPaths) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tray_routes_remain_cli_compatible() {
+        assert_eq!(QUICK_UI_ROUTE, "switcher");
+        assert_eq!(MANAGEMENT_UI_ROUTE, "control");
+    }
 
     #[test]
     fn tray_icons_are_bounded_argb_pixmaps() {

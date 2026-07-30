@@ -15,10 +15,10 @@ The first deployment targets the `vd` and `kiwi` NixOS hosts running Hyprland.
 1. Copy ordinary content on either machine.
 2. The local daemon captures it and adds it to the merged history.
 3. Online peers receive it; offline peers reconcile all retained history when they return.
-4. Press `SUPER+H` to open a compact egui switcher.
-5. Search or cycle with the keyboard and press Enter to set the selected item as the active clipboard.
-6. Open the full control center to manage history, transfers, peers, settings, and diagnostics.
-7. If the current clipboard exceeds the automatic-capture threshold, explicitly share it from the control center.
+4. Press `SUPER+H` to open Quick History in the compact unified egui shell.
+5. Search or cycle with the keyboard and press Enter to set the selected item as the active clipboard; quick activation closes the shell.
+6. Focus the same singleton in management presentation to use History, Transfers, Peers, Settings, and Diagnostics; management activation stays open.
+7. If the current clipboard exceeds the automatic-capture threshold, explicitly share it from management History.
 
 ### Agreed product decisions
 
@@ -60,7 +60,7 @@ The first deployment targets the `vd` and `kiwi` NixOS hosts running Hyprland.
 - Deduplication, activation, replicated deletion, pins, and quota eviction.
 - Chunked, cancellable, resumable large transfers.
 - Full CLI parity with machine-readable JSON.
-- Optional egui switcher and control center behind the Cargo `ui` feature.
+- One optional egui process/window/singleton behind the Cargo `ui` feature, with Quick History and management presentations.
 - Fast `vd` to `kiwi` smoke-test deployment without NixOS rebuilds.
 - Final NixOS/SOPS/Stow/systemd/Hyprland integration.
 
@@ -85,6 +85,7 @@ Use one Rust package containing a library and one `clip-sync` binary. Keep egui 
 clip-sync daemon
 clip-sync ui switcher       # requires `ui`
 clip-sync ui control        # requires `ui`
+clip-sync ui close-quick    # requires `ui`; signal-only, never starts a window
 clip-sync status --json
 clip-sync peers --json
 clip-sync history search ... --json
@@ -410,9 +411,11 @@ An explicit item larger than the 1 GiB quota is quota-exempt. Before starting, s
 
 ## 10. UI plan (`ui` Cargo feature)
 
-Use `eframe`/egui behind an optional `ui` feature. A daemon/CLI-only build must not compile or link graphics dependencies.
+Use `eframe`/egui behind an optional `ui` feature. A daemon/CLI-only build must not compile or link graphics dependencies. Quick History and management are presentations of one native process, owner-only singleton, compact shell, geometry resource, and canonical `clip-sync-switcher` app ID. `clip-sync ui switcher` requests Quick History; `clip-sync ui control` focuses the same window on History with management behavior.
 
-### Quick switcher
+The shell defaults to 720×480 with a 480×300 minimum and exposes History, Transfers, Peers, Settings, and Diagnostics routes. Its single geometry file migrates the former switcher geometry before the former control geometry. The header uses the 28 px logo and a 20 px `ClipSync` title.
+
+### Quick History
 
 Command:
 
@@ -429,22 +432,25 @@ Behavior:
 - newest merged entries shown first;
 - arrows/Page Up/Page Down move selection;
 - Enter activates and closes;
-- Escape closes;
+- focused Escape closes; an unfocused compositor binding dispatches `global, clip-sync:close-quick` to the UI's native `hyprland_global_shortcuts_v1` registration;
+- only anonymous pressed protocol events enter the existing UI signal channel, and management presentation ignores the global close signal;
+- retain `ui close-quick` only as a bounded same-user compatibility/debug signal, not as the declarative key binding;
 - do not close merely because focus changes;
-- `SUPER+H` focuses/toggles an existing switcher instead of opening duplicates.
+- `SUPER+H` focuses/toggles the unified singleton instead of opening duplicates;
+- generate the client binding from the vendored BSD-licensed protocol XML with optional `wayland-scanner` under `ui`, cleanly destroy protocol objects on exit, and degrade gracefully when Wayland/the protocol is unavailable;
+- never read `evdev`/`libinput` or implement global keylogging.
 
-Each compact row should show only useful scan information:
+The search input and inline filter-help tooltip occupy one row. Each compact card should show only useful scan information:
 
 - type icon or small preview;
-- one- or two-line text/filename preview;
-- source hostname;
-- relative time;
-- size;
-- pin and transfer-state indicators.
+- a wrapped text/filename preview capped at four lines;
+- an invariant fixed metadata region at the absolute card bottom containing MIME, size, PIN state, source hostname, and relative time;
+- accessible labels and full metadata tooltips;
+- a clear pin indicator; transfer progress remains in the Transfers route rather than crowding every history card.
 
 Support advanced query filters without making the default workflow look like a database console.
 
-### Full control center
+### Management presentation
 
 Command:
 
@@ -461,7 +467,9 @@ Sections:
 5. **Settings** — shared and local settings, validation, effective source, and live apply.
 6. **Diagnostics** — NetBird status, listener address, storage health, protocol versions, and copyable redacted diagnostics.
 
-All mutating actions go through daemon IPC and return explicit success/failure revisions.
+All mutating actions go through daemon IPC and return explicit success/failure revisions. Bounded UI IPC concurrency keeps read-only History/status requests responsive during a long confirmed Share. Share and other mutations are mutually gated at dispatch: no mutation is sent while Share is pending, and Share is not sent while any mutation is pending. Disabled controls expose the reason. Share inspection/confirmation carries a UI generation token so presentation changes and newer requests invalidate late responses without changing daemon transaction ordering or IPC v5.
+
+While History is open, the UI performs protocol-neutral bounded polling without changing daemon IPC v5: immediately on open/focus/route activation, every second while focused, and every five seconds while unfocused. Polling pauses on other routes and when minimization is detectable. There is at most one History request in flight plus one coalesced refresh; failures retain interactive stale cards, back off to a bounded maximum, and preserve selection by content ID through prepends, reorder, and deletion.
 
 ## 11. CLI and local IPC
 
@@ -477,7 +485,7 @@ Requirements:
 - an explicit flag when full clipboard content is requested;
 - `doctor` redacts sensitive fields by construction.
 
-Use a versioned request/response and subscription protocol over the Unix socket. The UI subscribes to history, transfer, peer, and setting changes rather than polling aggressively.
+Use a versioned request/response protocol over the Unix socket. IPC remains version 5. Transfer progress uses bounded route-specific refresh, and open History uses the bounded protocol-neutral cadence described above rather than an IPC protocol bump or aggressive polling.
 
 ## 12. Development milestones
 
@@ -657,7 +665,7 @@ Once smoke testing is stable:
 - Depend on NetBird opportunistically, but do not make local history unavailable when NetBird is down.
 - Use SOPS to materialize a user-readable, non-world-readable mesh-key file.
 - Add the Stow-managed `~/.config/clip-sync/config.toml`.
-- Add Hyprland floating rules for switcher/control-center app IDs.
+- Add one Hyprland floating rule for the canonical `clip-sync-switcher` window app ID and a non-consuming Escape binding using the compositor dispatcher `global, clip-sync:close-quick`.
 - Replace the current cliphist autostart and `SUPER+H` command.
 
 A system rebuild is only required for this final package/service/secret wiring, not the iterative application smoke-test loop.

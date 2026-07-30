@@ -36,15 +36,15 @@ SQLCipher stores metadata and operations; fixed-size XChaCha20-Poly1305 chunks s
 
 An authenticated `history.keyslot` wraps random database, chunk-store, and content-identity keys. `clip-sync rekey` uses an exclusive store lock, durable candidate keyslot, atomic replacement, reopen verification, and idempotent interrupted-rekey recovery. Rotation normally changes only the wrapped keyslot and mesh transport key.
 
-## Optional egui UI — validated live
+## Optional egui UI — historical validation
 
-The `ui` feature provides a keyboard-first switcher and full control center. Live Hyprland smoke tests observed:
+Before the unified-window release, the `ui` feature exposed separate keyboard-first switcher and Control Center windows. The original Milestone 0 Hyprland smoke tests observed:
 
 - `clip-sync-switcher`, floating and mapped at `720x420`;
 - `clip-sync-control`, floating and mapped at `1040x700`;
 - a second switcher invocation focused/signalled the singleton instead of opening a duplicate.
 
-The daemon-only build has no egui/windowing dependency path. Final rules and the `SUPER+H` cutover are documented in [deployment.md](deployment.md).
+These results are retained as the pre-unification record, not as current UI behavior. Current acceptance validates one `clip-sync-switcher` singleton and geometry, Quick/management intent switching, both tray routes, live History updates, and Quick-only native Hyprland global-shortcut signaling. The daemon-only build still has no egui/windowing dependency path. Current rules and the `SUPER+H` cutover are documented in [deployment.md](deployment.md).
 
 ## Remaining validation beyond Milestone 0
 

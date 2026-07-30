@@ -21,6 +21,7 @@
               ./Cargo.lock
               ./Cargo.toml
               ./assets
+              ./protocols
               ./src
               ./tests
             ];

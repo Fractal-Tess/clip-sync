@@ -23,7 +23,7 @@ Most clipboard sync tools assume a central service or immediately replace every 
 - **Offline reconciliation.** Peers catch up after reconnecting.
 - **Private-network first.** The initial transport targets trusted devices connected through NetBird.
 - **Encrypted persistence.** Clipboard payloads and searchable metadata are designed to remain encrypted at rest.
-- **Keyboard first.** The optional egui switcher provides fast search, grid navigation, pinning, and activation.
+- **Keyboard first.** The optional unified egui window provides fast History search, grid navigation, pinning, activation, and compact management routes.
 
 ## Initial target
 
@@ -37,6 +37,7 @@ The current pre-release implements the complete Linux daily-driver path; real-de
 clip-sync daemon
 clip-sync ui switcher
 clip-sync ui control
+clip-sync ui close-quick
 clip-sync ui tray
 clip-sync status --json
 clip-sync peers --json
@@ -52,7 +53,11 @@ clip-sync doctor --json
 clip-sync rekey --old-key-file OLD --new-key-file NEW
 ```
 
-The UI commands will only be available when built with the optional `ui` Cargo feature. The switcher uses arrow keys for grid navigation, `Enter` to activate the selected item, `Ctrl+P` to pin or unpin it, and `Esc` to close. Switcher and Control Center dimensions and positions are remembered independently; Hyprland positioning is restored through `hyprctl` because the Wayland protocol does not expose client-controlled placement. The singleton StatusNotifier tray opens the switcher on left click and exposes History Switcher, Control Center, and Quit Tray actions; quitting it does not stop synchronization.
+The UI commands are available when built with the optional `ui` Cargo feature. Both `ui switcher` and `ui control` address one native process, singleton, and `clip-sync-switcher` window: `switcher` opens keyboard-first Quick History while `control` focuses the same shell in management presentation. History uses arrow keys plus `Page Up`/`Page Down` for grid navigation, `Enter` to activate, and `Ctrl+P` to pin or unpin. Quick activation and focused `Esc` close the window; management activation stays open. One owner-only geometry file remembers the shared window; 720×480 is the default and 480×300 is the minimum, with existing switcher geometry migrated before the former control geometry. Hyprland positioning is restored through `hyprctl` because Wayland does not expose client-controlled placement. The singleton StatusNotifier tray preserves its History Switcher and Control Center routes; quitting the tray does not stop synchronization.
+
+Open History refreshes immediately and then polls the protocol-v5 daemon view at a bounded cadence (one second while focused and five seconds while unfocused), pausing on other routes or when minimization is detectable. Failed background refreshes retain the last interactive cards and use bounded backoff. History, status, and other read-only views remain concurrent and responsive during changes. UI mutations are gated around Share: another mutation cannot be dispatched while Share is pending, and Share cannot start while any mutation is pending; disabled controls explain the wait.
+
+For privacy-safe unfocused Quick History closing on Hyprland, add the non-consuming `global, clip-sync:close-quick` compositor binding documented in [the deployment guide](docs/deployment.md). The UI registers `clip-sync:close-quick` through the native `hyprland_global_shortcuts_v1` protocol and accepts only anonymous pressed events; Quick closes and management ignores them. Registration degrades gracefully outside compatible Wayland compositors and never reads `evdev`, `libinput`, or key values. Focused egui `Esc` remains available. `clip-sync ui close-quick` is retained only as a same-user compatibility/debug signal and is not the recommended binding.
 
 History search combines case-insensitive free text with typed filters. Commas
 and whitespace chain filters conjunctively, quoted phrases preserve separators,
@@ -97,7 +102,7 @@ Please report vulnerabilities according to [SECURITY.md](SECURITY.md).
 
 ## Development
 
-The current implementation includes native Wayland capture/ownership, SQLCipher operation history, envelope rekeying, authenticated NetBird-only QUIC sessions, store-and-forward anti-entropy, encrypted resumable chunks, safe file snapshots/materialization, replicated retention and settings, full CLI/IPC parity, and optional egui switcher/control-center modes. See [the deployment guide](docs/deployment.md), [Milestone 0 findings](docs/milestone-0.md), and [PLAN.md](PLAN.md) for validation details and remaining live soak work.
+The current implementation includes native Wayland capture/ownership, SQLCipher operation history, envelope rekeying, authenticated NetBird-only QUIC sessions, store-and-forward anti-entropy, encrypted resumable chunks, safe file snapshots/materialization, replicated retention and settings, full CLI/IPC parity, and an optional unified egui Quick History/management shell. See [the deployment guide](docs/deployment.md), [Milestone 0 findings](docs/milestone-0.md), and [PLAN.md](PLAN.md) for validation details and remaining live soak work.
 
 ```console
 nix develop

@@ -7,6 +7,8 @@ The flake exports `nixosModules.default` and two packages:
 - `packages.<system>.default` / `with-ui`: daemon, CLI, egui UI, and StatusNotifier tray;
 - `packages.<system>.daemon`: daemon and CLI without graphics dependencies.
 
+The UI package generates its Hyprland global-shortcut bindings from the vendored BSD-3-Clause protocol XML with the optional Rust `wayland-scanner` dependency. The daemon-only feature graph does not include that generator or egui/windowing crates.
+
 Add the flake input and module, then enable the user service:
 
 ```nix
@@ -22,7 +24,7 @@ Add the flake input and module, then enable the user service:
 }
 ```
 
-By default, each user service reads `%h/.config/clip-sync/config.toml`. The file may be a writable Stow symlink. The daemon and tray start with `graphical-session.target`, restart on failure, use a `0077` umask, and do not require NetBird to provide local history. The tray opens the switcher on left click and can launch either UI; set `services.clip-sync.tray.enable = false` when selecting the daemon-only package or when no StatusNotifier host is available.
+By default, each user service reads `%h/.config/clip-sync/config.toml`. The file may be a writable Stow symlink. The daemon and tray start with `graphical-session.target`, restart on failure, use a `0077` umask, and do not require NetBird to provide local history. The tray preserves its History Switcher and Control Center routes, but both target one native `clip-sync-switcher` process/window: left click opens Quick History and Control Center focuses management presentation. Set `services.clip-sync.tray.enable = false` when selecting the daemon-only package or when no StatusNotifier host is available.
 
 The graphical session must import `WAYLAND_DISPLAY` into the systemd user manager. UWSM normally does this. Verify with:
 
@@ -99,13 +101,43 @@ Never use the production secret for smoke tests.
 
 ## Hyprland
 
-Recommended rules:
+Recommended rules for Hyprland configurations using hyprlang syntax (through 0.54):
 
 ```ini
-windowrule = match:class ^(clip-sync-switcher)$, float on, center on, size 720 420
-windowrule = match:class ^(clip-sync-control)$, float on, center on, size 1040 700
+windowrule = match:class ^(clip-sync-switcher)$, float on, center on, size 720 480
 bind = $mainMod, H, exec, clip-sync ui switcher
+bindn = , Escape, global, clip-sync:close-quick
 ```
+
+The `n` flag is required: it is Hyprland's **non-consuming** bind flag, so Escape is still delivered to the focused application when ClipSync is absent or is showing management presentation. The UI registers app ID `clip-sync` and shortcut ID `close-quick` with the native `hyprland_global_shortcuts_v1` client protocol. The compositor supplies only anonymous pressed/released events: ClipSync forwards only pressed events into its existing signal channel, Quick closes, and management ignores the signal. Focused egui Escape remains unchanged. There is no spawned process per keypress, `evdev`/`libinput` reader, or global keylogger. Missing Wayland or protocol support is a non-fatal no-op.
+
+For a Home Manager/Nix Hyprland settings block, use the same compositor dispatcher rather than an `exec` binding:
+
+```nix
+wayland.windowManager.hyprland.settings = {
+  bind = [ "$mainMod, H, exec, clip-sync ui switcher" ];
+  bindn = [ ", Escape, global, clip-sync:close-quick" ];
+};
+```
+
+`clip-sync ui close-quick` remains available as a compatibility/debug command. It never starts the UI, validates the owner-only runtime path, and sends one bounded same-user Unix-socket message, but declarative bindings should use `global, clip-sync:close-quick`.
+
+For Hyprland 0.55+ Lua configuration, the equivalent non-consuming binding is:
+
+```lua
+hl.window_rule({
+  match = { class = "^(clip-sync-switcher)$" },
+  float = true,
+  center = true,
+  size = { 720, 480 },
+})
+hl.bind("SUPER + H", hl.dsp.exec_cmd("clip-sync ui switcher"))
+hl.bind("Escape", hl.dsp.global("clip-sync:close-quick"), { non_consuming = true })
+```
+
+The unified shell has one geometry file at `$XDG_STATE_HOME/clip-sync/window.json`, defaults to 720×480, and enforces a 480×300 minimum. On first run it migrates a valid `switcher-window.json` before considering `control-window.json`, then removes the legacy geometry files. Wayland does not expose client positioning, so saved placement is still restored through `hyprctl` when available.
+
+The local UI singleton signal changed when the former switcher and Control Center were unified. Treat this UI-only release as a coordinated cutover: before switching the package, close any mapped `clip-sync-switcher` and `clip-sync-control` windows, then let the declarative activation restart `clip-sync-tray.service`. Do not leave an old standalone UI process running across the switch. Daemon IPC remains version 5, so daemon/mesh interoperability is unchanged.
 
 Remove any `wl-paste --watch cliphist store` autostart only after `scripts/test-live-wayland` and the two-node smoke test pass. Keep `cliphist` installed during the initial soak so rollback does not depend on a network fetch.
 
