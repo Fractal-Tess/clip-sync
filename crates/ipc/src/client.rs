@@ -13,7 +13,7 @@ use super::{
 };
 
 const IPC_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
-const IPC_SHARE_REQUEST_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+const IPC_SHARE_REQUEST_TIMEOUT: Duration = Duration::from_mins(30);
 
 /// Sends one request to the daemon and waits for its response.
 ///

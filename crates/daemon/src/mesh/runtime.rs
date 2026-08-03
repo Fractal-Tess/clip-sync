@@ -76,7 +76,7 @@ impl MeshRuntimeConfig {
             listen_port,
             reconcile_interval: Duration::from_secs(5),
             reconnect_min: Duration::from_secs(1),
-            reconnect_max: Duration::from_secs(60),
+            reconnect_max: Duration::from_mins(1),
             batch_limits: BatchLimits {
                 max_ops: MAX_BATCH_OPERATIONS,
                 max_bytes: 4 * 1024 * 1024,
