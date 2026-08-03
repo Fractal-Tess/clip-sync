@@ -12,7 +12,7 @@ default-members = ["desktop/src-tauri"]
 [workspace.package]
 version = "0.2.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.97"
 description = "A masterless, encrypted clipboard-history mesh"
 repository = "https://github.com/Fractal-Tess/clip-sync"
 license = "MIT"
