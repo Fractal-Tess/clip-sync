@@ -109,8 +109,8 @@ jobs:
             --numeric-owner \
             "$ASSET"
 
-          sha256sum "dist/$ASSET.tar.gz" | tee "dist/$ASSET.tar.gz.sha256"
-          hex_hash="$(cut -d' ' -f1 "dist/$ASSET.tar.gz.sha256")"
+          hex_hash="$(sha256sum "dist/$ASSET.tar.gz" | cut -d' ' -f1)"
+          printf '%s  %s\n' "$hex_hash" "$ASSET.tar.gz" | tee "dist/$ASSET.tar.gz.sha256"
           sri_hash="sha256-$(printf '%s' "$hex_hash" | xxd -r -p | base64 -w0)"
           asset_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/${ASSET}.tar.gz"
           jq -n \
