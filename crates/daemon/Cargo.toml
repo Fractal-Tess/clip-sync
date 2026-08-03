@@ -1,0 +1,48 @@
+[package]
+name = "clip-sync-daemon"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description.workspace = true
+repository.workspace = true
+license.workspace = true
+authors.workspace = true
+autobins = false
+
+[lints]
+workspace = true
+
+[dependencies]
+clip-sync-core = { path = "../core" }
+clip-sync-ipc = { path = "../ipc" }
+anyhow.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+fs2.workspace = true
+futures-util.workspace = true
+getrandom.workspace = true
+hex.workspace = true
+hmac.workspace = true
+hostname.workspace = true
+image.workspace = true
+ipnet.workspace = true
+prost.workspace = true
+quinn.workspace = true
+rustix.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+socket2.workspace = true
+thiserror.workspace = true
+time.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+tempfile.workspace = true
+tracing-subscriber.workspace = true
+url.workspace = true

@@ -1,0 +1,11 @@
+# Package Managers
+package-lock.json
+pnpm-lock.yaml
+yarn.lock
+bun.lock
+bun.lockb
+
+# Generated and binary assets
+/static/
+/src-tauri/gen/
+/src/lib/bindings.ts

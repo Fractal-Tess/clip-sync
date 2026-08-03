@@ -40,14 +40,6 @@ in
       description = "Additional environment variables for the user service.";
     };
 
-    tray.enable = lib.mkOption {
-      type = lib.types.bool;
-      default = true;
-      description = ''
-        Run the persistent StatusNotifier tray item. Disable this when using
-        the daemon-only package or a desktop without a tray host.
-      '';
-    };
   };
 
   config = lib.mkIf cfg.enable {
@@ -60,7 +52,9 @@ in
       partOf = [ "graphical-session.target" ];
       wantedBy = cfg.wantedBy;
       environment = cfg.extraEnvironment;
-      path = [ pkgs.netbird ];
+      path = [
+        pkgs.iproute2
+      ];
 
       serviceConfig = {
         Type = "simple";
@@ -90,29 +84,5 @@ in
       };
     };
 
-    systemd.user.services.clip-sync-tray = lib.mkIf cfg.tray.enable {
-      description = "clip-sync system tray";
-      documentation = [ "https://github.com/Fractal-Tess/clip-sync" ];
-      after = [
-        "clip-sync.service"
-        "graphical-session-pre.target"
-      ];
-      partOf = [ "graphical-session.target" ];
-      wantedBy = cfg.wantedBy;
-      environment = cfg.extraEnvironment;
-      path = [ pkgs.hyprland ];
-
-      serviceConfig = {
-        Type = "simple";
-        ExecStart = "${lib.getExe cfg.package} --config ${configPath} ui tray";
-        Restart = "on-failure";
-        RestartSec = 2;
-        NoNewPrivileges = true;
-        PrivateTmp = true;
-        ProtectSystem = "strict";
-        RestrictAddressFamilies = [ "AF_UNIX" ];
-        UMask = "0077";
-      };
-    };
   };
 }

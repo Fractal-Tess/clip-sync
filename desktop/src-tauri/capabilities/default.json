@@ -1,0 +1,21 @@
+{
+	"$schema": "../gen/schemas/desktop-schema.json",
+	"identifier": "default",
+	"description": "Allows the main ClipSync window to call the minimal daemon IPC bridge",
+	"windows": ["main"],
+	"permissions": [
+		"core:window:allow-close",
+		"allow-get-status",
+		"allow-get-history",
+		"allow-get-image-preview",
+		"allow-update-history",
+		"allow-get-peers",
+		"allow-get-settings",
+		"allow-get-diagnostics",
+		"allow-get-transfers",
+		"allow-cancel-transfer",
+		"allow-forget-device",
+		"allow-update-shared-setting",
+		"allow-activate-history"
+	]
+}

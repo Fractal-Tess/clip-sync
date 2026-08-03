@@ -9,36 +9,52 @@
 </p>
 
 <p align="center">
-  <strong>Pre-release:</strong> the daily-driver implementation is feature-complete and under real-device validation; it has not received an independent security review.
+  <strong>Pre-release:</strong> the Linux daily-driver implementation is under real-device validation and has not received an independent security review.
 </p>
 
 ![A masterless network of clipboard peers](assets/splash.png)
 
-## Why clip-sync?
+## Overview
 
-Most clipboard sync tools assume a central service or immediately replace every connected device's clipboard. clip-sync is being built around a different model:
+clip-sync synchronizes retained clipboard history between trusted devices without a central service or immediately replacing every peer's active clipboard.
 
-- **No master node.** Every peer stores and forwards retained history.
-- **History before interruption.** Remote copies enter a merged history without replacing the active clipboard.
+- **No master node.** Every authorized peer stores and forwards retained history.
+- **History before interruption.** Remote copies enter a merged history until deliberately activated.
 - **Offline reconciliation.** Peers catch up after reconnecting.
-- **Private-network first.** The initial transport targets trusted devices connected through NetBird.
-- **Encrypted persistence.** Clipboard payloads and searchable metadata are designed to remain encrypted at rest.
-- **Keyboard first.** The optional unified egui window provides fast History search, grid navigation, pinning, activation, and compact management routes.
+- **Interface-scoped networking.** Authenticated discovery and transport run only on explicitly selected Linux interfaces.
+- **Encrypted persistence.** SQLCipher stores history metadata and operations; large payloads use fixed-size encrypted chunks.
+- **Arbitrary clipboard content.** Text, images, multiple MIME representations, and safe file snapshots are supported.
+- **Bounded transfers.** Large shares are chunked, resumable, cancellable, and relayable.
+- **Keyboard-first control.** Search, pagination, Vim-style navigation, activation, pinning, deletion, transfers, peers, settings, and diagnostics are available from one desktop window.
 
-## Initial target
+The initial target is NixOS on Hyprland/wlroots. Platform boundaries are kept narrow, but other operating systems are not currently supported.
 
-The first daily-driver target is NixOS on Hyprland/wlroots, synchronizing two personal devices over NetBird. The architecture keeps clipboard and peer-discovery boundaries narrow so other platforms can be added later.
+## Architecture
 
-The current pre-release implements the complete Linux daily-driver path; real-device smoke, deployment, and soak validation remain the release gate.
+The Rust workspace has five crates with a single lockfile and a strict authority boundary:
+
+- `clip-sync-core` owns domain models, encrypted persistence, clipboard backends, replication, transfer, and transport primitives.
+- `clip-sync-ipc` is an independent leaf containing the versioned Protobuf wire contract, bounded framing, and Unix-socket client.
+- `clip-sync-daemon` owns discovery, mesh and history orchestration, daemon state, and the IPC server.
+- `clip-sync-cli` owns parsing and client/offline command execution without starting a daemon or owning a runtime.
+- `clip-sync` is the Tauri package and sole application host, producing the only executable.
+
+The daemon is the sole owner of clipboard access, encrypted storage, retention, transfer state, and mesh networking. The CLI and Tauri desktop communicate with it through an owner-only Unix socket using protocol-v6 Protobuf IPC. They never open storage or mesh state directly, and neither client automatically starts the daemon.
+
+ClipSync sends small HMAC-authenticated UDP multicast beacons on each configured interface. Interfaces that cannot route multicast, including many point-to-point tunnels, fall back to rate-limited authenticated unicast probe windows with a hard per-cycle bound. A valid beacon exposes only the sender address and QUIC port; host and application metadata are exchanged only after the existing mesh-secret-authenticated QUIC handshake succeeds. QUIC listeners bind only to addresses on the selected interfaces, and the Peers view reports only live authenticated connections.
+
+`desktop/` contains the Tauri 2, SvelteKit 2, Svelte 5, Tailwind CSS 4, and shadcn-svelte control window. Rust command signatures generate its TypeScript IPC bindings through Specta.
+
+The desktop history client requests viewport-sized daemon pages, caches the current page plus two pages on each side, and preloads bounded image previews for that window. The preview cache is limited by entry count, memory, and request concurrency.
 
 ## Commands
 
+Running `clip-sync` with no arguments launches the desktop window. `clip-sync desktop` is the equivalent explicit form. Start the daemon separately before using desktop or online client commands.
+
 ```console
+clip-sync
+clip-sync desktop
 clip-sync daemon
-clip-sync ui switcher
-clip-sync ui control
-clip-sync ui close-quick
-clip-sync ui tray
 clip-sync status --json
 clip-sync peers --json
 clip-sync history search 'd:kiwi,t:text,p:false,"error message"' --json
@@ -53,16 +69,7 @@ clip-sync doctor --json
 clip-sync rekey --old-key-file OLD --new-key-file NEW
 ```
 
-The UI commands are available when built with the optional `ui` Cargo feature. Both `ui switcher` and `ui control` address one native process, singleton, and `clip-sync-switcher` window: `switcher` opens keyboard-first Quick History while `control` focuses the same shell in management presentation. History uses arrow keys plus `Page Up`/`Page Down` for grid navigation, `Enter` to activate, and `Ctrl+P` to pin or unpin. Quick activation and focused `Esc` close the window; management activation stays open. One owner-only geometry file remembers the shared window; 720×480 is the default and 480×300 is the minimum, with existing switcher geometry migrated before the former control geometry. Hyprland positioning is restored through `hyprctl` because Wayland does not expose client-controlled placement. The singleton StatusNotifier tray preserves its History Switcher and Control Center routes; quitting the tray does not stop synchronization.
-
-Open History refreshes immediately and then polls the protocol-v5 daemon view at a bounded cadence (one second while focused and five seconds while unfocused), pausing on other routes or when minimization is detectable. Failed background refreshes retain the last interactive cards and use bounded backoff. History, status, and other read-only views remain concurrent and responsive during changes. UI mutations are gated around Share: another mutation cannot be dispatched while Share is pending, and Share cannot start while any mutation is pending; disabled controls explain the wait.
-
-For privacy-safe unfocused Quick History closing on Hyprland, add the non-consuming `global, clip-sync:close-quick` compositor binding documented in [the deployment guide](docs/deployment.md). The UI registers `clip-sync:close-quick` through the native `hyprland_global_shortcuts_v1` protocol and accepts only anonymous pressed events; Quick closes and management ignores them. Registration degrades gracefully outside compatible Wayland compositors and never reads `evdev`, `libinput`, or key values. Focused egui `Esc` remains available. `clip-sync ui close-quick` is retained only as a same-user compatibility/debug signal and is not the recommended binding.
-
-History search combines case-insensitive free text with typed filters. Commas
-and whitespace chain filters conjunctively, quoted phrases preserve separators,
-and results are always newest first. `d:`, `t:`, and `p:` abbreviate `device:`,
-`type:`, and `pinned:`:
+History search combines case-insensitive free text with typed filters. Commas and whitespace chain filters conjunctively, while quoted phrases preserve separators. `d:`, `t:`, and `p:` abbreviate `device:`, `type:`, and `pinned:`.
 
 ```console
 clip-sync history search '"release notes",d:kiwi,t:text,p:true'
@@ -70,64 +77,175 @@ clip-sync history search 'before:2026-07-29T12:00:00Z,min-size:4KiB,max-size:2MB
 clip-sync history search 'before:1785326400000'
 ```
 
-`before:` accepts an RFC3339 timestamp or Unix milliseconds. Size bounds are
-inclusive and accept bytes or `KB`, `KiB`, `MB`, `MiB`, `GB`, and `GiB`.
-Search uses only the daemon's bounded preview and metadata view; the underlying
-history remains in the encrypted SQLCipher operation store.
+`before:` accepts RFC 3339 or Unix milliseconds. Inclusive size bounds accept bytes, `KB`, `KiB`, `MB`, `MiB`, `GB`, and `GiB`.
 
-## Status and roadmap
+## Desktop development
 
-| Phase | Goal | Status |
-| --- | --- | --- |
-| 0 | Validate Wayland, NetBird, QUIC authentication, encrypted storage, and egui integration | Complete |
-| 1 | Project foundation, config, model, IPC, CLI, and local checks | Complete |
-| 2 | Encrypted local text history | Complete |
-| 3 | Two-node text mesh vertical slice | Complete; disposable live `vd`/`kiwi` NetBird smoke passed |
-| 4 | Keyboard-first egui switcher | Complete; live Hyprland shell/singleton smoke passed |
-| 5 | Arbitrary MIME and safe file snapshots | Complete in implementation and integration tests |
-| 6 | Chunked, cancellable, resumable large sharing | Complete in implementation and integration tests |
-| 7 | Retention and convergence hardening | Complete |
-| 8 | Full control center and diagnostics | Complete |
-| 9 | NixOS daily-driver deployment | In progress |
-
-See [PLAN.md](PLAN.md) for the detailed architecture, threat model, milestones, test strategy, and acceptance criteria.
-
-## Security warning
-
-Clipboard history routinely contains passwords, tokens, private keys, personal messages, and proprietary data. **Do not use the current development version for sensitive clipboard contents.** Security-sensitive behavior will remain clearly marked until the storage and network designs have been independently reviewed and hardened.
-
-The initial trust model uses one high-entropy shared mesh secret supplied through a file (for example, by SOPS). Anyone holding that secret is an equal mesh member and can read or mutate shared history.
-
-Please report vulnerabilities according to [SECURITY.md](SECURITY.md).
-
-## Development
-
-The current implementation includes native Wayland capture/ownership, SQLCipher operation history, envelope rekeying, authenticated NetBird-only QUIC sessions, store-and-forward anti-entropy, encrypted resumable chunks, safe file snapshots/materialization, replicated retention and settings, full CLI/IPC parity, and an optional unified egui Quick History/management shell. See [the deployment guide](docs/deployment.md), [Milestone 0 findings](docs/milestone-0.md), and [PLAN.md](PLAN.md) for validation details and remaining live soak work.
+Enter the development shell before building either desktop host. It provides Rust, Bun, WebKitGTK, Wayland, GTK, and the other native dependencies.
 
 ```console
 nix develop
-cargo run -- config init
-cargo run -- doctor
-cargo run -- daemon
-# In another shell:
-cargo run -- status --json
+
+# Browser-only UI with clearly labeled, non-sensitive sample data
+cd desktop
+bun install --frozen-lockfile
+bun run dev
+
+# Tauri window connected to the running daemon
+bun run tauri dev
 ```
 
-All validation runs locally; the repository intentionally has no hosted CI/CD workflow.
+The Tauri script currently runs through XWayland and disables WebKitGTK compositing and DMA-BUF rendering to avoid WebKitGTK/Hyprland rendering failures. The Nix shell and packaged wrapper also expose the GTK/GSettings schema paths required by WebKitGTK. Its production window defaults to `760×520` and supports a `480×300` minimum.
+
+Tauri history shortcuts:
+
+- Arrow keys or `H/J/K/L`: move through the history grid.
+- Left/right at a column boundary: move to the corresponding row on the adjacent page.
+- `Page Up` / `Page Down`: change pages.
+- `/`: focus search.
+- `Enter`: activate the selected record and close the window.
+- `R`: refresh history.
+- `Escape`: close the window from any focused control.
+- Right-click a record: activate, pin/unpin, filter by source, or confirm mesh-wide deletion.
+
+## Development
 
 ```console
-./scripts/check                     # format, daemon/UI builds, clippy, and tests
-./scripts/check --security          # also run RustSec and source-policy checks
-./scripts/check --nix --security    # also build and validate the Nix packages
-WAYLAND_DISPLAY=wayland-1 ./scripts/test-live-wayland
-./scripts/deploy-smoke kiwi          # disposable two-node NetBird test
+nix develop
+cargo run -p clip-sync --bin clip-sync -- config init
+cargo run -p clip-sync --bin clip-sync -- doctor
+cargo run -p clip-sync --bin clip-sync -- daemon
+# In another shell:
+cargo run -p clip-sync --bin clip-sync -- status --json
 ```
 
-The flake exports UI and daemon-only packages plus a hardened NixOS user-service module.
+Run the local checks before submitting changes:
 
-## Contributing
+```console
+cargo fmt --all -- --check
+cargo check --workspace --all-targets --all-features --locked
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+cargo test --workspace --all-targets --all-features --locked
+cargo build -p clip-sync --bin clip-sync --locked
+cargo audit
+cargo deny check
+nix flake check
 
-The project is personal-first but intended to become reusable. Design discussion and focused contributions are welcome; read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request.
+cd desktop
+bun install --frozen-lockfile
+bun run check
+bun run lint
+bun run test
+bun run build
+bun run tauri build
+```
+
+GitHub Actions runs the frontend and Rust validation suite on pushes and pull requests. Stable SemVer tags build and publish the unified x86_64 Linux executable, its SHA-256 checksum, release notes from `CHANGELOG.md`, and a Nix release-artifact manifest. Live Wayland and multi-device validation remains manual against isolated test state.
+
+### Development principles
+
+- Preserve masterless behavior; do not introduce a hidden coordinator or privileged peer.
+- Keep the daemon authoritative for storage, clipboard, transfer, and mesh state.
+- Fail closed on authentication, decryption, permission, or validation failures.
+- Stream untrusted payloads and enforce explicit resource bounds.
+- Never log clipboard contents, filenames, previews, keys, secrets, or plaintext search queries.
+- Keep persistent clipboard content and searchable metadata encrypted.
+- Make replicated transitions deterministic, idempotent, and testable under reordering.
+- Avoid `unsafe` unless a platform boundary requires it and the invariant is documented.
+
+Focused contributions are welcome. Discuss large changes before implementation, add property or integration coverage for replication changes, and use focused commits with imperative subjects. AI-assisted contributors remain responsible for understanding, testing, licensing, and reviewing submitted code; do not submit generated cryptographic constructions without careful human review.
+
+## Tagged releases
+
+Releases use stable SemVer tags such as `v0.2.0`. Before tagging, update the workspace, frontend, and Tauri versions together and add a matching section to `CHANGELOG.md`.
+
+```console
+git tag -s v0.2.0
+git push origin v0.2.0
+```
+
+The release workflow validates the tag against every version source and publishes `clip-sync-v0.2.0-x86_64-linux.tar.gz`, a checksum, and `nix-release-artifacts.json`. After the release succeeds, manually replace `nix/release-artifacts.json` in the default branch with the generated release asset and commit it. That fixed-output hash enables the prebuilt Nix package without trusting a mutable download.
+
+## NixOS deployment
+
+The flake exports the unified desktop/CLI/daemon package as `packages.<system>.default` and the hardened user-service configuration as `nixosModules.default`. The package contains exactly one executable, `clip-sync`.
+
+When `nix/release-artifacts.json` contains an artifact for the current system and version, the default package downloads that CI-built release and uses `autoPatchelfHook` plus the normal runtime wrapper instead of compiling Rust. Before the post-release manifest is committed, or on systems without a published binary, it safely falls back to the source package. `packages.<system>.source` always remains available for reproducible source builds.
+
+```nix
+{
+  inputs.clip-sync.url = "github:Fractal-Tess/clip-sync";
+  inputs.clip-sync.inputs.nixpkgs.follows = "nixpkgs";
+
+  imports = [ inputs.clip-sync.nixosModules.default ];
+
+  services.clip-sync.enable = true;
+}
+```
+
+The service reads `%h/.config/clip-sync/config.toml`, starts with `graphical-session.target`, restarts on failure, and uses a `0077` umask. UWSM normally imports `WAYLAND_DISPLAY`; verify it when clipboard capture is unavailable:
+
+```console
+systemctl --user show-environment | grep WAYLAND_DISPLAY
+```
+
+An explicit `WAYLAND_DISPLAY` is honored. If it is absent, the daemon can recover only when exactly one numbered `wayland-N` socket exists in `XDG_RUNTIME_DIR`.
+
+### Secret provisioning
+
+Provision the same high-entropy 32-byte raw or 64-character hexadecimal mesh secret on every peer. The target must be owned by the desktop user with mode `0400` or `0600`. Stable sops-nix symlinks are supported after descriptor-level target validation.
+
+```nix
+sops.secrets.clip_sync_mesh_key = {
+  sopsFile = ./secrets.json;
+  format = "json";
+  owner = "your-user";
+  mode = "0400";
+};
+```
+
+Reference the runtime path in the local configuration:
+
+```toml
+[shared]
+mesh_quota_bytes = 1073741824
+capture_threshold_bytes = 20971520
+revision = ""
+
+[local]
+mesh_key_file = "/run/secrets/clip_sync_mesh_key"
+listen_port = 24892
+discovery_interval_seconds = 15
+reconcile_interval_seconds = 5
+reconnect_min_seconds = 1
+reconnect_max_seconds = 60
+peer_interfaces = ["eth0", "wt0"]
+maximum_explicit_share_bytes = 4294967296
+transfer_free_space_reserve_bytes = 67108864
+materialization_free_space_reserve_bytes = 8388608
+max_concurrent_chunk_streams = 4
+```
+
+### Mesh-secret rotation
+
+Stop the daemon and rotate every retained node before deploying the replacement secret as its configured `mesh_key_file`:
+
+```console
+systemctl --user stop clip-sync
+clip-sync rekey \
+  --old-key-file /run/secrets/clip_sync_mesh_key_old \
+  --new-key-file /run/secrets/clip_sync_mesh_key_new
+```
+
+The command is interruption-safe and idempotent when rerun with the same secrets. Do not delete or edit `history.keyslot` or `history.keyslot.next` during recovery. Deploy the new configured secret only after every node reports a verified rotation. Never use the production secret for smoke tests.
+
+## Security
+
+Clipboard history routinely contains passwords, tokens, private keys, messages, and proprietary data. **Do not use this pre-release for sensitive clipboard contents.** The protocol, cryptographic construction, storage format, and transfer behavior have not received an independent security review.
+
+The current trust model assumes that devices belong to one user, operating systems and the secret manager are trusted, and selected network interfaces are appropriate for peer communication. Discovery beacons are authenticated but not confidential and reveal that a host is listening for ClipSync; unauthenticated beacons are ignored. Every holder of the mesh secret has equal authority to read or mutate retained history. clip-sync does not protect against a compromised authorized peer, compromised desktop session, clipboard-source application behavior, or plaintext while an item is actively exposed to another application.
+
+Report suspected vulnerabilities through GitHub private vulnerability reporting rather than a public issue. Include the affected version, reproduction steps, expected impact, and any time-sensitive disclosure constraints.
 
 ## License
 

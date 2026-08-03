@@ -11,8 +11,11 @@
         "aarch64-linux"
       ];
       forAllSystems = nixpkgs.lib.genAttrs systems;
-      packageFor =
-        system: withUi:
+      workspace = builtins.fromTOML (builtins.readFile ./Cargo.toml);
+      version = workspace.workspace.package.version;
+      releaseArtifacts = builtins.fromJSON (builtins.readFile ./nix/release-artifacts.json);
+      sourcePackageFor =
+        system:
         let
           pkgs = nixpkgs.legacyPackages.${system};
           rustSource = pkgs.lib.fileset.toSource {
@@ -20,43 +23,84 @@
             fileset = pkgs.lib.fileset.unions [
               ./Cargo.lock
               ./Cargo.toml
+              ./deny.toml
               ./assets
-              ./protocols
-              ./src
-              ./tests
+              ./crates
+              ./desktop
+              ./nix
             ];
+          };
+          frontendSource = pkgs.lib.fileset.toSource {
+            root = ./.;
+            fileset = pkgs.lib.fileset.difference ./desktop ./desktop/src-tauri;
+          };
+          desktopFrontend = pkgs.callPackage ./nix/desktop-frontend.nix {
+            src = frontendSource;
           };
         in
         pkgs.rustPlatform.buildRustPackage {
           pname = "clip-sync";
-          version = "0.1.0";
+          inherit version;
           src = rustSource;
           cargoLock.lockFile = ./Cargo.lock;
-          buildFeatures = pkgs.lib.optionals withUi [ "ui" ];
           RUST_MIN_STACK = "16777216";
+
           nativeBuildInputs = with pkgs; [
-            makeWrapper
             perl
             pkg-config
+            wrapGAppsHook3
           ];
-          buildInputs = pkgs.lib.optionals withUi (
-            with pkgs;
-            [
-              libGL
-              libxkbcommon
-              wayland
-            ]
-          );
-          postFixup = ''
-            wrapProgram "$out/bin/clip-sync" \
-              --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.netbird ]} \
-              ${pkgs.lib.optionalString withUi "--prefix LD_LIBRARY_PATH : ${
+
+          buildInputs = with pkgs; [
+            cairo
+            dbus
+            gdk-pixbuf
+            glib
+            gsettings-desktop-schemas
+            gtk3
+            libGL
+            libsoup_3
+            libxkbcommon
+            openssl
+            pango
+            wayland
+            webkitgtk_4_1
+          ];
+
+          preBuild = ''
+            rm -rf desktop/build
+            mkdir -p desktop/build
+            cp -R ${desktopFrontend}/. desktop/build/
+          '';
+
+          cargoBuildFlags = [
+            "-p"
+            "clip-sync"
+            "--bin"
+            "clip-sync"
+            "--locked"
+          ];
+          doCheck = false;
+
+          postInstall = ''
+            find "$out/bin" -maxdepth 1 -type f ! -name clip-sync -delete
+          '';
+
+          preFixup = ''
+            gappsWrapperArgs+=(
+              --set GDK_BACKEND x11
+              --set WEBKIT_DISABLE_COMPOSITING_MODE 1
+              --set WEBKIT_DISABLE_DMABUF_RENDERER 1
+              --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.iproute2 ]}
+              --prefix LD_LIBRARY_PATH : ${
                 pkgs.lib.makeLibraryPath [
                   pkgs.libGL
                   pkgs.libxkbcommon
                   pkgs.wayland
+                  pkgs.webkitgtk_4_1
                 ]
-              }"}
+              }
+            )
           '';
 
           meta = {
@@ -67,23 +111,37 @@
             platforms = pkgs.lib.platforms.linux;
           };
         };
+      packageFor =
+        system:
+        let
+          pkgs = nixpkgs.legacyPackages.${system};
+          artifact =
+            if releaseArtifacts.version == version then releaseArtifacts.systems.${system} or null else null;
+        in
+        if artifact == null then
+          sourcePackageFor system
+        else
+          pkgs.callPackage ./nix/prebuilt-package.nix {
+            inherit artifact version;
+          };
     in
     {
       packages = forAllSystems (system: {
-        default = packageFor system true;
-        daemon = packageFor system false;
-        with-ui = packageFor system true;
+        default = packageFor system;
+        source = sourcePackageFor system;
       });
 
       checks = forAllSystems (system: {
-        package = packageFor system true;
-        daemon = packageFor system false;
+        package = self.packages.${system}.default;
+        source = self.packages.${system}.source;
       });
 
-      nixosModules.default = { pkgs, lib, ... }: {
-        imports = [ ./nix/module.nix ];
-        services.clip-sync.package = lib.mkDefault self.packages.${pkgs.system}.default;
-      };
+      nixosModules.default =
+        { pkgs, lib, ... }:
+        {
+          imports = [ ./nix/module.nix ];
+          services.clip-sync.package = lib.mkDefault self.packages.${pkgs.system}.default;
+        };
 
       devShells = forAllSystems (
         system:
@@ -93,23 +151,43 @@
         {
           default = pkgs.mkShell {
             packages = with pkgs; [
+              bun
               cargo
               cargo-audit
               cargo-deny
               clippy
+              dbus
+              gsettings-desktop-schemas
+              gtk3
+              iproute2
               libGL
+              librsvg
+              libsoup_3
               libxkbcommon
+              openssl
               pkg-config
-              protobuf
               rustc
               rustfmt
               wayland
+              webkitgtk_4_1
             ];
             LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath [
+              pkgs.dbus
+              pkgs.gtk3
               pkgs.libGL
+              pkgs.librsvg
+              pkgs.libsoup_3
               pkgs.libxkbcommon
+              pkgs.openssl
               pkgs.wayland
+              pkgs.webkitgtk_4_1
             ];
+            GDK_BACKEND = "x11";
+            WEBKIT_DISABLE_COMPOSITING_MODE = "1";
+            WEBKIT_DISABLE_DMABUF_RENDERER = "1";
+            shellHook = ''
+              export XDG_DATA_DIRS=${pkgs.gsettings-desktop-schemas}/share/gsettings-schemas/${pkgs.gsettings-desktop-schemas.name}:${pkgs.gtk3}/share/gsettings-schemas/${pkgs.gtk3.name}:''${XDG_DATA_DIRS:-}
+            '';
           };
         }
       );

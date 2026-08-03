@@ -1,0 +1,24 @@
+[package]
+name = "clip-sync-ipc"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description.workspace = true
+repository.workspace = true
+license.workspace = true
+authors.workspace = true
+autobins = false
+
+[lints]
+workspace = true
+
+[dependencies]
+bytes.workspace = true
+futures-util.workspace = true
+prost.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -1,0 +1,149 @@
+name: Tagged release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Release x86_64 Linux binary
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@v4
+
+      - name: Validate SemVer tag and release metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          if [[ ! "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "Release tag must be stable SemVer in the form vMAJOR.MINOR.PATCH" >&2
+            exit 1
+          fi
+          version="${tag#v}"
+          cargo_version="$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')"
+          tauri_version="$(jq -r .version desktop/src-tauri/tauri.conf.json)"
+          frontend_version="$(jq -r .version desktop/package.json)"
+          test "$version" = "$cargo_version"
+          test "$version" = "$tauri_version"
+          test "$version" = "$frontend_version"
+          grep -Fq "## [$version]" CHANGELOG.md
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+          echo "ASSET=clip-sync-v${version}-x86_64-linux" >> "$GITHUB_ENV"
+
+      - name: Install Linux desktop dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            build-essential \
+            file \
+            libayatana-appindicator3-dev \
+            libcairo2-dev \
+            libdbus-1-dev \
+            libgdk-pixbuf-2.0-dev \
+            libglib2.0-dev \
+            libgtk-3-dev \
+            libpango1.0-dev \
+            librsvg2-dev \
+            libsoup-3.0-dev \
+            libssl-dev \
+            libwayland-dev \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev \
+            libxkbcommon-dev \
+            patchelf \
+            perl \
+            pkg-config \
+            xxd
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.88.0
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-all-crates: true
+
+      - name: Install Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.13
+
+      - name: Build desktop frontend
+        working-directory: desktop
+        run: |
+          bun install --frozen-lockfile
+          bun run build
+
+      - name: Build unified release executable
+        run: cargo build --release -p clip-sync --bin clip-sync --locked
+
+      - name: Verify and package executable
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(target/release/clip-sync --version)" = "clip-sync $VERSION"
+          test "$(cargo metadata --no-deps --format-version 1 | jq '[.packages[].targets[] | select(.kind[] == "bin")] | length')" = "1"
+
+          mkdir -p "dist/$ASSET"
+          install -m755 target/release/clip-sync "dist/$ASSET/clip-sync"
+          install -m644 README.md CHANGELOG.md LICENSE "dist/$ASSET/"
+          tar \
+            --create \
+            --gzip \
+            --file "dist/$ASSET.tar.gz" \
+            --directory dist \
+            --sort=name \
+            --mtime='UTC 1970-01-01' \
+            --owner=0 \
+            --group=0 \
+            --numeric-owner \
+            "$ASSET"
+
+          sha256sum "dist/$ASSET.tar.gz" | tee "dist/$ASSET.tar.gz.sha256"
+          hex_hash="$(cut -d' ' -f1 "dist/$ASSET.tar.gz.sha256")"
+          sri_hash="sha256-$(printf '%s' "$hex_hash" | xxd -r -p | base64 -w0)"
+          asset_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/${ASSET}.tar.gz"
+          jq -n \
+            --arg version "$VERSION" \
+            --arg url "$asset_url" \
+            --arg hash "$sri_hash" \
+            '{version: $version, systems: {"x86_64-linux": {url: $url, hash: $hash}}}' \
+            > dist/nix-release-artifacts.json
+
+          awk -v prefix="## [$VERSION]" '
+            index($0, prefix) == 1 { capture = 1; next }
+            capture && (/^## \[/ || /^\[Unreleased\]:/) { exit }
+            capture { print }
+          ' CHANGELOG.md > dist/release-notes.md
+          test -s dist/release-notes.md
+
+      - name: Upload release build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ASSET }}
+          path: |
+            dist/${{ env.ASSET }}.tar.gz
+            dist/${{ env.ASSET }}.tar.gz.sha256
+            dist/nix-release-artifacts.json
+          if-no-files-found: error
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ClipSync v${{ env.VERSION }}
+          body_path: dist/release-notes.md
+          fail_on_unmatched_files: true
+          files: |
+            dist/${{ env.ASSET }}.tar.gz
+            dist/${{ env.ASSET }}.tar.gz.sha256
+            dist/nix-release-artifacts.json
