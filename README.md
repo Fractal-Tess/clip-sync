@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/logo.png" alt="clip-sync logo" width="140" />
+  <img src="assets/logo.png" alt="ClipSync faceted clipboard logo" width="180" />
 </p>
 
 <h1 align="center">clip-sync</h1>
@@ -11,8 +11,6 @@
 <p align="center">
   <strong>Pre-release:</strong> the Linux daily-driver implementation is under real-device validation and has not received an independent security review.
 </p>
-
-![A masterless network of clipboard peers](assets/splash.png)
 
 ## Overview
 
