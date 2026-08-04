@@ -1,9 +1,9 @@
 {
-  "version": "0.2.1",
+  "version": "0.2.2",
   "systems": {
     "x86_64-linux": {
-      "url": "https://github.com/Fractal-Tess/clip-sync/releases/download/v0.2.1/clip-sync-v0.2.1-x86_64-linux.tar.gz",
-      "hash": "sha256-WtgitCqjhAFgdYDIIfq5iMmsgWzpCWBcjEDwqdTygiA="
+      "url": "https://github.com/Fractal-Tess/clip-sync/releases/download/v0.2.2/clip-sync-v0.2.2-x86_64-linux.tar.gz",
+      "hash": "sha256-Aq0jnu5XwO5aeDOZyn3jKSMZfKPErOxl45PsFuCmKNM="
     }
   }
 }
