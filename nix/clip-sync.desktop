@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=ClipSync
+GenericName=Clipboard Synchronization
+Comment=Open the encrypted clipboard-history mesh
+Exec=clip-sync desktop
+Icon=clip-sync
+Terminal=false
+Categories=Utility;
+Keywords=clipboard;history;sync;mesh;
+StartupNotify=true
+StartupWMClass=clip-sync

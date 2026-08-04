@@ -56,6 +56,9 @@ stdenvNoCC.mkDerivation {
     install -Dm644 README.md "$out/share/doc/clip-sync/README.md"
     install -Dm644 CHANGELOG.md "$out/share/doc/clip-sync/CHANGELOG.md"
     install -Dm644 LICENSE "$out/share/licenses/clip-sync/LICENSE"
+    install -Dm644 ${./clip-sync.desktop} "$out/share/applications/clip-sync.desktop"
+    install -Dm644 ${../desktop/src-tauri/icons/128x128.png} \
+      "$out/share/icons/hicolor/128x128/apps/clip-sync.png"
     runHook postInstall
   '';
 

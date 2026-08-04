@@ -84,6 +84,9 @@
 
           postInstall = ''
             find "$out/bin" -maxdepth 1 -type f ! -name clip-sync -delete
+            install -Dm644 ${./nix/clip-sync.desktop} "$out/share/applications/clip-sync.desktop"
+            install -Dm644 ${./desktop/src-tauri/icons/128x128.png} \
+              "$out/share/icons/hicolor/128x128/apps/clip-sync.png"
           '';
 
           preFixup = ''
