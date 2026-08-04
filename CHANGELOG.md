@@ -6,6 +6,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-08-04
+
+### Added
+
+- A hidden, prewarmed desktop process managed by the graphical-session systemd user target.
+- Single-instance desktop activation so launcher requests reveal the existing window immediately.
+- A desktop launcher entry and application icon for Linux application menus.
+
+### Changed
+
+- Closing the desktop window now hides it while keeping the initialized webview available.
+
+### Fixed
+
+- Interface discovery now has the netlink access required by the hardened NixOS user service.
+- Linux launchers and Hyprland rules now use the desktop window's actual application class.
+
 ## [0.2.0] - 2026-08-03
 
 ### Added
@@ -34,5 +51,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Discovery beacons are authenticated with a key derived independently from the mesh secret.
 - Hostname and application metadata remain unavailable until the QUIC mesh handshake succeeds.
 
-[Unreleased]: https://github.com/Fractal-Tess/clip-sync/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/Fractal-Tess/clip-sync/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/Fractal-Tess/clip-sync/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/Fractal-Tess/clip-sync/releases/tag/v0.2.0

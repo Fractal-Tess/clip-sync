@@ -15,7 +15,7 @@ fn main() -> anyhow::Result<()> {
     match kind {
         LaunchKind::Desktop => {
             let config_override = invocation.config_override().map(Path::to_path_buf);
-            clip_sync_app::run(config_override);
+            clip_sync_app::run(config_override, invocation.desktop_background());
             Ok(())
         }
         LaunchKind::Daemon => {

@@ -15,7 +15,7 @@ pub(super) struct Cli {
 #[derive(Debug, Subcommand)]
 pub(super) enum Command {
     /// Launch the desktop control window.
-    Desktop,
+    Desktop(DesktopArgs),
     /// Run the background daemon in the foreground.
     Daemon,
     /// Query the running daemon.
@@ -48,6 +48,13 @@ pub(super) enum Command {
     },
     /// Rotate the mesh secret wrapping local encrypted-store data keys.
     Rekey(RekeyArgs),
+}
+
+#[derive(Debug, Clone, Copy, Args)]
+pub(super) struct DesktopArgs {
+    /// Keep the desktop process warm without initially showing its window.
+    #[arg(long, hide = true)]
+    pub(super) background: bool,
 }
 
 #[derive(Debug, Clone, Copy, Args)]

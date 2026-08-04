@@ -34,6 +34,15 @@ in
       description = "User targets that start clip-sync.";
     };
 
+    prewarmDesktop = lib.mkOption {
+      type = lib.types.bool;
+      default = true;
+      description = ''
+        Start a hidden desktop process with the graphical session so launcher
+        requests can reveal an already initialized window immediately.
+      '';
+    };
+
     extraEnvironment = lib.mkOption {
       type = lib.types.attrsOf lib.types.str;
       default = { };
@@ -82,6 +91,27 @@ in
         RestrictRealtime = true;
         SystemCallArchitectures = "native";
         UMask = "0077";
+      };
+    };
+
+    systemd.user.services.clip-sync-desktop = lib.mkIf cfg.prewarmDesktop {
+      description = "Prewarmed ClipSync desktop window";
+      documentation = [ "https://github.com/Fractal-Tess/clip-sync" ];
+      after = [
+        "clip-sync.service"
+        "graphical-session-pre.target"
+      ];
+      wants = [ "clip-sync.service" ];
+      partOf = [ "graphical-session.target" ];
+      wantedBy = cfg.wantedBy;
+      environment = cfg.extraEnvironment;
+
+      serviceConfig = {
+        Type = "simple";
+        ExecStart = "${lib.getExe cfg.package} --config ${configPath} desktop --background";
+        Restart = "on-failure";
+        RestartSec = 2;
+        TimeoutStopSec = 10;
       };
     };
 

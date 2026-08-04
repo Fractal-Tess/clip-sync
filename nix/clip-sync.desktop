@@ -9,4 +9,4 @@ Terminal=false
 Categories=Utility;
 Keywords=clipboard;history;sync;mesh;
 StartupNotify=true
-StartupWMClass=clip-sync
+StartupWMClass=Clip-sync

@@ -18,9 +18,15 @@ fn desktop_is_the_default_and_explicit_desktop_mode() {
     let default = invocation(&["clip-sync"]);
     assert_eq!(default.kind(), LaunchKind::Desktop);
     assert_eq!(default.config_override(), None);
+    assert!(!default.desktop_background());
 
     let explicit = invocation(&["clip-sync", "desktop"]);
     assert_eq!(explicit.kind(), LaunchKind::Desktop);
+    assert!(!explicit.desktop_background());
+
+    let background = invocation(&["clip-sync", "desktop", "--background"]);
+    assert_eq!(background.kind(), LaunchKind::Desktop);
+    assert!(background.desktop_background());
 
     let configured = invocation(&["clip-sync", "--config", "/tmp/config.toml", "desktop"]);
     assert_eq!(configured.kind(), LaunchKind::Desktop);

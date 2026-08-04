@@ -1,7 +1,7 @@
 {
 	"$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
 	"productName": "ClipSync",
-	"version": "0.2.0",
+	"version": "0.2.1",
 	"identifier": "dev.fractaltess.clipsync",
 	"mainBinaryName": "clip-sync",
 	"build": {
@@ -21,6 +21,7 @@
 				"minHeight": 300,
 				"resizable": true,
 				"fullscreen": false,
+				"visible": false,
 				"backgroundColor": "#0c1114"
 			}
 		],

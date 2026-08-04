@@ -47,10 +47,18 @@ impl ParsedInvocation {
     #[must_use]
     pub fn kind(&self) -> LaunchKind {
         match self.cli.command.as_ref() {
-            None | Some(Command::Desktop) => LaunchKind::Desktop,
+            None | Some(Command::Desktop(_)) => LaunchKind::Desktop,
             Some(Command::Daemon) => LaunchKind::Daemon,
             Some(_) => LaunchKind::Client,
         }
+    }
+
+    #[must_use]
+    pub fn desktop_background(&self) -> bool {
+        matches!(
+            self.cli.command.as_ref(),
+            Some(Command::Desktop(commands::DesktopArgs { background: true }))
+        )
     }
 
     #[must_use]
@@ -80,7 +88,7 @@ impl ParsedInvocation {
             Some(Command::Transfer { command }) => transfer_command(&paths, command).await,
             Some(Command::Device { command }) => device_command(&paths, command).await,
             Some(Command::Rekey(args)) => rekey_command(&paths, &args),
-            None | Some(Command::Desktop | Command::Daemon) => {
+            None | Some(Command::Desktop(_) | Command::Daemon) => {
                 bail!("invocation is not a client command")
             }
         }
