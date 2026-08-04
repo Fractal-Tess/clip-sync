@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.2.4] - 2026-08-05
+
+### Fixed
+
+- Refresh retained history whenever the persistent desktop window becomes visible or regains focus, so newly copied items appear immediately after opening ClipSync.
+
 ## [0.2.3] - 2026-08-04
 
 ### Changed
@@ -67,7 +73,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Discovery beacons are authenticated with a key derived independently from the mesh secret.
 - Hostname and application metadata remain unavailable until the QUIC mesh handshake succeeds.
 
-[Unreleased]: https://github.com/Fractal-Tess/clip-sync/compare/v0.2.3...HEAD
+[Unreleased]: https://github.com/Fractal-Tess/clip-sync/compare/v0.2.4...HEAD
+[0.2.4]: https://github.com/Fractal-Tess/clip-sync/compare/v0.2.3...v0.2.4
 [0.2.3]: https://github.com/Fractal-Tess/clip-sync/compare/v0.2.2...v0.2.3
 [0.2.2]: https://github.com/Fractal-Tess/clip-sync/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/Fractal-Tess/clip-sync/compare/v0.2.0...v0.2.1

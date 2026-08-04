@@ -57,6 +57,7 @@
 	let active = true;
 	let statusRequest: Promise<Status> | null = null;
 	let resizeTimer: ReturnType<typeof setTimeout> | undefined;
+	let visibleRefreshTimer: ReturnType<typeof setTimeout> | undefined;
 	const connectedToTauri = isTauri();
 	const imageCache = createHistoryImageCache();
 	const pageCache = createHistoryPageCache<HistoryItem>(getHistory);
@@ -355,6 +356,19 @@
 		}
 	}
 
+	function scheduleVisibleRefresh() {
+		if (document.visibilityState !== 'visible') return;
+		if (visibleRefreshTimer) clearTimeout(visibleRefreshTimer);
+		visibleRefreshTimer = setTimeout(() => {
+			visibleRefreshTimer = undefined;
+			if (active) void refresh({ offset: 0, resetPages: true });
+		}, 75);
+	}
+
+	function handleVisibilityChange() {
+		if (document.visibilityState === 'visible') scheduleVisibleRefresh();
+	}
+
 	function handleGlobalKeydown(event: KeyboardEvent) {
 		if (event.key === 'Escape') {
 			event.preventDefault();
@@ -415,6 +429,7 @@
 			observer.disconnect();
 			window.clearInterval(statusTimer);
 			if (resizeTimer) clearTimeout(resizeTimer);
+			if (visibleRefreshTimer) clearTimeout(visibleRefreshTimer);
 		};
 	});
 </script>
@@ -427,7 +442,8 @@
 	/>
 </svelte:head>
 
-<svelte:window onkeydowncapture={handleGlobalKeydown} />
+<svelte:window onfocus={scheduleVisibleRefresh} onkeydowncapture={handleGlobalKeydown} />
+<svelte:document onvisibilitychange={handleVisibilityChange} />
 
 <div class="app-shell">
 	<HistoryHeader {status} loading={statusLoading} {connectedToTauri} />
