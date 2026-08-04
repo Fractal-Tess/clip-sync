@@ -5,6 +5,7 @@ use specta_typescript::{BigIntExportBehavior, Typescript};
 #[cfg(debug_assertions)]
 use std::path::Path;
 use tauri::{Manager, WindowEvent};
+use tauri_plugin_window_state::{AppHandleExt, StateFlags};
 use tauri_specta::{Builder as SpectaBuilder, collect_commands};
 
 #[macro_use]
@@ -58,6 +59,11 @@ pub fn run(config_override: Option<PathBuf>, start_hidden: bool) {
                 show_main_window(app);
             },
         ))
+        .plugin(
+            tauri_plugin_window_state::Builder::default()
+                .with_state_flags(window_state_flags())
+                .build(),
+        )
         .manage(AppState::discover(config_override))
         .invoke_handler(specta.invoke_handler())
         .setup(move |app| {
@@ -71,11 +77,16 @@ pub fn run(config_override: Option<PathBuf>, start_hidden: bool) {
                 && let WindowEvent::CloseRequested { api, .. } = event
             {
                 api.prevent_close();
+                let _ = window.app_handle().save_window_state(window_state_flags());
                 let _ = window.hide();
             }
         })
         .run(tauri::generate_context!())
         .expect("error while running ClipSync");
+}
+
+fn window_state_flags() -> StateFlags {
+    StateFlags::POSITION | StateFlags::SIZE
 }
 
 fn show_main_window(app: &impl Manager<tauri::Wry>) {

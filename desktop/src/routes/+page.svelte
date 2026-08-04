@@ -13,7 +13,6 @@
 		type Status
 	} from '$lib/bridge';
 	import ControlNavigation from '$lib/components/control-navigation.svelte';
-	import HistoryDeleteDialog from '$lib/components/history/history-delete-dialog.svelte';
 	import HistoryFooter from '$lib/components/history/history-footer.svelte';
 	import HistoryHeader from '$lib/components/history/history-header.svelte';
 	import HistoryMessages from '$lib/components/history/history-messages.svelte';
@@ -50,7 +49,6 @@
 	let error = $state<string | null>(null);
 	let notice = $state<string | null>(null);
 	let activating = $state<string | null>(null);
-	let pendingDelete = $state.raw<{ item: HistoryItem; index: number } | null>(null);
 	let selectedIndex = $state(0);
 	let searchInput = $state<HTMLInputElement | null>(null);
 	let historyGrid = $state<HTMLElement | null>(null);
@@ -283,7 +281,6 @@
 			const result = await updateHistory(item.contentId, action);
 			if (!result.ok) throw new Error(result.message || 'History update failed');
 			notice = result.message;
-			pendingDelete = null;
 			await refresh({
 				includeStatus: false,
 				focus: index,
@@ -296,11 +293,6 @@
 		} finally {
 			activating = null;
 		}
-	}
-
-	function confirmPendingDelete() {
-		if (!pendingDelete) return;
-		void mutateHistory(pendingDelete.item, pendingDelete.index, 'delete');
 	}
 
 	function filterHistoryBySource(item: HistoryItem) {
@@ -483,7 +475,7 @@
 			}}
 			onActivate={(item, index) => void activate(item, index)}
 			onPin={(item, index) => void mutateHistory(item, index, item.pinned ? 'unpin' : 'pin')}
-			onDelete={(item, index) => (pendingDelete = { item, index })}
+			onDelete={(item, index) => void mutateHistory(item, index, 'delete')}
 			onFilterSource={filterHistoryBySource}
 			onNavigate={handleHistoryNavigation}
 			onRequestImage={imageCache.request}
@@ -495,14 +487,6 @@
 				<ControlCenter {section} />
 			{/key}
 		</div>
-	{/if}
-	{#if pendingDelete}
-		<HistoryDeleteDialog
-			item={pendingDelete.item}
-			busy={activating === pendingDelete.item.contentId}
-			onCancel={() => (pendingDelete = null)}
-			onConfirm={confirmPendingDelete}
-		/>
 	{/if}
 	<HistoryFooter
 		{currentPage}

@@ -10,7 +10,7 @@ members = [
 default-members = ["desktop/src-tauri"]
 
 [workspace.package]
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 rust-version = "1.97"
 description = "A masterless, encrypted clipboard-history mesh"
@@ -53,6 +53,7 @@ subtle = "2.6.1"
 tauri = "2.11.3"
 tauri-build = "2.6.3"
 tauri-plugin-single-instance = "2.4.3"
+tauri-plugin-window-state = "2.4.1"
 tauri-specta = { version = "=2.0.0-rc.21", features = ["derive", "typescript"] }
 tempfile = "3.27.0"
 thiserror = "2.0.19"

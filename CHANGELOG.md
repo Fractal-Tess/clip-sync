@@ -6,6 +6,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-08-04
+
+### Changed
+
+- History items are deleted immediately from their context-menu action without a confirmation dialog.
+
+### Fixed
+
+- Floating desktop-window position and size are persisted when the window hides and across restarts.
+
 ## [0.2.1] - 2026-08-04
 
 ### Added
@@ -51,6 +61,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Discovery beacons are authenticated with a key derived independently from the mesh secret.
 - Hostname and application metadata remain unavailable until the QUIC mesh handshake succeeds.
 
-[Unreleased]: https://github.com/Fractal-Tess/clip-sync/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/Fractal-Tess/clip-sync/compare/v0.2.2...HEAD
+[0.2.2]: https://github.com/Fractal-Tess/clip-sync/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/Fractal-Tess/clip-sync/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/Fractal-Tess/clip-sync/releases/tag/v0.2.0
