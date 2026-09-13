@@ -1,0 +1,34 @@
+[package]
+name = "clip-sync-desktop"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "ClipSync clipboard picker and application host"
+repository.workspace = true
+license.workspace = true
+authors.workspace = true
+autobins = false
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow.workspace = true
+bytemuck.workspace = true
+clip-sync-cli = { path = "../cli" }
+clip-sync-core = { path = "../core" }
+clip-sync-daemon = { path = "../daemon" }
+clip-sync-ipc = { path = "../ipc" }
+egui.workspace = true
+egui-winit.workspace = true
+egui_software_backend.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+softbuffer.workspace = true
+tokio.workspace = true
+tracing-subscriber.workspace = true
+winit.workspace = true
+
+[[bin]]
+name = "clip-sync"
+path = "src/main.rs"

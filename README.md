@@ -35,15 +35,13 @@ The Rust workspace has five crates with a single lockfile and a strict authority
 - `clip-sync-ipc` is an independent leaf containing the versioned Protobuf wire contract, bounded framing, and Unix-socket client.
 - `clip-sync-daemon` owns discovery, mesh and history orchestration, daemon state, and the IPC server.
 - `clip-sync-cli` owns parsing and client/offline command execution without starting a daemon or owning a runtime.
-- `clip-sync` is the Tauri package and sole application host, producing the only executable.
+- `clip-sync-desktop` is the application host, producing the only executable. It renders the picker and control centre with egui on a CPU rasterizer, so the window has no browser engine or GPU dependency.
 
-The daemon is the sole owner of clipboard access, encrypted storage, retention, transfer state, and mesh networking. The CLI and Tauri desktop communicate with it through an owner-only Unix socket using protocol-v6 Protobuf IPC. They never open storage or mesh state directly, and neither client automatically starts the daemon.
+The daemon is the sole owner of clipboard access, encrypted storage, retention, transfer state, and mesh networking. The CLI and desktop window communicate with it through an owner-only Unix socket using protocol-v6 Protobuf IPC. They never open storage or mesh state directly, and neither client automatically starts the daemon.
 
 ClipSync sends small HMAC-authenticated UDP multicast beacons on each configured interface. Interfaces that cannot route multicast, including many point-to-point tunnels, fall back to rate-limited authenticated unicast probe windows with a hard per-cycle bound. A valid beacon exposes only the sender address and QUIC port; host and application metadata are exchanged only after the existing mesh-secret-authenticated QUIC handshake succeeds. QUIC listeners bind only to addresses on the selected interfaces, and the Peers view reports only live authenticated connections.
 
-`desktop/` contains the Tauri 2, SvelteKit 2, Svelte 5, Tailwind CSS 4, and shadcn-svelte control window. Rust command signatures generate its TypeScript IPC bindings through Specta.
-
-The desktop history client requests viewport-sized daemon pages, caches the current page plus two pages on each side, and preloads bounded image previews for that window. The preview cache is limited by entry count, memory, and request concurrency.
+`crates/desktop` contains both windows. The picker is the default view; `F1` swaps to the control centre, which carries the status, peers, transfers, diagnostics, and settings tabs. Image previews are fetched only after the grid is on screen, so decoding never delays the first frame.
 
 ## Commands
 
@@ -79,42 +77,33 @@ clip-sync history search 'before:1785326400000'
 
 ## Desktop development
 
-Enter the development shell before building either desktop host. It provides Rust, Bun, WebKitGTK, Wayland, GTK, and the other native dependencies.
+Enter the development shell before building the desktop host. It provides Rust, Wayland, and xkbcommon; there is no browser engine or Node toolchain to install.
 
 ```console
 nix develop
-
-# Browser-only UI with clearly labeled, non-sensitive sample data
-cd desktop
-bun install --frozen-lockfile
-bun run dev
-
-# Tauri window connected to the running daemon
-bun run tauri dev
+cargo run --bin clip-sync              # picker
+cargo run --bin clip-sync -- desktop --control
 ```
 
-The Tauri script currently runs through XWayland and disables WebKitGTK compositing and DMA-BUF rendering to avoid WebKitGTK/Hyprland rendering failures. The Nix shell and packaged wrapper also expose the GTK/GSettings schema paths required by WebKitGTK. Its production window defaults to `760×520` and supports a `480×300` minimum.
+winit and softbuffer `dlopen` Wayland and xkbcommon, so both must be on `LD_LIBRARY_PATH`. The shell and the packaged wrapper set it.
 
-Tauri history shortcuts:
+Picker shortcuts:
 
-- Arrow keys or `H/J/K/L`: move through the history grid.
-- Left/right at a column boundary: move to the corresponding row on the adjacent page.
-- `Page Up` / `Page Down`: change pages.
-- `/`: focus search.
+- Arrow keys: move through the history grid.
 - `Enter`: activate the selected record and close the window.
-- `R`: refresh history.
-- `Escape`: close the window from any focused control.
-- Right-click a record: activate, pin/unpin, filter by source, or confirm mesh-wide deletion.
+- `Ctrl+P` / `Ctrl+D`: pin or delete the selected record.
+- Typing filters; `Escape` closes the window.
+- `F1`: swap to the control centre, where `Ctrl+Tab` cycles tabs and `Escape` returns.
 
 ## Development
 
 ```console
 nix develop
-cargo run -p clip-sync --bin clip-sync -- config init
-cargo run -p clip-sync --bin clip-sync -- doctor
-cargo run -p clip-sync --bin clip-sync -- daemon
+cargo run -p clip-sync-desktop --bin clip-sync -- config init
+cargo run -p clip-sync-desktop --bin clip-sync -- doctor
+cargo run -p clip-sync-desktop --bin clip-sync -- daemon
 # In another shell:
-cargo run -p clip-sync --bin clip-sync -- status --json
+cargo run -p clip-sync-desktop --bin clip-sync -- status --json
 ```
 
 Run the local checks before submitting changes:
@@ -124,21 +113,13 @@ cargo fmt --all -- --check
 cargo check --workspace --all-targets --all-features --locked
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 cargo test --workspace --all-targets --all-features --locked
-cargo build -p clip-sync --bin clip-sync --locked
+cargo build -p clip-sync-desktop --bin clip-sync --locked
 cargo audit
 cargo deny check
 nix flake check
-
-cd desktop
-bun install --frozen-lockfile
-bun run check
-bun run lint
-bun run test
-bun run build
-bun run tauri build
 ```
 
-GitHub Actions runs the frontend and Rust validation suite on pushes and pull requests. Stable SemVer tags build and publish the unified x86_64 Linux executable, its SHA-256 checksum, release notes from `CHANGELOG.md`, and a Nix release-artifact manifest. Live Wayland and multi-device validation remains manual against isolated test state.
+GitHub Actions runs the Rust validation suite on pushes and pull requests. Stable SemVer tags build and publish the unified x86_64 Linux executable, its SHA-256 checksum, release notes from `CHANGELOG.md`, and a Nix release-artifact manifest. Live Wayland and multi-device validation remains manual against isolated test state.
 
 ### Development principles
 
@@ -155,14 +136,14 @@ Focused contributions are welcome. Discuss large changes before implementation, 
 
 ## Tagged releases
 
-Releases use stable SemVer tags such as `v0.2.0`. Before tagging, update the workspace, frontend, and Tauri versions together and add a matching section to `CHANGELOG.md`.
+Releases use stable SemVer tags such as `v0.2.0`. Before tagging, update the workspace version and add a matching section to `CHANGELOG.md`.
 
 ```console
 git tag -s v0.2.0
 git push origin v0.2.0
 ```
 
-The release workflow validates the tag against every version source and publishes `clip-sync-v0.2.0-x86_64-linux.tar.gz`, a checksum, and `nix-release-artifacts.json`. After the release succeeds, manually replace `nix/release-artifacts.json` in the default branch with the generated release asset and commit it. That fixed-output hash enables the prebuilt Nix package without trusting a mutable download.
+The release workflow validates the tag against the workspace version and publishes `clip-sync-v0.2.0-x86_64-linux.tar.gz`, a checksum, and `nix-release-artifacts.json`. After the release succeeds, manually replace `nix/release-artifacts.json` in the default branch with the generated release asset and commit it. That fixed-output hash enables the prebuilt Nix package without trusting a mutable download.
 
 ## NixOS deployment
 

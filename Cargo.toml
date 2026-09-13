@@ -5,12 +5,12 @@ members = [
     "crates/ipc",
     "crates/daemon",
     "crates/cli",
-    "desktop/src-tauri",
+    "crates/desktop",
 ]
-default-members = ["desktop/src-tauri"]
+default-members = ["crates/desktop"]
 
 [workspace.package]
-version = "0.2.4"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.97"
 description = "A masterless, encrypted clipboard-history mesh"
@@ -22,10 +22,16 @@ authors = ["Fractal-Tess"]
 anyhow = "1.0.104"
 async-trait = "0.1.91"
 blake3 = "1.8.5"
+bytemuck = "1.24.0"
 bytes = "1.12.1"
 chacha20poly1305 = "0.11.0"
 clap = { version = "4.6.4", features = ["derive"] }
 directories = "6.0.0"
+egui = "0.34"
+# The daemon owns the clipboard and the picker opens no links, so egui's own
+# clipboard and browser integrations are left out.
+egui-winit = { version = "0.34", default-features = false, features = ["wayland", "x11"] }
+egui_software_backend = "0.0.3"
 fs2 = "0.4.3"
 futures-util = { version = "0.3.33", features = ["sink"] }
 getrandom = "0.4.3"
@@ -47,14 +53,8 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 sha2 = "0.11.0"
 socket2 = { version = "0.6.3", features = ["all"] }
-specta = "=2.0.0-rc.22"
-specta-typescript = "=0.0.9"
+softbuffer = "0.4.8"
 subtle = "2.6.1"
-tauri = "2.11.3"
-tauri-build = "2.6.3"
-tauri-plugin-single-instance = "2.4.3"
-tauri-plugin-window-state = "2.4.1"
-tauri-specta = { version = "=2.0.0-rc.21", features = ["derive", "typescript"] }
 tempfile = "3.27.0"
 thiserror = "2.0.19"
 time = { version = "0.3.54", features = ["parsing"] }
@@ -68,6 +68,7 @@ uuid = { version = "1.24.0", features = ["v4", "serde"] }
 wayland-client = "0.31.15"
 wayland-protocols = { version = "0.32.13", features = ["client", "staging"] }
 wayland-protocols-wlr = { version = "0.3.12", features = ["client"] }
+winit = "0.30.13"
 zeroize = { version = "1.9.0", features = ["derive"] }
 
 [workspace.lints.rust]

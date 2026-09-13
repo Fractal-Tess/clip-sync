@@ -53,11 +53,13 @@ impl ParsedInvocation {
         }
     }
 
+    /// Whether the window should open on the control centre rather than the
+    /// picker.
     #[must_use]
-    pub fn desktop_background(&self) -> bool {
+    pub fn desktop_control(&self) -> bool {
         matches!(
             self.cli.command.as_ref(),
-            Some(Command::Desktop(commands::DesktopArgs { background: true }))
+            Some(Command::Desktop(commands::DesktopArgs { control: true }))
         )
     }
 

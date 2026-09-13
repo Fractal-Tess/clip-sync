@@ -6,6 +6,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-09-13
+
+### Changed
+
+- Replaced the Tauri/SvelteKit desktop window with a native egui window rendered on a CPU rasterizer. The picker reaches first pixel in roughly 30 ms instead of waiting on a browser engine, and the package no longer depends on WebKitGTK, GTK3, libsoup, or a Node toolchain.
+- The control centre is now a second view inside the same window, reached with `F1` and left with `Escape`. `clip-sync desktop --control` opens it directly.
+
+### Removed
+
+- The prewarmed desktop process, its systemd user unit, and the `services.clip-sync.prewarmDesktop` option. Launch is fast enough that keeping a process resident no longer pays for itself.
+- `clip-sync desktop --background`, which existed only to feed the prewarm unit.
+
 ## [0.2.4] - 2026-08-05
 
 ### Fixed
@@ -73,7 +85,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Discovery beacons are authenticated with a key derived independently from the mesh secret.
 - Hostname and application metadata remain unavailable until the QUIC mesh handshake succeeds.
 
-[Unreleased]: https://github.com/Fractal-Tess/clip-sync/compare/v0.2.4...HEAD
+[Unreleased]: https://github.com/Fractal-Tess/clip-sync/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/Fractal-Tess/clip-sync/compare/v0.2.4...v0.3.0
 [0.2.4]: https://github.com/Fractal-Tess/clip-sync/compare/v0.2.3...v0.2.4
 [0.2.3]: https://github.com/Fractal-Tess/clip-sync/compare/v0.2.2...v0.2.3
 [0.2.2]: https://github.com/Fractal-Tess/clip-sync/compare/v0.2.1...v0.2.2

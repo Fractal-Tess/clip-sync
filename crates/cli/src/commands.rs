@@ -14,7 +14,7 @@ pub(super) struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub(super) enum Command {
-    /// Launch the desktop control window.
+    /// Launch the clipboard picker window.
     Desktop(DesktopArgs),
     /// Run the background daemon in the foreground.
     Daemon,
@@ -52,9 +52,9 @@ pub(super) enum Command {
 
 #[derive(Debug, Clone, Copy, Args)]
 pub(super) struct DesktopArgs {
-    /// Keep the desktop process warm without initially showing its window.
-    #[arg(long, hide = true)]
-    pub(super) background: bool,
+    /// Open the control centre instead of the clipboard picker.
+    #[arg(long)]
+    pub(super) control: bool,
 }
 
 #[derive(Debug, Clone, Copy, Args)]
