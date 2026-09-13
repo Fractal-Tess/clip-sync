@@ -256,24 +256,75 @@
 	background: #0a1418;
 }
 
-.search-heading h1,
-.search-heading span {
-	margin: 0;
+.filter-controls {
+	display: flex;
+	align-items: center;
+	gap: 0.4rem;
+	min-width: 0;
 }
 
-.search-heading h1 {
-	font-size: 0.76rem;
-	font-weight: 670;
-	letter-spacing: -0.015em;
+.filter-trigger[data-slot='dropdown-menu-trigger'] {
+	display: inline-flex;
+	align-items: center;
+	gap: 0.38rem;
+	height: 2rem;
+	min-width: 0;
+	max-width: 9rem;
+	border: 1px solid var(--input);
+	border-radius: 2px;
+	padding: 0 0.52rem;
+	background: #081216;
+	color: var(--foreground);
+	font-size: 0.65rem;
+	white-space: nowrap;
+	transition:
+		border-color 150ms ease,
+		background 150ms ease;
 }
 
-.search-heading span {
-	display: block;
-	margin-top: 0.18rem;
+.filter-trigger[data-slot='dropdown-menu-trigger']:hover,
+.filter-trigger[data-slot='dropdown-menu-trigger'][aria-expanded='true'] {
+	border-color: color-mix(in srgb, var(--primary) 62%, var(--input));
+	background: var(--accent);
+}
+
+.filter-trigger[data-slot='dropdown-menu-trigger']:focus-visible {
+	border-color: var(--primary);
+	outline: 2px solid color-mix(in srgb, var(--ring) 35%, transparent);
+	outline-offset: 1px;
+}
+
+.filter-trigger > span {
+	overflow: hidden;
+	text-overflow: ellipsis;
+}
+
+.filter-trigger svg {
+	width: 0.78rem;
+	height: 0.78rem;
+	flex: none;
 	color: var(--muted-foreground);
-	font-size: 0.56rem;
-	font-variation-settings: 'MONO' 1;
-	letter-spacing: 0.03em;
+}
+
+.filter-trigger .filter-chevron {
+	width: 0.68rem;
+	height: 0.68rem;
+	margin-left: auto;
+}
+
+.filter-menu[data-slot='dropdown-menu-content'] {
+	min-width: 10.5rem;
+	border-radius: 3px;
+	font-size: 0.68rem;
+}
+
+.clear-filters[data-slot='button'] {
+	border-radius: 2px;
+	color: var(--muted-foreground);
+}
+
+.clear-filters[data-slot='button']:hover {
+	color: var(--foreground);
 }
 
 .search-form {
@@ -1234,10 +1285,6 @@
 		grid-template-columns: 1fr;
 	}
 
-	.search-heading {
-		display: none;
-	}
-
 	.control-navigation-button[data-slot='button'] {
 		padding-inline: 0.58rem;
 		font-size: 0.56rem;
@@ -1308,7 +1355,7 @@
 		padding: 0.35rem 0.5rem;
 	}
 
-	.search-heading,
+	.filter-controls,
 	.preview-banner {
 		display: none;
 	}

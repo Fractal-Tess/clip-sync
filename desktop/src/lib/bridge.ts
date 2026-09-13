@@ -89,19 +89,34 @@ export async function getStatus() {
 export async function getHistory(query: string, offset: number, limit: number) {
 	if (isTauri()) return unwrap(await commands.getHistory(query, offset, limit));
 	const normalized = query.trim().toLowerCase();
-	const deviceFilter = normalized.match(/^(?:d|device):"((?:\\.|[^"])*)"$/);
+	const deviceFilter = normalized.match(/(?:^|\s)(?:d|device):"((?:\\.|[^"])*)"/);
 	const requestedDevice = deviceFilter?.[1]?.replaceAll(/\\(["\\])/g, '$1');
+	const typeFilter = normalized.match(/(?:^|\s)(?:t|type):([^\s]+)/)?.[1];
+	const searchTerm = normalized
+		.replace(/(?:^|\s)(?:d|device):"(?:\\.|[^"])*"/, ' ')
+		.replace(/(?:^|\s)(?:t|type):[^\s]+/, ' ')
+		.trim();
 	const matches = sampleHistory.filter((item) => {
-		if (requestedDevice !== undefined) {
-			return [item.sourceDevice, item.sourceNode].some(
-				(source) => source?.toLowerCase() === requestedDevice
+		const sourceMatches =
+			requestedDevice === undefined ||
+			[item.sourceDevice, item.sourceNode].some((source) =>
+				source?.toLowerCase().includes(requestedDevice)
 			);
-		}
-		return normalized
-			? `${item.preview} ${item.sourceDevice} ${item.sourceNode} ${item.mimeTypes.join(' ')}`
-					.toLowerCase()
-					.includes(normalized)
-			: true;
+		const typeMatches =
+			typeFilter === undefined ||
+			item.mimeTypes.some((mimeType) => {
+				const mime = mimeType.toLowerCase();
+				if (typeFilter === 'file') return mime === 'text/uri-list';
+				if (typeFilter === 'text') return mime.startsWith('text/');
+				if (typeFilter === 'image') return mime.startsWith('image/');
+				return mime.includes(typeFilter);
+			});
+		const textMatches =
+			!searchTerm ||
+			`${item.preview} ${item.sourceDevice} ${item.sourceNode} ${item.mimeTypes.join(' ')}`
+				.toLowerCase()
+				.includes(searchTerm);
+		return sourceMatches && typeMatches && textMatches;
 	});
 	const start = Math.max(0, Math.trunc(offset));
 	const pageSize = Math.max(1, Math.trunc(limit));
@@ -260,4 +275,9 @@ export async function activateHistory(contentId: string) {
 
 export async function closeAppWindow() {
 	if (isTauri()) await getCurrentWindow().close();
+}
+
+export async function onAppWindowCloseRequested(handler: () => void) {
+	if (!isTauri()) return () => {};
+	return getCurrentWindow().onCloseRequested(handler);
 }

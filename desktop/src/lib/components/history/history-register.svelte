@@ -36,7 +36,7 @@
 		pageSize,
 		columns,
 		rows,
-		query,
+		hasFilters,
 		activating,
 		selectedIndex = $bindable(),
 		historyGrid = $bindable(null),
@@ -58,7 +58,7 @@
 		pageSize: number;
 		columns: number;
 		rows: number;
-		query: string;
+		hasFilters: boolean;
 		activating: string | null;
 		selectedIndex: number;
 		historyGrid: HTMLElement | null;
@@ -126,15 +126,15 @@
 			<Empty class="empty-register">
 				<EmptyMedia><Clipboard aria-hidden="true" /></EmptyMedia>
 				<EmptyHeader>
-					<EmptyTitle>{query.trim() ? 'No matching records' : 'No retained records'}</EmptyTitle>
+					<EmptyTitle>{hasFilters ? 'No matching records' : 'No retained records'}</EmptyTitle>
 					<EmptyDescription>
-						{query.trim()
-							? 'Clear or revise the search, or copy something on a connected device.'
+						{hasFilters
+							? 'Clear or revise the filters, or copy something on a connected device.'
 							: 'Copy something on this or a connected device to add it to retained history.'}
 					</EmptyDescription>
 				</EmptyHeader>
-				{#if query.trim()}
-					<Button variant="outline" size="sm" onclick={onClearSearch}>Clear search</Button>
+				{#if hasFilters}
+					<Button variant="outline" size="sm" onclick={onClearSearch}>Clear filters</Button>
 				{/if}
 			</Empty>
 		{:else if historyLoaded}

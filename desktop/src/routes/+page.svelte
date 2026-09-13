@@ -7,6 +7,7 @@
 		getHistory,
 		getStatus,
 		isTauri,
+		onAppWindowCloseRequested,
 		updateHistory,
 		type HistoryItem,
 		type HistoryUpdate,
@@ -42,6 +43,9 @@
 	let historyColumnCount = $state(DEFAULT_HISTORY_COLUMNS);
 	let historyRowCount = $state(DEFAULT_HISTORY_ROWS);
 	let query = $state('');
+	let contentType = $state('all');
+	let source = $state('all');
+	let knownSources = $state.raw<string[]>([]);
 	let loading = $state(true);
 	let statusLoading = $state(true);
 	let refreshing = $state(false);
@@ -65,6 +69,16 @@
 		controlSections.find((destination) => destination.id === section)?.label ?? 'History'
 	);
 	const pageSize = $derived(historyColumnCount * historyRowCount);
+	const effectiveQuery = $derived.by(() => {
+		const filters = [query.trim()];
+		if (contentType !== 'all') filters.push(`type:${contentType}`);
+		if (source !== 'all') {
+			const escapedSource = source.replaceAll('\\', '\\\\').replaceAll('"', '\\"');
+			filters.push(`device:"${escapedSource}"`);
+		}
+		return filters.filter(Boolean).join(' ');
+	});
+	const hasFilters = $derived(Boolean(effectiveQuery));
 	const currentPage = $derived(historyPageForOffset(historyOffset, pageSize));
 	const pageCount = $derived(historyPageCount(totalHistory, pageSize));
 	const rangeStart = $derived(history.length === 0 ? 0 : historyOffset + 1);
@@ -74,17 +88,35 @@
 		return cause instanceof Error ? cause.message : String(cause);
 	}
 
-	function focusHistory(index = selectedIndex) {
+	function selectHistory(index = selectedIndex, focusGrid = true) {
 		if (history.length === 0) return;
 		const nextIndex = Math.min(Math.max(index, 0), history.length - 1);
 		selectedIndex = nextIndex;
 		const historyButton =
 			historyGrid?.querySelectorAll<HTMLButtonElement>('.history-cell')[nextIndex];
-		historyButton?.focus({ preventScroll: true });
+		if (focusGrid) historyButton?.focus({ preventScroll: true });
 		historyButton?.scrollIntoView({
 			block: 'nearest',
 			behavior: window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth'
 		});
+	}
+
+	function focusSearch() {
+		if (section !== 'history') return;
+		requestAnimationFrame(() => searchInput?.focus({ preventScroll: true }));
+	}
+
+	function resetFilters() {
+		query = '';
+		contentType = 'all';
+		source = 'all';
+		notice = null;
+		pageCache.reset();
+	}
+
+	function closeHistoryWindow() {
+		resetFilters();
+		void closeAppWindow();
 	}
 
 	function requestStatus() {
@@ -114,6 +146,12 @@
 	) {
 		history = pageData.items;
 		totalHistory = pageData.total;
+		knownSources = [
+			...new Set([
+				...knownSources,
+				...pageData.items.map((item) => item.sourceDevice || item.sourceNode).filter(Boolean)
+			])
+		].sort((left, right) => left.localeCompare(right));
 		historyOffset = page * pageSize;
 		selectedIndex =
 			history.length === 0
@@ -129,10 +167,10 @@
 		imageCache.beginPage(generation);
 	}
 
-	async function focusRequestedHistory(focus: HistoryPageFocus | null) {
+	async function focusRequestedHistory(focus: HistoryPageFocus | null, focusGrid: boolean) {
 		if (focus === null || history.length === 0) return;
 		await tick();
-		focusHistory(selectedIndex);
+		selectHistory(selectedIndex, focusGrid);
 	}
 
 	function prefetchCachedWindowImages(centerPage: number, generation: number) {
@@ -156,18 +194,20 @@
 		includeStatus = true,
 		focus = null,
 		forcePage = true,
-		resetPages = false
+		resetPages = false,
+		focusGrid = true
 	}: {
 		offset?: number;
 		includeStatus?: boolean;
 		focus?: HistoryPageFocus | null;
 		forcePage?: boolean;
 		resetPages?: boolean;
+		focusGrid?: boolean;
 	} = {}) {
 		const generation = ++refreshGeneration;
 		const requestedPageSize = pageSize;
 		const requestedPage = historyPageForOffset(offset, requestedPageSize);
-		pageCache.configure(query, requestedPageSize);
+		pageCache.configure(effectiveQuery, requestedPageSize);
 		if (resetPages) pageCache.reset();
 		pageCache.prepare(requestedPage, Math.max(totalHistory, offset + requestedPageSize));
 		const requestedPageIsCached = pageCache.read(requestedPage) !== null;
@@ -225,10 +265,10 @@
 		error = failures.length > 0 ? failures.join(' ') : null;
 		loading = false;
 		refreshing = false;
-		await focusRequestedHistory(focus);
+		await focusRequestedHistory(focus, focusGrid);
 	}
 
-	async function goToPage(page: number, focus: HistoryPageFocus | null = null) {
+	async function goToPage(page: number, focus: HistoryPageFocus | null = null, focusGrid = true) {
 		if (totalHistory === 0) return;
 		const offset = historyPageOffset(page, totalHistory, pageSize);
 		if (offset === historyOffset) return;
@@ -236,7 +276,7 @@
 		pageCache.prepare(boundedPage, totalHistory);
 		const cached = pageCache.read(boundedPage);
 		if (!cached) {
-			await refresh({ offset, includeStatus: false, focus, forcePage: false });
+			await refresh({ offset, includeStatus: false, focus, forcePage: false, focusGrid });
 			return;
 		}
 
@@ -246,7 +286,7 @@
 		error = null;
 		applyHistoryPage(boundedPage, cached, focus, generation);
 		prefetchCachedWindowImages(boundedPage, generation);
-		await focusRequestedHistory(focus);
+		await focusRequestedHistory(focus, focusGrid);
 		warmHistoryWindow(boundedPage, cached.total, generation);
 	}
 
@@ -290,19 +330,35 @@
 		} catch (cause) {
 			error = errorMessage(cause);
 			await tick();
-			focusHistory(index);
+			selectHistory(index);
 		} finally {
 			activating = null;
 		}
 	}
 
 	function filterHistoryBySource(item: HistoryItem) {
-		const source = item.sourceDevice || item.sourceNode;
-		if (!source) return;
-		const escapedSource = source.replaceAll('\\', '\\\\').replaceAll('"', '\\"');
-		query = `device:"${escapedSource}"`;
+		const itemSource = item.sourceDevice || item.sourceNode;
+		if (!itemSource) return;
+		source = itemSource;
 		notice = null;
 		void refresh({ offset: 0, resetPages: true });
+	}
+
+	function changeContentType(nextContentType: string) {
+		contentType = nextContentType;
+		notice = null;
+		void refresh({ offset: 0, resetPages: true });
+	}
+
+	function changeSource(nextSource: string) {
+		source = nextSource;
+		notice = null;
+		void refresh({ offset: 0, resetPages: true });
+	}
+
+	function clearAllFilters() {
+		resetFilters();
+		void refresh({ offset: 0 });
 	}
 
 	async function activate(item: HistoryItem, index: number) {
@@ -314,22 +370,26 @@
 			const result = await activateHistory(item.contentId);
 			if (!result.ok) throw new Error(result.message || 'Clipboard activation failed');
 			notice = result.message;
+			resetFilters();
 			if (connectedToTauri) {
 				await closeAppWindow();
 				windowClosed = true;
+			} else {
+				await refresh({ offset: 0 });
+				focusSearch();
 			}
 		} catch (cause) {
 			error = errorMessage(cause);
 		} finally {
 			activating = null;
-			if (!windowClosed) {
+			if (!windowClosed && error) {
 				await tick();
-				focusHistory(index);
+				selectHistory(index);
 			}
 		}
 	}
 
-	function handleHistoryNavigation(event: KeyboardEvent, index = selectedIndex) {
+	function handleHistoryNavigation(event: KeyboardEvent, index = selectedIndex, focusGrid = true) {
 		const action = historyNavigationAction(
 			event.key,
 			index,
@@ -342,22 +402,22 @@
 
 		event.preventDefault();
 		if (action.type === 'page') {
-			void goToPage(action.page, action.focus);
+			void goToPage(action.page, action.focus, focusGrid);
 		} else {
-			focusHistory(action.index);
+			selectHistory(action.index, focusGrid);
 		}
 		return true;
 	}
 
 	function handleSearchKeydown(event: KeyboardEvent) {
-		if (event.key === 'ArrowDown' && history.length > 0) {
-			event.preventDefault();
-			focusHistory();
+		if (event.key.startsWith('Arrow') && history.length > 0) {
+			handleHistoryNavigation(event, selectedIndex, false);
 		}
 	}
 
 	function scheduleVisibleRefresh() {
 		if (document.visibilityState !== 'visible') return;
+		focusSearch();
 		if (visibleRefreshTimer) clearTimeout(visibleRefreshTimer);
 		visibleRefreshTimer = setTimeout(() => {
 			visibleRefreshTimer = undefined;
@@ -372,7 +432,7 @@
 	function handleGlobalKeydown(event: KeyboardEvent) {
 		if (event.key === 'Escape') {
 			event.preventDefault();
-			void closeAppWindow();
+			closeHistoryWindow();
 			return;
 		}
 		if (event.defaultPrevented || event.altKey || event.ctrlKey || event.metaKey) return;
@@ -382,6 +442,12 @@
 			target instanceof HTMLTextAreaElement ||
 			(target instanceof HTMLElement && target.isContentEditable);
 		if (isTyping) return;
+		if (
+			target instanceof HTMLElement &&
+			target.closest('.filter-trigger, [data-slot="dropdown-menu-content"]')
+		) {
+			return;
+		}
 
 		if (section !== 'history') return;
 
@@ -419,6 +485,12 @@
 		});
 		if (historyWorkspace) observer.observe(historyWorkspace);
 		void refresh({ offset: 0 });
+		focusSearch();
+		let unlistenCloseRequested: (() => void) | undefined;
+		void onAppWindowCloseRequested(resetFilters).then((unlisten) => {
+			if (active) unlistenCloseRequested = unlisten;
+			else unlisten();
+		});
 		const statusTimer = window.setInterval(() => {
 			if (document.visibilityState === 'visible') void refreshStatus();
 		}, 5_000);
@@ -427,6 +499,7 @@
 			active = false;
 			refreshGeneration += 1;
 			observer.disconnect();
+			unlistenCloseRequested?.();
 			window.clearInterval(statusTimer);
 			if (resizeTimer) clearTimeout(resizeTimer);
 			if (visibleRefreshTimer) clearTimeout(visibleRefreshTimer);
@@ -456,12 +529,19 @@
 			total={totalHistory}
 			{rangeStart}
 			{rangeEnd}
+			{contentType}
+			{source}
+			sources={knownSources}
+			{hasFilters}
 			{refreshing}
 			onSearch={() => {
 				notice = null;
 				void refresh({ offset: 0, resetPages: true });
 			}}
 			onKeydown={handleSearchKeydown}
+			onContentTypeChange={changeContentType}
+			onSourceChange={changeSource}
+			onClearFilters={clearAllFilters}
 		/>
 		<HistoryMessages
 			{connectedToTauri}
@@ -482,13 +562,9 @@
 			{pageSize}
 			columns={historyColumnCount}
 			rows={historyRowCount}
-			{query}
+			{hasFilters}
 			{activating}
-			onClearSearch={() => {
-				query = '';
-				notice = null;
-				void refresh({ offset: 0 });
-			}}
+			onClearSearch={clearAllFilters}
 			onActivate={(item, index) => void activate(item, index)}
 			onPin={(item, index) => void mutateHistory(item, index, item.pinned ? 'unpin' : 'pin')}
 			onDelete={(item, index) => void mutateHistory(item, index, 'delete')}
