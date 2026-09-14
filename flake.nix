@@ -102,20 +102,48 @@
     {
       packages = forAllSystems (system: {
         default = packageFor system;
+        clip-sync = packageFor system;
         source = sourcePackageFor system;
       });
+
+      apps = forAllSystems (
+        system:
+        let
+          package = packageFor system;
+        in
+        {
+          default = {
+            type = "app";
+            program = "${package}/bin/clip-sync";
+            meta.description = "Encrypted clipboard history and synchronization";
+          };
+        }
+      );
 
       checks = forAllSystems (system: {
         package = self.packages.${system}.default;
         source = self.packages.${system}.source;
       });
 
-      nixosModules.default =
-        { pkgs, lib, ... }:
-        {
-          imports = [ ./nix/module.nix ];
-          services.clip-sync.package = lib.mkDefault self.packages.${pkgs.system}.default;
-        };
+      nixosModules = rec {
+        clip-sync =
+          { pkgs, lib, ... }:
+          {
+            imports = [ ./nix/module.nix ];
+            services.clip-sync.package = lib.mkDefault self.packages.${pkgs.system}.clip-sync;
+          };
+        default = clip-sync;
+      };
+
+      homeManagerModules = rec {
+        clip-sync =
+          { pkgs, lib, ... }:
+          {
+            imports = [ ./nix/home-manager-module.nix ];
+            services.clip-sync.package = lib.mkDefault self.packages.${pkgs.system}.clip-sync;
+          };
+        default = clip-sync;
+      };
 
       devShells = forAllSystems (
         system:

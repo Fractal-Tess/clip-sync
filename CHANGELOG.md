@@ -6,10 +6,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+
 ### Added
 
 - History cards show the entry's size and how long ago it was copied.
 - `Ctrl+A` selects the whole search query, so the next keystroke replaces it and `Backspace` clears it.
+- Added `packages.<system>.clip-sync`, `apps.<system>.default`, and a Home Manager module for the per-user `services.clip-sync` service.
+  The NixOS and Home Manager service modules share their option definitions.
+  `environment` replaces `extraEnvironment`, and `autoStart = false` retains a
+  manually startable unit without adding session-target startup edges.
 
 ### Changed
 

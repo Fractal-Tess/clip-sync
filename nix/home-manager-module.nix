@@ -14,20 +14,26 @@ in
   options.services.clip-sync = import ./options.nix { inherit lib; };
 
   config = lib.mkIf cfg.enable {
-    environment.systemPackages = [ cfg.package ];
+    home.packages = [ cfg.package ];
 
     systemd.user.services.clip-sync = {
-      description = "Masterless encrypted clipboard-history mesh";
-      documentation = [ "https://github.com/Fractal-Tess/clip-sync" ];
-      after = [ "graphical-session-pre.target" ];
-      partOf = [ "graphical-session.target" ];
-      wantedBy = lib.optionals cfg.autoStart cfg.wantedBy;
-      environment = cfg.environment;
-      path = [
-        pkgs.iproute2
-      ];
+      Unit = {
+        Description = "Masterless encrypted clipboard-history mesh";
+        Documentation = [ "https://github.com/Fractal-Tess/clip-sync" ];
+        After = [ "graphical-session-pre.target" ];
+        PartOf = [ "graphical-session.target" ];
+      };
+      Install.WantedBy = lib.optionals cfg.autoStart cfg.wantedBy;
 
-      serviceConfig = {
+      Service = {
+        Environment = lib.mapAttrsToList (name: value: "${name}=${value}") (
+          {
+            PATH = "${
+              lib.makeBinPath [ pkgs.iproute2 ]
+            }:%h/.nix-profile/bin:/etc/profiles/per-user/%u/bin:/run/current-system/sw/bin";
+          }
+          // cfg.environment
+        );
         Type = "simple";
         ExecStart = "${lib.getExe cfg.package} --config ${configPath} daemon";
         Restart = "on-failure";

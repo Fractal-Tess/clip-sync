@@ -151,6 +151,41 @@ The flake exports the unified desktop/CLI/daemon package as `packages.<system>.d
 
 When `nix/release-artifacts.json` contains an artifact for the current system and version, the default package downloads that CI-built release and uses `autoPatchelfHook` plus the normal runtime wrapper instead of compiling Rust. Before the post-release manifest is committed, or on systems without a published binary, it safely falls back to the source package. `packages.<system>.source` always remains available for reproducible source builds.
 
+The canonical package name is `packages.<system>.clip-sync` (also available as
+`packages.<system>.default`), and `apps.<system>.default` runs the same
+`clip-sync` executable.
+
+The NixOS module installs the selected package system-wide and manages a
+per-user systemd unit. Its `package` option defaults to the flake's tested
+`packages.<system>.clip-sync` output; override it explicitly to pin another
+package or version. `configFile = null` is intentional: the service keeps
+using the writable `%h/.config/clip-sync/config.toml` file instead of trying to
+generate mutable configuration in the Nix store. `autoStart = false` keeps the
+unit available for `systemctl --user start clip-sync` without adding a target
+dependency. `environment` supplies service environment variables.
+
+For a Home Manager-only installation, import
+`inputs.clip-sync.homeManagerModules.default`. It exposes the same
+`services.clip-sync` options and defaults `package` to the same tested flake
+output, but installs the package and user service in the user's home
+configuration rather than system-wide:
+
+```nix
+{
+  imports = [ inputs.clip-sync.homeManagerModules.default ];
+
+  services.clip-sync = {
+    enable = true;
+    autoStart = true;
+    package = inputs.clip-sync.packages.${pkgs.system}.clip-sync;
+  };
+}
+```
+
+Use the NixOS module for a system-managed service and system-wide CLI
+installation; use Home Manager for a per-user package and user-session
+service. Both modules retain the writable per-user default config behavior.
+
 ```nix
 {
   inputs.clip-sync.url = "github:Fractal-Tess/clip-sync";
