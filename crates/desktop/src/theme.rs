@@ -8,6 +8,8 @@ pub const CARD_BACKGROUND: egui::Color32 = egui::Color32::from_rgb(0x12, 0x1a, 0
 pub const BUTTON: egui::Color32 = egui::Color32::from_rgb(0x1e, 0x2a, 0x30);
 pub const CARD_SELECTED: egui::Color32 = egui::Color32::from_rgb(0x15, 0x2a, 0x30);
 pub const ACCENT: egui::Color32 = egui::Color32::from_rgb(0x4a, 0xd6, 0xb0);
+/// Backs selected query text; dark enough that the glyphs on top stay legible.
+pub const SELECTION: egui::Color32 = egui::Color32::from_rgb(0x1d, 0x53, 0x49);
 pub const TEXT: egui::Color32 = egui::Color32::from_rgb(0x9a, 0xac, 0xb2);
 pub const TEXT_SELECTED: egui::Color32 = egui::Color32::from_rgb(0xe6, 0xf2, 0xf5);
 pub const DANGER: egui::Color32 = egui::Color32::from_rgb(0xe8, 0x6a, 0x6a);

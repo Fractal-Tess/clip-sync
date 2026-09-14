@@ -26,12 +26,22 @@ use winit::{
 use crate::{
     control::Control,
     daemon::{Daemon, HistoryItem},
-    theme::{ACCENT, BACKGROUND, CARD_BACKGROUND, CARD_SELECTED, DANGER, SURFACE, TEXT, TEXT_SELECTED},
+    theme::{
+        ACCENT, BACKGROUND, CARD_BACKGROUND, CARD_SELECTED, DANGER, SELECTION, SURFACE, TEXT,
+        TEXT_SELECTED,
+    },
 };
 
-const WINDOW_WIDTH: f64 = 940.0;
-const WINDOW_HEIGHT: f64 = 620.0;
+const WINDOW_WIDTH: f64 = 1120.0;
+const WINDOW_HEIGHT: f64 = 740.0;
 const HISTORY_LIMIT: u32 = 200;
+
+/// How much larger than its nominal point size everything is drawn.
+///
+/// One knob rather than thirty: this is egui's points-per-pixel, so cards,
+/// padding, strokes, and glyphs all grow together and the layout keeps its
+/// proportions. The window grows with it so the grid keeps its column count.
+const SCALE: f32 = 1.18;
 
 /// Cards stretch to divide the row evenly; this is the narrowest one allowed
 /// before the grid drops a column.
@@ -46,6 +56,11 @@ const HEADER_HEIGHT: f32 = 40.0;
 /// Width of the control centre's navigation rail.
 const NAV_WIDTH: f32 = 168.0;
 const FOOTER_HEIGHT: f32 = 22.0;
+
+/// Point size for a card's preview text.
+const PREVIEW_SIZE: f32 = 11.0;
+/// Point size for the small monospace badges and hints.
+const META_SIZE: f32 = 9.0;
 
 /// Thumbnails fetched per paint, so a screen of images fills in progressively
 /// instead of stalling one long frame.
@@ -65,6 +80,9 @@ pub struct Picker {
     items: Vec<HistoryItem>,
     filtered: Vec<usize>,
     query: String,
+    /// Whether ctrl+a has selected the whole query, so the next keystroke
+    /// replaces it instead of appending to it.
+    query_selected: bool,
     selected: usize,
     /// Column count from the last paint, so key handling can move by a row.
     columns: usize,
@@ -102,6 +120,7 @@ impl Picker {
             items: Vec::new(),
             filtered: Vec::new(),
             query: String::new(),
+            query_selected: false,
             selected: 0,
             columns: 1,
             visible: 0..0,
@@ -296,8 +315,10 @@ impl Picker {
             match key.as_ref() {
                 Key::Character("p") => self.toggle_pin(),
                 Key::Character("d") => self.delete_selected(),
+                Key::Character("a") => self.query_selected = !self.query.is_empty(),
                 Key::Character("u") => {
                     self.query.clear();
+                    self.query_selected = false;
                     self.selected = 0;
                     self.refilter();
                 }
@@ -306,6 +327,11 @@ impl Picker {
             self.request_redraw();
             return;
         }
+
+        // Any key that is not ctrl+a collapses the selection, the way it would
+        // in a real text field: navigating away from a selection should not
+        // leave the next character silently wiping the query.
+        let replacing = std::mem::take(&mut self.query_selected);
 
         match key {
             Key::Named(NamedKey::Escape) => {
@@ -328,7 +354,11 @@ impl Picker {
                 self.selected = self.filtered.len().saturating_sub(1);
             }
             Key::Named(NamedKey::Backspace) => {
-                self.query.pop();
+                if replacing {
+                    self.query.clear();
+                } else {
+                    self.query.pop();
+                }
                 self.selected = 0;
                 self.refilter();
             }
@@ -336,6 +366,9 @@ impl Picker {
                 let typed = text.unwrap_or_default();
                 if typed.is_empty() || typed.chars().any(char::is_control) {
                     return;
+                }
+                if replacing {
+                    self.query.clear();
                 }
                 self.query.push_str(typed);
                 self.selected = 0;
@@ -386,13 +419,13 @@ impl Picker {
             (Some(state), Some(window)) => state.take_egui_input(window),
             _ => egui::RawInput::default(),
         };
-        input.screen_rect = Some(egui::Rect::from_min_size(
-            egui::pos2(0.0, 0.0),
-            egui::vec2(width as f32, height as f32),
-        ));
+        // egui lays out in points, the surface is addressed in pixels, and
+        // `SCALE` is the ratio between them.
+        let points = egui::vec2(width as f32, height as f32) / SCALE;
+        input.screen_rect = Some(egui::Rect::from_min_size(egui::pos2(0.0, 0.0), points));
 
         match self.view {
-            View::Picker => self.draw_picker(input, width, height),
+            View::Picker => self.draw_picker(input, points),
             View::Control => self.draw_control(input),
         }
     }
@@ -439,11 +472,11 @@ impl Picker {
     }
 
     #[allow(clippy::too_many_lines)]
-    fn draw_picker(&mut self, input: egui::RawInput, width: u32, height: u32) -> egui::FullOutput {
-        let grid_width = width as f32 - 2.0 * MARGIN;
+    fn draw_picker(&mut self, input: egui::RawInput, points: egui::Vec2) -> egui::FullOutput {
+        let grid_width = points.x - 2.0 * MARGIN;
         let columns = (((grid_width + GAP) / (MIN_CARD_WIDTH + GAP)).floor() as usize).max(1);
         let card_width = (grid_width - GAP * (columns - 1) as f32) / columns as f32;
-        let grid_height = height as f32 - HEADER_HEIGHT - FOOTER_HEIGHT - 2.0 * MARGIN;
+        let grid_height = points.y - HEADER_HEIGHT - FOOTER_HEIGHT - 2.0 * MARGIN;
         let visible_rows =
             (((grid_height + GAP) / (MIN_CARD_HEIGHT + GAP)).floor() as usize).max(1);
         let card_height =
@@ -472,7 +505,9 @@ impl Picker {
             .collect();
 
         let query = self.query.clone();
+        let query_selected = self.query_selected;
         let status = self.status.clone();
+        let now = unix_millis();
         let total = self.items.len();
         let shown = self.filtered.len();
         let position = if shown == 0 { 0 } else { self.selected + 1 };
@@ -496,15 +531,36 @@ impl Picker {
                         // a repaint several times a second forever.
                         ui.spacing_mut().item_spacing.x = 3.0;
                         if !query.is_empty() {
-                            ui.label(
-                                egui::RichText::new(&query).strong().color(TEXT_SELECTED),
+                            // Laid out by hand rather than with `ui.label` so
+                            // the highlight can go down before the glyphs:
+                            // ctrl+a has no caret to move, so this block is the
+                            // only feedback that the query is selected.
+                            let galley = ui.painter().layout_no_wrap(
+                                query.clone(),
+                                egui::FontId::proportional(14.0),
+                                TEXT_SELECTED,
                             );
+                            let (rect, _) = ui
+                                .allocate_exact_size(galley.size(), egui::Sense::hover());
+                            if query_selected {
+                                ui.painter().rect_filled(
+                                    rect.expand2(egui::vec2(2.0, 2.0)),
+                                    2.0,
+                                    SELECTION,
+                                );
+                            }
+                            ui.painter().galley(rect.min, galley, TEXT_SELECTED);
                         }
                         let (caret, _) =
                             ui.allocate_exact_size(egui::vec2(2.0, 17.0), egui::Sense::hover());
                         ui.painter().rect_filled(caret, 1.0, ACCENT);
                         if query.is_empty() {
-                            ui.label(egui::RichText::new("type to filter…").weak().italics());
+                            ui.label(
+                                egui::RichText::new("type to filter…")
+                                    .size(14.0)
+                                    .weak()
+                                    .italics(),
+                            );
                         }
                         ui.with_layout(
                             egui::Layout::right_to_left(egui::Align::Center),
@@ -515,7 +571,10 @@ impl Picker {
                                     format!("{position}/{shown} of {total}")
                                 };
                                 ui.label(
-                                    egui::RichText::new(counter).monospace().size(10.0).weak(),
+                                    egui::RichText::new(counter)
+                                        .monospace()
+                                        .size(META_SIZE + 1.0)
+                                        .weak(),
                                 );
                             },
                         );
@@ -540,6 +599,7 @@ impl Picker {
                                     textures,
                                     egui::vec2(card_width, card_height),
                                     local,
+                                    now,
                                 );
                             }
                         });
@@ -548,10 +608,10 @@ impl Picker {
                     ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
                         ui.label(
                             egui::RichText::new(
-                                "←↑↓→ move    enter copy    ^p pin    ^d delete    f1 control    esc close",
+                                "←↑↓→ move    enter copy    ^a select all    ^p pin    ^d delete    f1 control    esc close",
                             )
                             .monospace()
-                            .size(9.0)
+                            .size(META_SIZE)
                             .weak(),
                         );
                     });
@@ -580,7 +640,7 @@ impl Picker {
             .viewport_output
             .values()
             .any(|viewport| viewport.repaint_delay.is_zero());
-        let primitives = self.egui.tessellate(output.shapes, 1.0);
+        let primitives = self.egui.tessellate(output.shapes, SCALE);
 
         let Some(surface) = self.surface.as_mut() else {
             return;
@@ -600,7 +660,7 @@ impl Picker {
             let pixels: &mut [[u8; 4]] = bytemuck::cast_slice_mut(&mut buffer);
             let mut target = BufferMutRef::new(pixels, width as usize, height as usize);
             self.renderer
-                .render(&mut target, &primitives, &output.textures_delta, 1.0);
+                .render(&mut target, &primitives, &output.textures_delta, SCALE);
         }
         let _ = buffer.present();
 
@@ -650,7 +710,7 @@ impl ApplicationHandler for Picker {
             self.egui.clone(),
             egui::ViewportId::ROOT,
             &window,
-            Some(1.0),
+            Some(SCALE),
             None,
             Some(2048),
         ));
@@ -699,6 +759,7 @@ fn card(
     textures: &HashMap<String, egui::TextureHandle>,
     size: egui::Vec2,
     local: &str,
+    now: u64,
 ) {
     let (background, foreground) = if selected {
         (CARD_SELECTED, TEXT_SELECTED)
@@ -723,7 +784,10 @@ fn card(
                 ui.set_max_size(inner);
                 ui.spacing_mut().item_spacing.y = 4.0;
                 ui.vertical(|ui| {
-                    let body_height = inner.y - 14.0;
+                    // Reserve the metadata row plus the spacing above it, so a
+                    // long preview is clipped clear of the row rather than
+                    // running its last line into the size and age.
+                    let body_height = inner.y - META_SIZE - 9.0;
                     ui.allocate_ui(egui::vec2(inner.x, body_height), |ui| {
                         ui.set_clip_rect(ui.max_rect());
                         match textures.get(&item.content_id) {
@@ -748,7 +812,7 @@ fn card(
                                 ui.label(
                                     egui::RichText::new(clamp_preview(&item.preview))
                                         .color(foreground)
-                                        .size(11.0),
+                                        .size(PREVIEW_SIZE),
                                 );
                             }
                         }
@@ -760,35 +824,99 @@ fn card(
                                 ui.label(
                                     egui::RichText::new("pin")
                                         .monospace()
-                                        .size(9.0)
+                                        .size(META_SIZE)
                                         .color(ACCENT),
                                 );
                             }
                             if item.is_image {
                                 ui.label(
-                                    egui::RichText::new("img").monospace().size(9.0).weak(),
+                                    egui::RichText::new("img")
+                                        .monospace()
+                                        .size(META_SIZE)
+                                        .weak(),
                                 );
                             }
                             // Entries from this machine are the common case, so
                             // only remote origins earn a label.
                             if item.source != local && !item.source.is_empty() {
-                                ui.with_layout(
-                                    egui::Layout::right_to_left(egui::Align::Center),
-                                    |ui| {
-                                        ui.label(
-                                            egui::RichText::new(&item.source)
-                                                .monospace()
-                                                .size(9.0)
-                                                .weak(),
-                                        );
-                                    },
+                                ui.label(
+                                    egui::RichText::new(&item.source)
+                                        .monospace()
+                                        .size(META_SIZE)
+                                        .weak(),
                                 );
                             }
+                            // Age and size sit on the right so they line up
+                            // down the column and stay readable as a pair,
+                            // rather than shifting with the badges beside them.
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "{}  ·  {}",
+                                            human_size(item.size_bytes),
+                                            human_age(now, item.created_millis),
+                                        ))
+                                        .monospace()
+                                        .size(META_SIZE)
+                                        .weak(),
+                                    );
+                                },
+                            );
                         });
                     });
                 });
             });
     });
+}
+
+/// Wall-clock milliseconds since the Unix epoch.
+fn unix_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_millis().min(u128::from(u64::MAX)) as u64)
+}
+
+/// Renders a byte count in the largest unit that keeps it under four digits.
+///
+/// Cards have room for a handful of characters, so precision is traded for
+/// width: one decimal below 10 of a unit, none above it.
+fn human_size(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else if value < 10.0 {
+        format!("{value:.1} {}", UNITS[unit])
+    } else {
+        format!("{value:.0} {}", UNITS[unit])
+    }
+}
+
+/// Renders how long ago `created` was, as a single coarse unit.
+///
+/// Clipboard history is browsed by recency, so "3h" answers the question the
+/// user actually has; an absolute timestamp would cost twice the width to say
+/// less. Entries stamped in the future — clock skew across the mesh — read as
+/// "now" rather than wrapping into a negative age.
+fn human_age(now: u64, created: u64) -> String {
+    let seconds = now.saturating_sub(created) / 1000;
+    match seconds {
+        0..=9 => "now".to_owned(),
+        s if s < 60 => format!("{s}s"),
+        s if s < 3_600 => format!("{}m", s / 60),
+        s if s < 86_400 => format!("{}h", s / 3_600),
+        s if s < 604_800 => format!("{}d", s / 86_400),
+        s if s < 2_592_000 => format!("{}w", s / 604_800),
+        s if s < 31_536_000 => format!("{}mo", s / 2_592_000),
+        s => format!("{}y", s / 31_536_000),
+    }
 }
 
 /// Scales `source` down to fit inside `bounds` without distorting it.

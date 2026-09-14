@@ -6,6 +6,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- History cards show the entry's size and how long ago it was copied.
+- `Ctrl+A` selects the whole search query, so the next keystroke replaces it and `Backspace` clears it.
+
+### Changed
+
+- The picker and control centre are drawn 18% larger, and the window grew with them so the grid keeps its column count.
+
 ## [0.3.0] - 2026-09-13
 
 ### Changed

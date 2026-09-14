@@ -28,6 +28,9 @@ pub struct HistoryItem {
     pub source: String,
     pub pinned: bool,
     pub is_image: bool,
+    pub size_bytes: u64,
+    /// Unix milliseconds the entry was first copied.
+    pub created_millis: u64,
 }
 
 /// A decoded thumbnail, already bounded by the daemon to 320x180.
@@ -144,6 +147,11 @@ impl Daemon {
                     item.source_device
                 },
                 pinned: item.pinned,
+                size_bytes: item.logical_size,
+                // `origin_millis` is when the entry was copied on whichever
+                // node produced it; `physical_millis` is only when this node
+                // learned about it, which for synced entries is later.
+                created_millis: item.origin_millis.unwrap_or(item.physical_millis),
             })
             .collect())
     }
