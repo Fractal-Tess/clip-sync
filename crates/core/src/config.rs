@@ -1,6 +1,7 @@
 use std::{
     env, fs,
     io::{Read, Write},
+    net::IpAddr,
     path::{Path, PathBuf},
 };
 
@@ -173,6 +174,20 @@ impl Config {
                 ));
             }
         }
+        if self.local.peer_addresses.len() > 512 {
+            return Err(ConfigError::Invalid(
+                "local.peer_addresses must contain at most 512 IP addresses",
+            ));
+        }
+        let mut peer_addresses = std::collections::BTreeSet::new();
+        for address in &self.local.peer_addresses {
+            if address.is_unspecified() || address.is_multicast() || !peer_addresses.insert(address)
+            {
+                return Err(ConfigError::Invalid(
+                    "local.peer_addresses must contain unique unicast IP addresses",
+                ));
+            }
+        }
         if self.local.listen_port == 0 {
             return Err(ConfigError::Invalid(
                 "local.listen_port must be greater than zero",
@@ -261,6 +276,8 @@ pub struct LocalConfig {
     /// Linux interfaces used for authenticated discovery and mesh connections.
     /// An empty list disables network discovery and incoming mesh listeners.
     pub peer_interfaces: Vec<String>,
+    /// Stable peer IPs to dial directly when multicast discovery is unavailable.
+    pub peer_addresses: Vec<IpAddr>,
     pub maximum_explicit_share_bytes: u64,
     pub transfer_free_space_reserve_bytes: u64,
     pub materialization_free_space_reserve_bytes: u64,
@@ -277,6 +294,7 @@ impl Default for LocalConfig {
             reconnect_min_seconds: 1,
             reconnect_max_seconds: 60,
             peer_interfaces: Vec::new(),
+            peer_addresses: Vec::new(),
             maximum_explicit_share_bytes: 4 * 1024 * 1024 * 1024,
             transfer_free_space_reserve_bytes: 64 * 1024 * 1024,
             materialization_free_space_reserve_bytes: 8 * 1024 * 1024,
@@ -494,6 +512,25 @@ mod tests {
         assert!(matches!(config.validate(), Err(ConfigError::Invalid(_))));
 
         config.local.peer_interfaces = vec!["interface-name-is-too-long".to_owned()];
+        assert!(matches!(config.validate(), Err(ConfigError::Invalid(_))));
+    }
+
+    #[test]
+    fn peer_addresses_are_bounded_unique_unicast_addresses() {
+        let mut config = Config::default();
+        config.local.peer_addresses = vec![
+            "100.91.0.2".parse().expect("IP"),
+            "100.91.126.8".parse().expect("IP"),
+        ];
+        assert!(config.validate().is_ok());
+
+        config
+            .local
+            .peer_addresses
+            .push("100.91.0.2".parse().expect("IP"));
+        assert!(matches!(config.validate(), Err(ConfigError::Invalid(_))));
+
+        config.local.peer_addresses = vec!["239.255.67.83".parse().expect("IP")];
         assert!(matches!(config.validate(), Err(ConfigError::Invalid(_))));
     }
 

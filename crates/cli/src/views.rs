@@ -24,6 +24,7 @@ struct SafeLocal {
     reconnect_min_seconds: u64,
     reconnect_max_seconds: u64,
     peer_interfaces: Vec<String>,
+    peer_addresses: Vec<std::net::IpAddr>,
     mesh_key_file_configured: bool,
     config_path: String,
 }

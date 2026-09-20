@@ -25,6 +25,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - History cards use a pointing cursor to make their click behavior visible.
 - `Escape` now closes the window from both the picker and control centre.
 
+### Fixed
+
+- Large automatic clipboard captures now fit the authenticated reconciliation frame instead of permanently blocking all later operations.
+- Stable `peer_addresses` keep VPN peers connected when the selected interface does not route multicast discovery.
+
 ## [0.3.0] - 2026-09-13
 
 ### Changed

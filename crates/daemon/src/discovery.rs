@@ -65,6 +65,7 @@ pub struct DiscoveredPeer {
 pub struct InterfaceDiscovery {
     ip_command: PathBuf,
     peer_interfaces: Vec<String>,
+    peer_addresses: Vec<IpAddr>,
     local_hostname: String,
     listen_port: u16,
     key: Zeroizing<[u8; 32]>,
@@ -76,6 +77,7 @@ impl InterfaceDiscovery {
     #[must_use]
     pub fn new(
         peer_interfaces: Vec<String>,
+        peer_addresses: Vec<IpAddr>,
         local_hostname: String,
         listen_port: u16,
         key: Zeroizing<[u8; 32]>,
@@ -84,6 +86,7 @@ impl InterfaceDiscovery {
         Self {
             ip_command: PathBuf::from("ip"),
             peer_interfaces,
+            peer_addresses,
             local_hostname,
             listen_port,
             key,
@@ -119,6 +122,7 @@ impl InterfaceDiscovery {
             .into_iter()
             .collect::<Vec<_>>();
         let local_address_set = local_addresses.iter().copied().collect::<BTreeSet<_>>();
+        let configured_peers = configured_peers(&endpoints, &self.peer_addresses, self.listen_port);
         let mut tasks = JoinSet::new();
         for endpoint in endpoints {
             let key = *self.key;
@@ -139,7 +143,7 @@ impl InterfaceDiscovery {
             });
         }
 
-        let mut peers = BTreeSet::new();
+        let mut peers = configured_peers;
         while let Some(result) = tasks.join_next().await {
             let discovered = result.map_err(DiscoveryError::Task)??;
             peers.extend(discovered);
@@ -250,6 +254,28 @@ fn parse_interface_endpoints(
     });
     endpoints.dedup_by(|left, right| left.address == right.address);
     Ok(endpoints)
+}
+
+fn configured_peers(
+    endpoints: &[InterfaceEndpoint],
+    peer_addresses: &[IpAddr],
+    listen_port: u16,
+) -> BTreeSet<DiscoveredPeer> {
+    peer_addresses
+        .iter()
+        .filter_map(|address| {
+            endpoints
+                .iter()
+                .find(|endpoint| endpoint.address != *address && endpoint.network.contains(address))
+                .map(|endpoint| DiscoveredPeer {
+                    hostname: address.to_string(),
+                    address: *address,
+                    port: listen_port,
+                    local_address: endpoint.address,
+                    connected: true,
+                })
+        })
+        .collect()
 }
 
 async fn discover_on_endpoint(
@@ -673,6 +699,7 @@ mod tests {
             .expect("command permissions");
         let discovery = InterfaceDiscovery::new(
             vec!["wt0".to_owned()],
+            Vec::new(),
             "host".to_owned(),
             24_892,
             Zeroizing::new([1; 32]),
@@ -682,5 +709,30 @@ mod tests {
         let endpoints = discovery.interface_endpoints().await.expect("endpoints");
         assert_eq!(endpoints.len(), 1);
         assert_eq!(endpoints[0].name, "wt0");
+    }
+
+    #[test]
+    fn configured_peers_remain_in_every_snapshot() {
+        let endpoints =
+            parse_interface_endpoints(INTERFACES, &["wt0".to_owned()]).expect("valid interfaces");
+        let peers = configured_peers(
+            &endpoints,
+            &[
+                "100.91.0.2".parse().expect("local IP"),
+                "100.91.126.8".parse().expect("peer IP"),
+                "192.168.10.8".parse().expect("other network"),
+            ],
+            24_892,
+        );
+        assert_eq!(
+            peers,
+            BTreeSet::from([DiscoveredPeer {
+                hostname: "100.91.126.8".to_owned(),
+                address: "100.91.126.8".parse().expect("peer IP"),
+                port: 24_892,
+                local_address: "100.91.0.2".parse().expect("local IP"),
+                connected: true,
+            }])
+        );
     }
 }

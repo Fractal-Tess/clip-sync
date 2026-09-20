@@ -95,6 +95,7 @@ impl DaemonState {
             reconnect_min_seconds: u64,
             reconnect_max_seconds: u64,
             peer_interfaces: &'a [String],
+            peer_addresses: &'a [std::net::IpAddr],
             mesh_key_file_configured: bool,
             config_path: &'a str,
         }
@@ -116,6 +117,7 @@ impl DaemonState {
                 reconnect_min_seconds: config.local.reconnect_min_seconds,
                 reconnect_max_seconds: config.local.reconnect_max_seconds,
                 peer_interfaces: &config.local.peer_interfaces,
+                peer_addresses: &config.local.peer_addresses,
                 mesh_key_file_configured: !config.local.mesh_key_file.as_os_str().is_empty(),
                 config_path: &config_path,
             },

@@ -226,6 +226,8 @@ pub(super) fn restart_required_local_change(
     current.mesh_key_file != changed.mesh_key_file
         || current.listen_port != changed.listen_port
         || current.discovery_interval_seconds != changed.discovery_interval_seconds
+        || current.peer_interfaces != changed.peer_interfaces
+        || current.peer_addresses != changed.peer_addresses
         || current.reconcile_interval_seconds != changed.reconcile_interval_seconds
         || current.reconnect_min_seconds != changed.reconnect_min_seconds
         || current.reconnect_max_seconds != changed.reconnect_max_seconds

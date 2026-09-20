@@ -107,7 +107,9 @@ impl Control {
     pub fn apply(&mut self, daemon: &Daemon, action: Action) {
         let outcome = match action {
             Action::Refresh => Ok("Reloaded"),
-            Action::CancelTransfer(id) => daemon.cancel_transfer(&id).map(|()| "Transfer cancelled"),
+            Action::CancelTransfer(id) => {
+                daemon.cancel_transfer(&id).map(|()| "Transfer cancelled")
+            }
             Action::ForgetDevice(id) => daemon.forget_device(&id).map(|()| "Device forgotten"),
             Action::SetShared(setting, value) => {
                 daemon.set_shared_setting(setting, value).map(|()| "Saved")
@@ -147,23 +149,22 @@ impl Control {
         );
         ui.add_space(14.0);
 
-        ui.with_layout(
-            egui::Layout::top_down_justified(egui::Align::LEFT),
-            |ui| {
-                for (index, tab) in Tab::ALL.into_iter().enumerate() {
-                    let selected = index == self.tab_index;
-                    let text = egui::RichText::new(tab.label()).size(12.0).color(if selected {
+        ui.with_layout(egui::Layout::top_down_justified(egui::Align::LEFT), |ui| {
+            for (index, tab) in Tab::ALL.into_iter().enumerate() {
+                let selected = index == self.tab_index;
+                let text = egui::RichText::new(tab.label())
+                    .size(12.0)
+                    .color(if selected {
                         theme::TEXT_SELECTED
                     } else {
                         theme::TEXT
                     });
-                    if ui.selectable_label(selected, text).clicked() {
-                        self.tab_index = index;
-                        self.notice = None;
-                    }
+                if ui.selectable_label(selected, text).clicked() {
+                    self.tab_index = index;
+                    self.notice = None;
                 }
-            },
-        );
+            }
+        });
 
         ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
             if ui
@@ -310,13 +311,7 @@ impl Control {
                         (_, true) => ("forgotten", theme::TEXT),
                         _ => ("", theme::TEXT),
                     };
-                    fixed_text(
-                        ui,
-                        64.0,
-                        badge,
-                        egui::FontId::proportional(9.0),
-                        color,
-                    );
+                    fixed_text(ui, 64.0, badge, egui::FontId::proportional(9.0), color);
                     if !device.local && !device.forgotten && ui.small_button("Forget").clicked() {
                         actions.push(Action::ForgetDevice(device.device_id.clone()));
                     }
@@ -384,7 +379,11 @@ impl Control {
                             .color(theme::TEXT_SELECTED),
                     );
                 });
-                ui.label(egui::RichText::new(&check.detail).size(10.5).color(theme::TEXT));
+                ui.label(
+                    egui::RichText::new(&check.detail)
+                        .size(10.5)
+                        .color(theme::TEXT),
+                );
             });
         }
     }
@@ -405,7 +404,12 @@ impl Control {
                     // The revision is a content hash; a prefix is enough to tell
                     // two of them apart, and the full string is unreadable.
                     "revision {}",
-                    settings.shared.revision.chars().take(12).collect::<String>()
+                    settings
+                        .shared
+                        .revision
+                        .chars()
+                        .take(12)
+                        .collect::<String>()
                 ))
                 .monospace()
                 .size(9.0)
@@ -592,13 +596,24 @@ const DEVICE_WIDTH: f32 = 300.0;
 /// gives a column that later widgets line up against.
 fn fixed_text(ui: &mut egui::Ui, width: f32, text: &str, font: egui::FontId, color: egui::Color32) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 18.0), egui::Sense::hover());
-    ui.painter()
-        .text(rect.left_center(), egui::Align2::LEFT_CENTER, text, font, color);
+    ui.painter().text(
+        rect.left_center(),
+        egui::Align2::LEFT_CENTER,
+        text,
+        font,
+        color,
+    );
 }
 
 fn label_cell(ui: &mut egui::Ui, text: &str) {
     let color = ui.visuals().weak_text_color();
-    fixed_text(ui, LABEL_WIDTH, text, egui::FontId::proportional(11.0), color);
+    fixed_text(
+        ui,
+        LABEL_WIDTH,
+        text,
+        egui::FontId::proportional(11.0),
+        color,
+    );
 }
 
 fn field(ui: &mut egui::Ui, label: &str, value: &str) {
@@ -616,8 +631,7 @@ fn field(ui: &mut egui::Ui, label: &str, value: &str) {
 fn dot(ui: &mut egui::Ui, ok: bool) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
     let color = if ok { theme::ACCENT } else { theme::DANGER };
-    ui.painter()
-        .circle_filled(rect.center(), 3.5, color);
+    ui.painter().circle_filled(rect.center(), 3.5, color);
 }
 
 fn uptime(seconds: u64) -> String {

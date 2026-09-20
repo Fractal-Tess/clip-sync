@@ -79,7 +79,8 @@ impl Daemon {
     ///
     /// Returns an error when configuration discovery or runtime startup fails.
     pub fn discover(config_override: Option<PathBuf>) -> Result<Self> {
-        let paths = AppPaths::discover(config_override).context("failed to resolve ClipSync paths")?;
+        let paths =
+            AppPaths::discover(config_override).context("failed to resolve ClipSync paths")?;
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()

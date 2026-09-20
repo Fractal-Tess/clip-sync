@@ -5,7 +5,7 @@ use quinn::{RecvStream, SendStream};
 use thiserror::Error;
 
 pub const PROTOCOL_VERSION: u32 = 3;
-pub const MAX_CONTROL_FRAME_BYTES: usize = 24 * 1024 * 1024;
+pub const MAX_CONTROL_FRAME_BYTES: usize = 96 * 1024 * 1024;
 pub const MAX_FRONTIER_BYTES: usize = 1024 * 1024;
 pub const MAX_MEMBERSHIP_BYTES: usize = 1024 * 1024;
 pub const MAX_HOSTNAME_BYTES: usize = 255;
@@ -168,4 +168,22 @@ pub enum ProtocolError {
     Write(#[from] quinn::WriteError),
     #[error("could not read a control frame: {0}")]
     Read(#[from] quinn::ReadExactError),
+}
+
+#[cfg(test)]
+mod tests {
+    use clip_sync_core::config::DEFAULT_CAPTURE_THRESHOLD_BYTES;
+
+    use super::MAX_CONTROL_FRAME_BYTES;
+
+    #[test]
+    fn control_frame_carries_worst_case_default_capture_encoding() {
+        let worst_case_json_bytes = DEFAULT_CAPTURE_THRESHOLD_BYTES
+            .checked_mul(4)
+            .expect("default threshold fits");
+        assert!(
+            u64::try_from(MAX_CONTROL_FRAME_BYTES).expect("frame limit fits u64")
+                > worst_case_json_bytes
+        );
+    }
 }

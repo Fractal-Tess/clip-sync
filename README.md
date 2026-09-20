@@ -236,11 +236,16 @@ reconcile_interval_seconds = 5
 reconnect_min_seconds = 1
 reconnect_max_seconds = 60
 peer_interfaces = ["eth0", "wt0"]
+peer_addresses = ["100.91.0.2", "100.91.126.8"]
 maximum_explicit_share_bytes = 4294967296
 transfer_free_space_reserve_bytes = 67108864
 materialization_free_space_reserve_bytes = 8388608
 max_concurrent_chunk_streams = 4
 ```
+
+`peer_addresses` keeps stable mesh or VPN peers dialable when the selected
+interface does not route multicast. Every connection still authenticates with
+the mesh secret; addresses only replace discovery, not authentication.
 
 ### Mesh-secret rotation
 

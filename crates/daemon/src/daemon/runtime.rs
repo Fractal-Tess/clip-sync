@@ -343,6 +343,7 @@ fn spawn_discovery(
             let interval = Duration::from_secs(config.local.discovery_interval_seconds);
             let discovery = InterfaceDiscovery::new(
                 config.local.peer_interfaces,
+                config.local.peer_addresses,
                 hostname.clone(),
                 config.local.listen_port,
                 discovery_key.clone(),
