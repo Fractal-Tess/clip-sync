@@ -15,10 +15,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   The NixOS and Home Manager service modules share their option definitions.
   `environment` replaces `extraEnvironment`, and `autoStart = false` retains a
   manually startable unit without adding session-target startup edges.
+- Clicking a history card activates it and closes the picker.
+- Pinned entries move into a dedicated side column with an animated accent transition.
 
 ### Changed
 
 - The picker and control centre are drawn 18% larger, and the window grew with them so the grid keeps its column count.
+- Bottom-edge keyboard instructions use larger, higher-contrast text.
+- History cards use a pointing cursor to make their click behavior visible.
+- `Escape` now closes the window from both the picker and control centre.
 
 ## [0.3.0] - 2026-09-13
 

@@ -89,11 +89,13 @@ winit and softbuffer `dlopen` Wayland and xkbcommon, so both must be on `LD_LIBR
 
 Picker shortcuts:
 
+- Click a history card to activate it and close the window.
 - Arrow keys: move through the history grid.
 - `Enter`: activate the selected record and close the window.
-- `Ctrl+P` / `Ctrl+D`: pin or delete the selected record.
-- Typing filters; `Escape` closes the window.
-- `F1`: swap to the control centre, where `Ctrl+Tab` cycles tabs and `Escape` returns.
+- `Ctrl+P`: pin or unpin the selected record; pinned records move to the side column.
+- `Ctrl+D`: delete the selected record.
+- Typing filters; `Escape` closes the window from either view.
+- `F1`: swap between the picker and control centre; `Ctrl+Tab` cycles control-centre tabs.
 
 ## Development
 

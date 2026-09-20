@@ -7,7 +7,6 @@
 use std::{
     collections::{HashMap, HashSet},
     num::NonZeroU32,
-    ops::Range,
     rc::Rc,
     time::Instant,
 };
@@ -55,12 +54,17 @@ const MARGIN: f32 = 10.0;
 const HEADER_HEIGHT: f32 = 40.0;
 /// Width of the control centre's navigation rail.
 const NAV_WIDTH: f32 = 168.0;
-const FOOTER_HEIGHT: f32 = 22.0;
+const FOOTER_HEIGHT: f32 = 26.0;
 
 /// Point size for a card's preview text.
 const PREVIEW_SIZE: f32 = 11.0;
 /// Point size for the small monospace badges and hints.
 const META_SIZE: f32 = 9.0;
+/// Point size for the keyboard help along the bottom edge.
+const FOOTER_TEXT_SIZE: f32 = 11.0;
+const PINNED_COLUMN_WIDTH: f32 = 216.0;
+const PINNED_HEADER_HEIGHT: f32 = 18.0;
+const PIN_ANIMATION_SECONDS: f32 = 0.28;
 
 /// Thumbnails fetched per paint, so a screen of images fills in progressively
 /// instead of stalling one long frame.
@@ -86,8 +90,8 @@ pub struct Picker {
     selected: usize,
     /// Column count from the last paint, so key handling can move by a row.
     columns: usize,
-    /// Positions within `filtered` that the last paint drew.
-    visible: Range<usize>,
+    /// Item indices that the last paint drew.
+    visible: Vec<usize>,
     textures: HashMap<String, egui::TextureHandle>,
     /// Entries the daemon could not produce a thumbnail for; never retried.
     undecodable: HashSet<String>,
@@ -123,7 +127,7 @@ impl Picker {
             query_selected: false,
             selected: 0,
             columns: 1,
-            visible: 0..0,
+            visible: Vec::new(),
             textures: HashMap::new(),
             undecodable: HashSet::new(),
             status: None,
@@ -298,7 +302,7 @@ impl Picker {
         // through egui-winit; only the keys egui does not bind are handled here.
         if self.view == View::Control {
             match key {
-                Key::Named(NamedKey::Escape) => self.show_picker(),
+                Key::Named(NamedKey::Escape) => event_loop.exit(),
                 Key::Named(NamedKey::Tab) if self.modifiers.control_key() => {
                     self.control.cycle_tab(!self.modifiers.shift_key());
                 }
@@ -385,9 +389,7 @@ impl Picker {
     /// image decodes.
     fn hydrate_previews(&mut self) -> bool {
         let pending: Vec<String> = self
-            .filtered
-            .get(self.visible.clone())
-            .unwrap_or_default()
+            .visible
             .iter()
             .map(|&index| &self.items[index])
             .filter(|item| item.is_image)
@@ -414,7 +416,7 @@ impl Picker {
         !pending.is_empty()
     }
 
-    fn draw(&mut self, width: u32, height: u32) -> egui::FullOutput {
+    fn draw(&mut self, event_loop: &ActiveEventLoop, width: u32, height: u32) -> egui::FullOutput {
         let mut input = match (self.egui_state.as_mut(), self.window.as_ref()) {
             (Some(state), Some(window)) => state.take_egui_input(window),
             _ => egui::RawInput::default(),
@@ -425,7 +427,7 @@ impl Picker {
         input.screen_rect = Some(egui::Rect::from_min_size(egui::pos2(0.0, 0.0), points));
 
         match self.view {
-            View::Picker => self.draw_picker(input, points),
+            View::Picker => self.draw_picker(event_loop, input, points),
             View::Control => self.draw_control(input),
         }
     }
@@ -451,10 +453,9 @@ impl Picker {
                 )
                 .show_inside(root, |ui| {
                     ui.label(
-                        egui::RichText::new("^tab switch tab    f1 picker    esc back")
+                        egui::RichText::new("^tab switch tab    f1 picker    esc close")
                             .monospace()
-                            .size(9.0)
-                            .weak(),
+                            .size(FOOTER_TEXT_SIZE),
                     );
                 });
             egui::CentralPanel::default()
@@ -472,37 +473,60 @@ impl Picker {
     }
 
     #[allow(clippy::too_many_lines)]
-    fn draw_picker(&mut self, input: egui::RawInput, points: egui::Vec2) -> egui::FullOutput {
+    fn draw_picker(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        input: egui::RawInput,
+        points: egui::Vec2,
+    ) -> egui::FullOutput {
         let grid_width = points.x - 2.0 * MARGIN;
-        let columns = (((grid_width + GAP) / (MIN_CARD_WIDTH + GAP)).floor() as usize).max(1);
-        let card_width = (grid_width - GAP * (columns - 1) as f32) / columns as f32;
+        let pinned: Vec<(usize, usize)> = self
+            .filtered
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|(_, index)| self.items[*index].pinned)
+            .collect();
+        let unpinned: Vec<(usize, usize)> = self
+            .filtered
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|(_, index)| !self.items[*index].pinned)
+            .collect();
+        let pinned_width = if pinned.is_empty() {
+            0.0
+        } else {
+            PINNED_COLUMN_WIDTH + GAP
+        };
+        let main_width = grid_width - pinned_width;
+        let columns = (((main_width + GAP) / (MIN_CARD_WIDTH + GAP)).floor() as usize).max(1);
+        let card_width = (main_width - GAP * (columns - 1) as f32) / columns as f32;
         let grid_height = points.y - HEADER_HEIGHT - FOOTER_HEIGHT - 2.0 * MARGIN;
         let visible_rows =
             (((grid_height + GAP) / (MIN_CARD_HEIGHT + GAP)).floor() as usize).max(1);
-        let card_height =
-            (grid_height - GAP * (visible_rows - 1) as f32) / visible_rows as f32;
+        let card_height = (grid_height - GAP * (visible_rows - 1) as f32) / visible_rows as f32;
 
-        let first_row = (self.selected / columns).saturating_sub(visible_rows.saturating_sub(1));
-        let start = first_row * columns;
-        let end = (start + visible_rows * columns).min(self.filtered.len());
-        let visible = start..end;
+        let selected_item = self.filtered.get(self.selected).copied();
+        let selected_main = unpinned
+            .iter()
+            .position(|(_, index)| Some(*index) == selected_item)
+            .unwrap_or_default();
+        let first_row = (selected_main / columns).saturating_sub(visible_rows.saturating_sub(1));
+        let main_start = first_row * columns;
+        let main_end = (main_start + visible_rows * columns).min(unpinned.len());
+        let rows: Vec<&[(usize, usize)]> = unpinned[main_start..main_end].chunks(columns).collect();
 
-        let rows: Vec<Vec<(usize, bool)>> = self
-            .filtered
-            .get(visible.clone())
-            .unwrap_or_default()
-            .chunks(columns)
-            .enumerate()
-            .map(|(row, chunk)| {
-                chunk
-                    .iter()
-                    .enumerate()
-                    .map(|(column, &index)| {
-                        (index, start + row * columns + column == self.selected)
-                    })
-                    .collect()
-            })
-            .collect();
+        let selected_pinned = pinned
+            .iter()
+            .position(|(_, index)| Some(*index) == selected_item)
+            .unwrap_or_default();
+        let pinned_start = selected_pinned.saturating_sub(visible_rows.saturating_sub(1));
+        let pinned_end = (pinned_start + visible_rows).min(pinned.len());
+        let visible_pinned = &pinned[pinned_start..pinned_end];
+        let pinned_card_height =
+            (grid_height - 2.0 * CARD_PADDING - PINNED_HEADER_HEIGHT - GAP * visible_rows as f32)
+                / visible_rows as f32;
 
         let query = self.query.clone();
         let query_selected = self.query_selected;
@@ -514,7 +538,10 @@ impl Picker {
         let items = &self.items;
         let textures = &self.textures;
         let local = self.local.as_str();
+        let selected = self.selected;
+        let filtered_empty = self.filtered.is_empty();
 
+        let mut clicked = None;
         let output = self.egui.run_ui(input, |root| {
             let frame = egui::Frame::new().fill(BACKGROUND).inner_margin(MARGIN);
             egui::CentralPanel::default()
@@ -584,26 +611,84 @@ impl Picker {
                         ui.colored_label(DANGER, status);
                     }
 
-                    if rows.is_empty() {
+                    if filtered_empty {
                         ui.add_space(GAP);
                         ui.label(egui::RichText::new("No matching entries").weak());
                     }
 
-                    for row in &rows {
-                        ui.horizontal(|ui| {
-                            for (index, selected) in row {
-                                card(
-                                    ui,
-                                    &items[*index],
-                                    *selected,
-                                    textures,
-                                    egui::vec2(card_width, card_height),
-                                    local,
-                                    now,
-                                );
-                            }
-                        });
-                    }
+                    ui.horizontal_top(|ui| {
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(main_width, grid_height),
+                            egui::Layout::top_down(egui::Align::LEFT),
+                            |ui| {
+                                if rows.is_empty() && !visible_pinned.is_empty() {
+                                    ui.label(
+                                        egui::RichText::new("All matching entries are pinned")
+                                            .weak(),
+                                    );
+                                }
+                                for row in &rows {
+                                    ui.horizontal(|ui| {
+                                        for (position, index) in *row {
+                                            if card(
+                                                ui,
+                                                &items[*index],
+                                                *position == selected,
+                                                textures,
+                                                egui::vec2(card_width, card_height),
+                                                local,
+                                                now,
+                                            )
+                                            .clicked()
+                                            {
+                                                clicked = Some(*position);
+                                            }
+                                        }
+                                    });
+                                }
+                            },
+                        );
+
+                        if !visible_pinned.is_empty() {
+                            egui::Frame::new()
+                                .fill(SURFACE)
+                                .corner_radius(6)
+                                .inner_margin(CARD_PADDING)
+                                .show(ui, |ui| {
+                                    ui.vertical(|ui| {
+                                        ui.set_width(PINNED_COLUMN_WIDTH - 2.0 * CARD_PADDING);
+                                        ui.set_min_height(grid_height - 2.0 * CARD_PADDING);
+                                        ui.label(
+                                            egui::RichText::new(format!(
+                                                "PINNED  {}",
+                                                pinned.len()
+                                            ))
+                                            .monospace()
+                                            .size(META_SIZE + 1.0)
+                                            .color(ACCENT),
+                                        );
+                                        for (position, index) in visible_pinned {
+                                            if card(
+                                                ui,
+                                                &items[*index],
+                                                *position == selected,
+                                                textures,
+                                                egui::vec2(
+                                                    PINNED_COLUMN_WIDTH - 2.0 * CARD_PADDING,
+                                                    pinned_card_height,
+                                                ),
+                                                local,
+                                                now,
+                                            )
+                                            .clicked()
+                                            {
+                                                clicked = Some(*position);
+                                            }
+                                        }
+                                    });
+                                });
+                        }
+                    });
 
                     ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
                         ui.label(
@@ -611,26 +696,34 @@ impl Picker {
                                 "←↑↓→ move    enter copy    ^a select all    ^p pin    ^d delete    f1 control    esc close",
                             )
                             .monospace()
-                            .size(META_SIZE)
-                            .weak(),
+                            .size(FOOTER_TEXT_SIZE),
                         );
                     });
                 });
         });
 
+        if let Some(position) = clicked {
+            self.selected = position;
+            self.activate_selected(event_loop);
+        }
+
         self.columns = columns;
-        self.visible = visible;
+        self.visible = rows
+            .iter()
+            .flat_map(|row| row.iter().map(|(_, index)| *index))
+            .chain(visible_pinned.iter().map(|(_, index)| *index))
+            .collect();
         output
     }
 
-    fn paint(&mut self) {
+    fn paint(&mut self, event_loop: &ActiveEventLoop) {
         let Some(window) = self.window.clone() else {
             return;
         };
         let size = window.inner_size();
         let (width, height) = (size.width.max(1), size.height.max(1));
 
-        let mut output = self.draw(width, height);
+        let mut output = self.draw(event_loop, width, height);
         if let Some(state) = self.egui_state.as_mut() {
             state.handle_platform_output(&window, std::mem::take(&mut output.platform_output));
         }
@@ -740,7 +833,7 @@ impl ApplicationHandler for Picker {
 
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
-            WindowEvent::RedrawRequested => self.paint(),
+            WindowEvent::RedrawRequested => self.paint(event_loop),
             WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
                 let text = event.text.as_deref();
@@ -760,19 +853,28 @@ fn card(
     size: egui::Vec2,
     local: &str,
     now: u64,
-) {
-    let (background, foreground) = if selected {
-        (CARD_SELECTED, TEXT_SELECTED)
+) -> egui::Response {
+    let pin_progress = ui.ctx().animate_bool_with_time(
+        egui::Id::new(("pin", item.content_id.as_str())),
+        item.pinned,
+        PIN_ANIMATION_SECONDS,
+    );
+    let base_background = if selected {
+        CARD_SELECTED
     } else {
-        (CARD_BACKGROUND, TEXT)
+        CARD_BACKGROUND
     };
+    let background = base_background.lerp_to_gamma(CARD_SELECTED, 0.35 * pin_progress);
+    let foreground = if selected { TEXT_SELECTED } else { TEXT };
     let stroke = if selected {
         egui::Stroke::new(1.0_f32, ACCENT)
+    } else if pin_progress > 0.0 {
+        egui::Stroke::new(1.0_f32, ACCENT.gamma_multiply(pin_progress))
     } else {
         egui::Stroke::NONE
     };
 
-    ui.allocate_ui(size, |ui| {
+    let response = ui.allocate_ui(size, |ui| {
         egui::Frame::new()
             .fill(background)
             .stroke(stroke)
@@ -801,8 +903,7 @@ fn card(
                                     egui::Sense::hover(),
                                 );
                                 let scaled = fit(handle.size_vec2(), area.size());
-                                let texture =
-                                    egui::load::SizedTexture::new(handle.id(), scaled);
+                                let texture = egui::load::SizedTexture::new(handle.id(), scaled);
                                 egui::Image::new(texture).corner_radius(4).paint_at(
                                     ui,
                                     egui::Rect::from_center_size(area.center(), scaled),
@@ -820,12 +921,12 @@ fn card(
 
                     ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
                         ui.horizontal(|ui| {
-                            if item.pinned {
+                            if pin_progress > 0.0 {
                                 ui.label(
                                     egui::RichText::new("pin")
                                         .monospace()
                                         .size(META_SIZE)
-                                        .color(ACCENT),
+                                        .color(ACCENT.gamma_multiply(pin_progress)),
                                 );
                             }
                             if item.is_image {
@@ -869,13 +970,19 @@ fn card(
                 });
             });
     });
+    response
+        .response
+        .interact(egui::Sense::click())
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
 /// Wall-clock milliseconds since the Unix epoch.
 fn unix_millis() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |since| since.as_millis().min(u128::from(u64::MAX)) as u64)
+        .map_or(0, |since| {
+            since.as_millis().min(u128::from(u64::MAX)) as u64
+        })
 }
 
 /// Renders a byte count in the largest unit that keeps it under four digits.
