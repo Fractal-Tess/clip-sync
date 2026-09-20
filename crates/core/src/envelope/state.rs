@@ -34,7 +34,7 @@ impl StateKeys {
     ///
     /// Existing directly-derived `SQLCipher` databases are migrated to a random
     /// database key. Existing chunk stores and keyed content identities retain
-    /// their former derived roots so identifiers and ciphertext do not change.
+    /// their mesh-derived roots so identifiers and ciphertext remain portable.
     ///
     /// # Errors
     ///
@@ -126,14 +126,10 @@ fn initialize_keyslot(state_dir: &Path, secret: &MeshSecret) -> Result<StateKeys
         Err(error) => return Err(error.into()),
     };
     let chunk_catalog_exists = path_exists(&chunks_path.join("catalog.db"))?;
-
-    let chunks = if chunk_catalog_exists {
-        let legacy = secret.chunk_store_key()?;
-        ChunkStore::verify_key(&chunks_path, &legacy)?;
-        legacy
-    } else {
-        ChunkStoreKey::from_bytes(random_key()?)
-    };
+    let chunks = secret.chunk_store_key()?;
+    if chunk_catalog_exists {
+        ChunkStore::verify_key(&chunks_path, &chunks)?;
+    }
     let keys = StateKeys {
         storage: StorageKey::from_bytes(random_key()?),
         chunks,

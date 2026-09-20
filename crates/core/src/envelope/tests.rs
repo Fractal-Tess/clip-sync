@@ -8,6 +8,33 @@ fn secret(byte: u8) -> MeshSecret {
 }
 
 #[test]
+fn independently_initialized_mesh_members_share_chunk_identity_and_encryption() {
+    let first_directory = tempfile::tempdir().expect("first temporary directory");
+    let second_directory = tempfile::tempdir().expect("second temporary directory");
+    let mesh_secret = secret(42);
+    let first_lock = StoreLock::acquire(first_directory.path()).expect("first store lock");
+    let second_lock = StoreLock::acquire(second_directory.path()).expect("second store lock");
+    let first = StateKeys::open_or_create(&first_lock, &mesh_secret).expect("initialize first");
+    let second = StateKeys::open_or_create(&second_lock, &mesh_secret).expect("initialize second");
+
+    assert_ne!(
+        first.storage_key().as_bytes(),
+        second.storage_key().as_bytes(),
+        "database encryption remains device-local"
+    );
+    assert_eq!(
+        first.chunk_store_key().as_bytes(),
+        second.chunk_store_key().as_bytes(),
+        "replicated manifests and encrypted chunks require one mesh-wide key"
+    );
+    assert_eq!(
+        first.content_identity_key(),
+        second.content_identity_key(),
+        "clipboard content identities must be mesh-wide"
+    );
+}
+
+#[test]
 fn interruption_before_commit_resumes_without_changing_data_keys() {
     let directory = tempfile::tempdir().expect("temporary directory");
     let old = secret(1);
