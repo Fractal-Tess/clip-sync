@@ -207,16 +207,18 @@ pub(super) async fn persist_and_record(
     drop(state);
 
     let mut members = context.known_members.write().await;
-    members.insert(peer);
-    members.extend(known_members);
+    let mut changed = members.insert(peer);
+    for member in known_members {
+        changed |= members.insert(member);
+    }
     for (_, operation) in &decoded {
-        members.insert(operation.id().node());
+        changed |= members.insert(operation.id().node());
     }
     drop(members);
 
     for (_, operation) in decoded {
         if let Operation::ForgetDevice { node_id } = operation.operation() {
-            context.forgotten_devices.write().await.insert(*node_id);
+            changed |= context.forgotten_devices.write().await.insert(*node_id);
             if let Some(active) = context.registry.lock().await.remove(node_id) {
                 active
                     .connection
@@ -224,7 +226,15 @@ pub(super) async fn persist_and_record(
             }
         }
     }
-    bump_revision(&context.revision);
+
+    // The reconciliation loop wakes on this revision, so bumping it after an
+    // exchange that carried nothing makes every exchange schedule the next one
+    // and the mesh spins at full speed while idle. Each peer's task also wakes
+    // the others, so the cost scales with the mesh. Signalling only real change
+    // leaves the periodic tick as the floor for convergence.
+    if !operations.is_empty() || changed {
+        bump_revision(&context.revision);
+    }
     Ok(())
 }
 
