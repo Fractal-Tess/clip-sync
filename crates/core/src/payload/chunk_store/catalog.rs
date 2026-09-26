@@ -124,7 +124,7 @@ impl ChunkStore {
             id_key,
             config,
         };
-        store.cleanup_unreferenced()?;
+        store.recover()?;
         Ok(store)
     }
 

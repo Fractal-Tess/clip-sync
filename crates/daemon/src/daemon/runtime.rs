@@ -1,7 +1,7 @@
 use std::{collections::BTreeMap, fs, time::Duration};
 
 use anyhow::Context;
-use tokio::task::JoinHandle;
+use tokio::{task::JoinHandle, time::MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
 use zeroize::Zeroizing;
 
@@ -31,6 +31,11 @@ use super::{
     mesh_persistence::{MeshPersistenceContext, handle_mesh_batch, handle_mesh_chunk_command},
     views::{device_items, history_items},
 };
+
+/// How often the daemon reclaims chunk-store residue that the catalog cannot
+/// see. Interrupted writes are rare, and the sweep enumerates the whole store,
+/// so this stays well clear of the hot reconciliation path.
+const CHUNK_STORE_MAINTENANCE_INTERVAL: Duration = Duration::from_mins(5);
 
 /// Runs discovery and local IPC until a termination signal is received.
 ///
@@ -201,9 +206,19 @@ pub async fn run(paths: AppPaths, mut config: Config) -> anyhow::Result<()> {
     let mut active_materialization = None;
     let mut pending_materialization_cleanup = None;
     let materialization_root = paths.runtime_dir.join("materialized");
+    let mut chunk_store_maintenance = tokio::time::interval_at(
+        tokio::time::Instant::now() + CHUNK_STORE_MAINTENANCE_INTERVAL,
+        CHUNK_STORE_MAINTENANCE_INTERVAL,
+    );
+    chunk_store_maintenance.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
     loop {
         tokio::select! {
+            _ = chunk_store_maintenance.tick() => {
+                if let Err(error) = transfers.store_mut().sweep_orphans() {
+                    tracing::warn!(%error, "chunk-store orphan sweep failed");
+                }
+            }
             result = &mut server, if !server_finished => {
                 server_finished = true;
                 result.context("serve local IPC")?;

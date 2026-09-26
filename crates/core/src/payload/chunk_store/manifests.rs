@@ -211,7 +211,13 @@ impl ChunkStore {
             "DELETE FROM staged_manifests WHERE id = ?1",
             [id.as_bytes().as_slice()],
         )?;
-        self.cleanup_unreferenced()?;
+        // Reconciliation calls this for every projected transfer on every
+        // received mesh batch, and almost always finds nothing staged.
+        // Reclaiming only after a real delete keeps the steady state free of
+        // catalog scans.
+        if changed != 0 {
+            self.cleanup_unreferenced()?;
+        }
         Ok(changed != 0)
     }
     /// Deletes a manifest and reclaims chunks with no remaining references.

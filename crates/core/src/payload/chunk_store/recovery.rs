@@ -55,7 +55,10 @@ impl ChunkStore {
         Ok(removed)
     }
 
-    /// Removes all cataloged zero-ref chunks and abandoned staging files.
+    /// Removes all cataloged zero-ref chunks and their backing files.
+    ///
+    /// The work is proportional to the garbage actually present. Residue that
+    /// the catalog cannot see is handled by [`ChunkStore::sweep_orphans`].
     ///
     /// # Errors
     ///
@@ -112,9 +115,36 @@ impl ChunkStore {
                 .checked_add(ids.len())
                 .ok_or(ChunkStoreError::SizeOverflow)?;
         }
-        self.cleanup_staging()?;
-        removed
+        Ok(removed)
+    }
+
+    /// Reclaims on-disk residue that the catalog cannot account for.
+    ///
+    /// Both passes enumerate the whole chunk directory, so the cost is
+    /// proportional to the store rather than to the garbage actually present.
+    /// Abandoned staging files and uncataloged objects are only produced by an
+    /// interrupted write, so this runs at open and on the daemon's maintenance
+    /// tick instead of on every catalog mutation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for directory enumeration or file removal failures.
+    pub fn sweep_orphans(&mut self) -> Result<usize, ChunkStoreError> {
+        let staged = self.cleanup_staging()?;
+        staged
             .checked_add(self.cleanup_orphan_objects()?)
+            .ok_or(ChunkStoreError::SizeOverflow)
+    }
+
+    /// Runs catalog reclamation followed by a full filesystem sweep.
+    ///
+    /// # Errors
+    ///
+    /// Returns SQL, malformed catalog, or filesystem cleanup errors.
+    pub fn recover(&mut self) -> Result<usize, ChunkStoreError> {
+        let reclaimed = self.cleanup_unreferenced()?;
+        reclaimed
+            .checked_add(self.sweep_orphans()?)
             .ok_or(ChunkStoreError::SizeOverflow)
     }
 
