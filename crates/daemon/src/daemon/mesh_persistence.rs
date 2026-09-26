@@ -36,8 +36,14 @@ pub(super) async fn handle_mesh_batch(
     batch: PersistBatch,
     context: &mut MeshPersistenceContext<'_>,
 ) {
+    // An exchange that carried no operations leaves history, devices, and
+    // config exactly as they were, so there is nothing to republish. It also
+    // must not wake the mesh: notify_transfers bumps the revision that drives
+    // reconciliation, and doing that here made every batch schedule the next
+    // exchange, which kept the mesh reconciling at full speed while idle.
+    let carried_operations = !batch.operations().is_empty();
     let result = persist_mesh_batch(&batch, context).await;
-    if result.is_ok() {
+    if result.is_ok() && carried_operations {
         context
             .state
             .set_device_names(
