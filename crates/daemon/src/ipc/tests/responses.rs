@@ -256,7 +256,7 @@ async fn history_search_uses_authenticated_device_name_aliases() {
             protocol_version: IPC_PROTOCOL_VERSION,
             request_id: 80,
             body: Some(request::Body::History(HistoryRequest {
-                query: "D:vd,T:image,P:true".to_owned(),
+                query: "VD image".to_owned(),
                 limit: 100,
                 offset: 0,
             })),
@@ -270,7 +270,7 @@ async fn history_search_uses_authenticated_device_name_aliases() {
 }
 
 #[tokio::test]
-async fn history_search_applies_typed_filters_in_newest_first_order() {
+async fn history_search_matches_every_word_in_newest_first_order() {
     let temporary = tempfile::tempdir().expect("temporary directory");
     let (commands, _command_rx) = mpsc::unbounded_channel();
     let state = DaemonState::new(
@@ -322,12 +322,7 @@ async fn history_search_applies_typed_filters_in_newest_first_order() {
             protocol_version: IPC_PROTOCOL_VERSION,
             request_id: 81,
             body: Some(request::Body::History(HistoryRequest {
-                query: concat!(
-                    r#""release notes" device:"office laptop" type:markdown "#,
-                    "pinned:true min-size:4KiB max-size:5KB ",
-                    "before:2024-01-01T00:00:00Z"
-                )
-                .to_owned(),
+                query: "release notes office markdown".to_owned(),
                 limit: 500,
                 offset: 0,
             })),
@@ -347,7 +342,7 @@ async fn history_search_applies_typed_filters_in_newest_first_order() {
 }
 
 #[tokio::test]
-async fn invalid_history_query_error_is_stable_and_does_not_echo_value() {
+async fn oversized_history_query_error_is_stable_and_does_not_echo_value() {
     let temporary = tempfile::tempdir().expect("temporary directory");
     let (commands, _command_rx) = mpsc::unbounded_channel();
     let state = DaemonState::new(
@@ -361,7 +356,7 @@ async fn invalid_history_query_error_is_stable_and_does_not_echo_value() {
             protocol_version: IPC_PROTOCOL_VERSION,
             request_id: 82,
             body: Some(request::Body::History(HistoryRequest {
-                query: "pinned:private-value".to_owned(),
+                query: "private-value ".repeat(400),
                 limit: 100,
                 offset: 0,
             })),
@@ -371,10 +366,7 @@ async fn invalid_history_query_error_is_stable_and_does_not_echo_value() {
         panic!("expected error response");
     };
     assert_eq!(error.code, "invalid_history_query");
-    assert_eq!(
-        error.message,
-        "invalid query at byte 0: pinned expects true or false"
-    );
+    assert_eq!(error.message, "history query exceeds 4096 bytes");
     assert!(!error.message.contains("private-value"));
 }
 
