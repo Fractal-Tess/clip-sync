@@ -2,7 +2,6 @@ mod commands;
 mod devices;
 mod diagnostics;
 mod history;
-mod rekey;
 mod settings;
 mod share;
 mod support;
@@ -22,7 +21,6 @@ use commands::{Cli, Command};
 use devices::{device_command, peers};
 use diagnostics::{doctor, status};
 use history::history_command;
-use rekey::rekey_command;
 use settings::config_command;
 use share::share_clipboard;
 use transfer::transfer_command;
@@ -89,7 +87,6 @@ impl ParsedInvocation {
             Some(Command::ShareClipboard(output)) => share_clipboard(&paths, output).await,
             Some(Command::Transfer { command }) => transfer_command(&paths, command).await,
             Some(Command::Device { command }) => device_command(&paths, command).await,
-            Some(Command::Rekey(args)) => rekey_command(&paths, &args),
             None | Some(Command::Desktop(_) | Command::Daemon) => {
                 bail!("invocation is not a client command")
             }

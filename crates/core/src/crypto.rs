@@ -5,15 +5,13 @@ use sha2::Sha256;
 use thiserror::Error;
 use zeroize::Zeroizing;
 
-use crate::{payload::ChunkStoreKey, storage::StorageKey, transport::Psk};
+use crate::{payload::ChunkStoreKey, transport::Psk};
 
 const SECRET_BYTES: usize = 32;
 const CONTENT_KEY_INFO: &[u8] = b"clip-sync/content-id-key/v1";
 const TRANSPORT_KEY_INFO: &[u8] = b"clip-sync/transport-auth-key/v1";
-const DISCOVERY_KEY_INFO: &[u8] = b"clip-sync/interface-discovery-auth-key/v1";
 const CHUNK_STORE_KEY_INFO: &[u8] = b"clip-sync/chunk-store/root-key/v1";
 const ENVELOPE_KEY_INFO: &[u8] = b"clip-sync/envelope/key-encryption-key/v1";
-const STORAGE_SALT: &[u8] = b"clip-sync/storage-salt/v1";
 
 /// High-entropy shared mesh secret loaded from an owner-only file.
 pub struct MeshSecret {
@@ -73,29 +71,6 @@ impl MeshSecret {
         hkdf.expand(TRANSPORT_KEY_INFO, key.as_mut())
             .map_err(|_| SecretError::Derivation)?;
         Psk::new(key.as_ref()).map_err(|_| SecretError::Derivation)
-    }
-
-    /// Derives the key used to authenticate interface discovery beacons.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if HKDF expansion unexpectedly fails.
-    pub fn discovery_key(&self) -> Result<Zeroizing<[u8; 32]>, SecretError> {
-        let hkdf = Hkdf::<Sha256>::new(None, self.bytes.as_ref());
-        let mut key = Zeroizing::new([0; 32]);
-        hkdf.expand(DISCOVERY_KEY_INFO, key.as_mut())
-            .map_err(|_| SecretError::Derivation)?;
-        Ok(key)
-    }
-
-    /// Derives the `SQLCipher` spike key with domain separation.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if key derivation unexpectedly fails.
-    pub fn storage_key(&self) -> Result<StorageKey, SecretError> {
-        StorageKey::derive_from_secret(self.bytes.as_ref(), STORAGE_SALT)
-            .map_err(|_| SecretError::Derivation)
     }
 
     /// Derives the keyed content-identity key.

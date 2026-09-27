@@ -72,14 +72,6 @@ fn every_client_command_routes_to_client_mode() {
         vec!["clip-sync", "transfer", "list"],
         vec!["clip-sync", "transfer", "cancel", "transfer"],
         vec!["clip-sync", "device", "forget", "device"],
-        vec![
-            "clip-sync",
-            "rekey",
-            "--old-key-file",
-            "old.key",
-            "--new-key-file",
-            "new.key",
-        ],
     ];
 
     for arguments in commands {
@@ -128,14 +120,6 @@ fn cli_exposes_history_search_and_mutations() {
             "wt0",
             "tun0",
             "--json",
-        ],
-        vec![
-            "clip-sync",
-            "rekey",
-            "--old-key-file",
-            "old.key",
-            "--new-key-file",
-            "new.key",
         ],
     ] {
         Cli::try_parse_from(arguments).expect("command should parse");

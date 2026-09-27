@@ -1,11 +1,11 @@
 pub mod clipboard;
 pub mod config;
 pub mod crypto;
-pub mod envelope;
 pub mod model;
 pub mod payload;
 pub mod replica;
 pub mod replication;
+pub mod state_keys;
 pub mod storage;
 pub mod transfer;
 pub mod transport;

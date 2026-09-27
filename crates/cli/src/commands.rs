@@ -46,8 +46,6 @@ pub(super) enum Command {
         #[command(subcommand)]
         command: DeviceCommand,
     },
-    /// Rotate the mesh secret wrapping local encrypted-store data keys.
-    Rekey(RekeyArgs),
 }
 
 #[derive(Debug, Clone, Copy, Args)]
@@ -111,16 +109,6 @@ pub(super) struct MutationArgs {
     pub(super) content_id: String,
     #[arg(long)]
     pub(super) json: bool,
-}
-
-#[derive(Debug, Args)]
-pub(super) struct RekeyArgs {
-    /// Owner-only file containing the currently active mesh secret.
-    #[arg(long, value_name = "PATH")]
-    pub(super) old_key_file: PathBuf,
-    /// Owner-only file containing the replacement mesh secret.
-    #[arg(long, value_name = "PATH")]
-    pub(super) new_key_file: PathBuf,
 }
 
 #[derive(Debug, Subcommand)]

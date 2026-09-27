@@ -3,16 +3,15 @@ use std::{collections::BTreeMap, fs, time::Duration};
 use anyhow::Context;
 use tokio::{task::JoinHandle, time::MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
-use zeroize::Zeroizing;
 
 use clip_sync_core::{
     clipboard::{backend::ClipboardEvent, wayland::WaylandBackend},
     config::{AppPaths, Config},
     crypto::MeshSecret,
-    envelope::{StateKeys, StoreLock},
     payload::{
         ChunkStore, ChunkStoreConfig, ExplicitSharePolicy, Materializer, MaterializerConfig,
     },
+    state_keys::{StateKeys, StoreLock},
     storage::HistoryStore,
     transfer::{TransferCoordinator, TransferStateLimits},
 };
@@ -61,7 +60,7 @@ pub async fn run(paths: AppPaths, mut config: Config) -> anyhow::Result<()> {
     let mesh_secret = MeshSecret::load(&config.local.mesh_key_file)
         .context("load mesh secret from configured file")?;
     let state_keys =
-        StateKeys::open_or_create(&store_lock, &mesh_secret).context("open encrypted keyslot")?;
+        StateKeys::open_or_create(&store_lock, &mesh_secret).context("open local state key")?;
     let storage_path = paths.state_dir.join("history.db");
     let mut history = HistoryStore::open(&storage_path, state_keys.storage_key())
         .with_context(|| format!("open encrypted history at {}", storage_path.display()))?;
@@ -72,9 +71,6 @@ pub async fn run(paths: AppPaths, mut config: Config) -> anyhow::Result<()> {
     let transport_psk = mesh_secret
         .transport_psk()
         .context("derive mesh transport key")?;
-    let discovery_key = mesh_secret
-        .discovery_key()
-        .context("derive interface discovery key")?;
     let chunk_store = ChunkStore::open(
         paths.state_dir.join("chunks"),
         state_keys.chunk_store_key(),
@@ -165,7 +161,6 @@ pub async fn run(paths: AppPaths, mut config: Config) -> anyhow::Result<()> {
         state.clone(),
         mesh_handle.clone(),
         hostname,
-        discovery_key,
         shutdown.clone(),
     );
     let (config_tx, mut config_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -350,11 +345,12 @@ pub(super) fn unix_time_millis() -> anyhow::Result<u64> {
     u64::try_from(millis).context("system clock milliseconds exceed u64")
 }
 
+/// Re-reads interface addresses on the configured interval, so a VPN that
+/// reconnects with a new address is picked up without restarting.
 fn spawn_discovery(
     state: DaemonState,
     mesh: MeshHandle,
     hostname: String,
-    discovery_key: Zeroizing<[u8; 32]>,
     shutdown: CancellationToken,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -366,31 +362,21 @@ fn spawn_discovery(
                 config.local.peer_addresses,
                 hostname.clone(),
                 config.local.listen_port,
-                discovery_key.clone(),
-                interval,
             );
-            match discovery.discover(shutdown.child_token()).await {
+            match discovery.discover().await {
                 Ok(snapshot) => {
-                    tracing::debug!(
-                        peer_count = snapshot.peers.len(),
-                        interface_count = snapshot.local_addresses.len(),
-                        "interface discovery updated"
-                    );
                     mesh.update_discovery(snapshot.clone());
                     state.set_discovery(snapshot).await;
                 }
                 Err(error) => {
                     mesh.clear_discovery();
                     state.set_discovery_error(error.to_string()).await;
-                    tracing::warn!(%error, "interface discovery is unavailable");
-                    tokio::select! {
-                        () = shutdown.cancelled() => break,
-                        () = tokio::time::sleep(interval) => {}
-                    }
+                    tracing::warn!(%error, "peer interfaces are unavailable");
                 }
             }
-            if shutdown.is_cancelled() {
-                break;
+            tokio::select! {
+                () = shutdown.cancelled() => break,
+                () = tokio::time::sleep(interval) => {}
             }
         }
     })

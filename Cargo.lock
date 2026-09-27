@@ -520,9 +520,7 @@ dependencies = [
  "clip-sync-ipc",
  "fs2",
  "futures-util",
- "getrandom 0.4.3",
  "hex",
- "hmac",
  "hostname",
  "image",
  "ipnet",
@@ -532,18 +530,14 @@ dependencies = [
  "rustix 1.1.4",
  "serde",
  "serde_json",
- "sha2",
- "socket2",
  "tempfile",
  "thiserror 2.0.19",
- "time",
  "tokio",
  "tokio-util",
  "tracing",
  "tracing-subscriber",
  "url",
  "uuid",
- "zeroize",
 ]
 
 [[package]]
