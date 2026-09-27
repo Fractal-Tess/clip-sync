@@ -42,7 +42,9 @@ in
         LockPersonality = true;
         MemoryDenyWriteExecute = true;
         NoNewPrivileges = true;
-        PrivateTmp = true;
+        # Copied files are served from where they are, and /tmp is a common
+        # place for them; a private /tmp would hide them from the daemon.
+        PrivateTmp = false;
         ProtectClock = true;
         ProtectControlGroups = true;
         ProtectKernelLogs = true;
