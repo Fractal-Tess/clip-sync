@@ -129,6 +129,7 @@ fn history_json_fields_are_stable() {
             physical_millis: 1_704_067_200_000,
             origin_millis: Some(1_704_067_200_000),
             remote: true,
+            pinned_millis: None,
         }),
         serde_json::json!({
             "content_id": "content",

@@ -29,6 +29,9 @@ pub(super) fn history_items(replica: &Replica) -> Vec<HistoryItem> {
                 origin_millis: Some(origin.timestamp().physical_millis()),
                 remote: matches!(view.item(), Some(ItemKind::Reference(_)))
                     && origin.operation_id().node() != local,
+                pinned_millis: view
+                    .pinned_at()
+                    .map(|event| event.timestamp().physical_millis()),
             }
         })
         .collect()

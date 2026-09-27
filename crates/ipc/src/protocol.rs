@@ -178,6 +178,9 @@ pub struct HistoryItem {
     /// from it when the item is activated here.
     #[prost(bool, tag = "10")]
     pub remote: bool,
+    /// When the item was pinned, for a stable pin order; absent if unpinned.
+    #[prost(uint64, optional, tag = "11")]
+    pub pinned_millis: Option<u64>,
 }
 
 #[derive(Clone, PartialEq, Eq, Message)]

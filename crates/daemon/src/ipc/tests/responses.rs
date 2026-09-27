@@ -53,6 +53,7 @@ async fn history_search_is_bounded_and_case_insensitive() {
                 physical_millis: 2,
                 origin_millis: Some(2),
                 remote: false,
+                pinned_millis: None,
             },
             HistoryItem {
                 content_id: "beta".to_owned(),
@@ -65,6 +66,7 @@ async fn history_search_is_bounded_and_case_insensitive() {
                 physical_millis: 1,
                 origin_millis: Some(1),
                 remote: false,
+                pinned_millis: None,
             },
         ])
         .await;
@@ -110,6 +112,7 @@ async fn history_response_honors_offset_and_reports_total() {
             physical_millis: index,
             origin_millis: Some(index),
             remote: false,
+            pinned_millis: None,
         })
         .collect();
     state.set_history(items).await;
@@ -252,6 +255,7 @@ async fn history_search_uses_authenticated_device_name_aliases() {
             physical_millis: 1,
             origin_millis: Some(1),
             remote: false,
+            pinned_millis: None,
         }])
         .await;
 
@@ -296,6 +300,7 @@ async fn history_search_matches_every_word_in_newest_first_order() {
                 physical_millis: 1_704_067_199_000,
                 origin_millis: Some(1_704_067_199_000),
                 remote: false,
+                pinned_millis: None,
             },
             HistoryItem {
                 content_id: "new".to_owned(),
@@ -308,6 +313,7 @@ async fn history_search_matches_every_word_in_newest_first_order() {
                 physical_millis: 1_704_067_199_500,
                 origin_millis: Some(1_704_067_199_500),
                 remote: false,
+                pinned_millis: None,
             },
             HistoryItem {
                 content_id: "wrong-device".to_owned(),
@@ -320,6 +326,7 @@ async fn history_search_matches_every_word_in_newest_first_order() {
                 physical_millis: 1_704_067_199_900,
                 origin_millis: Some(1_704_067_199_900),
                 remote: false,
+                pinned_millis: None,
             },
         ])
         .await;
@@ -399,6 +406,7 @@ async fn large_history_search_stays_responsive_and_bounded() {
             physical_millis: index,
             origin_millis: Some(index),
             remote: false,
+            pinned_millis: None,
         })
         .collect();
     state.set_history(items).await;

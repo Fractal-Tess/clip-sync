@@ -25,6 +25,7 @@ use winit::{
 use crate::{
     control::Control,
     daemon::{Daemon, HistoryItem},
+    selection::{Move, Selection, Zone},
     theme::{
         ACCENT, BACKGROUND, CARD_BACKGROUND, CARD_SELECTED, DANGER, SELECTION, SURFACE, TEXT,
         TEXT_SELECTED,
@@ -82,14 +83,20 @@ pub struct Picker {
     started: Instant,
     timing: bool,
     items: Vec<HistoryItem>,
-    filtered: Vec<usize>,
+    /// Unpinned matches, newest first, as indices into `items`.
+    history: Vec<usize>,
+    /// Pinned matches in the order they were pinned, so their numbers (and
+    /// alt+1…9) stay put however often they are used.
+    pins: Vec<usize>,
     query: String,
     /// Whether ctrl+a has selected the whole query, so the next keystroke
     /// replaces it instead of appending to it.
     query_selected: bool,
-    selected: usize,
-    /// Column count from the last paint, so key handling can move by a row.
+    selection: Selection,
+    /// Grid shape from the last paint, so key handling can move by a row or
+    /// a screen.
     columns: usize,
+    rows: usize,
     /// Item indices that the last paint drew.
     visible: Vec<usize>,
     textures: HashMap<String, egui::TextureHandle>,
@@ -122,11 +129,13 @@ impl Picker {
             started,
             timing: std::env::var_os("CLIP_SYNC_TIMING").is_some(),
             items: Vec::new(),
-            filtered: Vec::new(),
+            history: Vec::new(),
+            pins: Vec::new(),
             query: String::new(),
             query_selected: false,
-            selected: 0,
+            selection: Selection::default(),
             columns: 1,
+            rows: 1,
             visible: Vec::new(),
             textures: HashMap::new(),
             undecodable: HashSet::new(),
@@ -169,12 +178,16 @@ impl Picker {
     /// refetched rather than patched in place.
     fn reload_keeping(&mut self, content_id: &str) {
         self.load_history();
-        if let Some(position) = self
-            .filtered
-            .iter()
-            .position(|&index| self.items[index].content_id == content_id)
-        {
-            self.selected = position;
+        let find = |list: &[usize]| {
+            list.iter()
+                .position(|&index| self.items[index].content_id == content_id)
+        };
+        if let Some(position) = find(&self.pins) {
+            self.selection.zone = Zone::Pins;
+            self.selection.pins = position;
+        } else if let Some(position) = find(&self.history) {
+            self.selection.zone = Zone::History;
+            self.selection.history = position;
         }
     }
 
@@ -184,7 +197,7 @@ impl Picker {
     /// a daemon round trip per keystroke would add latency for no benefit.
     fn refilter(&mut self) {
         let needle = self.query.trim().to_lowercase();
-        self.filtered = self
+        let matches = self
             .items
             .iter()
             .enumerate()
@@ -193,25 +206,50 @@ impl Picker {
                     || item.preview.to_lowercase().contains(&needle)
                     || item.source.to_lowercase().contains(&needle)
             })
-            .map(|(index, _)| index)
-            .collect();
-        self.selected = self.selected.min(self.filtered.len().saturating_sub(1));
+            .map(|(index, _)| index);
+        let (mut pins, history): (Vec<usize>, Vec<usize>) =
+            matches.partition(|&index| self.items[index].pinned);
+        let items = &self.items;
+        pins.sort_by(|&left, &right| {
+            let (left, right) = (&items[left], &items[right]);
+            left.pinned_millis
+                .cmp(&right.pinned_millis)
+                .then_with(|| left.content_id.cmp(&right.content_id))
+        });
+        self.history = history;
+        self.pins = pins;
+        self.selection.clamp(self.history.len(), self.pins.len());
     }
 
-    fn move_selection(&mut self, delta: isize) {
-        if self.filtered.is_empty() {
-            return;
-        }
-        let last = self.filtered.len() - 1;
-        self.selected = match delta {
-            d if d < 0 => self.selected.saturating_sub(d.unsigned_abs()),
-            d => (self.selected + d.unsigned_abs()).min(last),
+    fn navigate(&mut self, movement: Move) {
+        self.selection.apply(
+            movement,
+            self.history.len(),
+            self.pins.len(),
+            self.columns,
+            self.rows,
+        );
+    }
+
+    /// Resets both cursors to the top after the query changed.
+    fn restart_selection(&mut self) {
+        let zone = self.selection.zone;
+        self.selection = Selection {
+            zone,
+            ..Selection::default()
         };
+        self.refilter();
+    }
+
+    fn selected_index(&self) -> Option<usize> {
+        match self.selection.zone {
+            Zone::History => self.history.get(self.selection.history).copied(),
+            Zone::Pins => self.pins.get(self.selection.pins).copied(),
+        }
     }
 
     fn selected_content_id(&self) -> Option<String> {
-        let &index = self.filtered.get(self.selected)?;
-        Some(self.items[index].content_id.clone())
+        Some(self.items[self.selected_index()?].content_id.clone())
     }
 
     fn activate_selected(&mut self, event_loop: &ActiveEventLoop) {
@@ -230,8 +268,18 @@ impl Picker {
         }
     }
 
+    /// Pastes the Nth pin (one-based, as numbered on screen) directly.
+    fn activate_pin(&mut self, event_loop: &ActiveEventLoop, number: usize) {
+        if number == 0 || number > self.pins.len() {
+            return;
+        }
+        self.selection.zone = Zone::Pins;
+        self.selection.pins = number - 1;
+        self.activate_selected(event_loop);
+    }
+
     fn toggle_pin(&mut self) {
-        let Some(&index) = self.filtered.get(self.selected) else {
+        let Some(index) = self.selected_index() else {
             return;
         };
         let content_id = self.items[index].content_id.clone();
@@ -257,9 +305,7 @@ impl Picker {
             Ok(()) => {
                 self.status = None;
                 self.textures.remove(&content_id);
-                let position = self.selected;
                 self.load_history();
-                self.selected = position.min(self.filtered.len().saturating_sub(1));
             }
             Err(error) => self.status = Some(format!("{error:#}")),
         }
@@ -312,8 +358,16 @@ impl Picker {
             return;
         }
 
-        let columns = self.columns.max(1) as isize;
-        let page = columns * 4;
+        // Pins are numbered on screen; alt plus the number pastes one without
+        // navigating to it.
+        if self.modifiers.alt_key() {
+            if let Key::Character(digit) = key.as_ref()
+                && let Ok(number) = digit.parse::<usize>()
+            {
+                self.activate_pin(event_loop, number);
+            }
+            return;
+        }
 
         if self.modifiers.control_key() {
             match key.as_ref() {
@@ -323,8 +377,7 @@ impl Picker {
                 Key::Character("u") => {
                     self.query.clear();
                     self.query_selected = false;
-                    self.selected = 0;
-                    self.refilter();
+                    self.restart_selection();
                 }
                 _ => return,
             }
@@ -347,24 +400,24 @@ impl Picker {
                 return;
             }
             Key::Named(NamedKey::Delete) => self.delete_selected(),
-            Key::Named(NamedKey::ArrowRight) => self.move_selection(1),
-            Key::Named(NamedKey::ArrowLeft) => self.move_selection(-1),
-            Key::Named(NamedKey::ArrowDown) => self.move_selection(columns),
-            Key::Named(NamedKey::ArrowUp) => self.move_selection(-columns),
-            Key::Named(NamedKey::PageDown) => self.move_selection(page),
-            Key::Named(NamedKey::PageUp) => self.move_selection(-page),
-            Key::Named(NamedKey::Home) => self.selected = 0,
-            Key::Named(NamedKey::End) => {
-                self.selected = self.filtered.len().saturating_sub(1);
-            }
+            Key::Named(NamedKey::Tab) => self
+                .selection
+                .toggle_zone(self.history.len(), self.pins.len()),
+            Key::Named(NamedKey::ArrowRight) => self.navigate(Move::Right),
+            Key::Named(NamedKey::ArrowLeft) => self.navigate(Move::Left),
+            Key::Named(NamedKey::ArrowDown) => self.navigate(Move::Down),
+            Key::Named(NamedKey::ArrowUp) => self.navigate(Move::Up),
+            Key::Named(NamedKey::PageDown) => self.navigate(Move::PageDown),
+            Key::Named(NamedKey::PageUp) => self.navigate(Move::PageUp),
+            Key::Named(NamedKey::Home) => self.navigate(Move::First),
+            Key::Named(NamedKey::End) => self.navigate(Move::Last),
             Key::Named(NamedKey::Backspace) => {
                 if replacing {
                     self.query.clear();
                 } else {
                     self.query.pop();
                 }
-                self.selected = 0;
-                self.refilter();
+                self.restart_selection();
             }
             _ => {
                 let typed = text.unwrap_or_default();
@@ -375,8 +428,7 @@ impl Picker {
                     self.query.clear();
                 }
                 self.query.push_str(typed);
-                self.selected = 0;
-                self.refilter();
+                self.restart_selection();
             }
         }
         self.request_redraw();
@@ -427,7 +479,18 @@ impl Picker {
         input.screen_rect = Some(egui::Rect::from_min_size(egui::pos2(0.0, 0.0), points));
 
         match self.view {
-            View::Picker => self.draw_picker(event_loop, input, points),
+            View::Picker => {
+                let (output, clicked) = self.draw_picker(input, points);
+                if let Some((zone, position)) = clicked {
+                    self.selection.zone = zone;
+                    match zone {
+                        Zone::History => self.selection.history = position,
+                        Zone::Pins => self.selection.pins = position,
+                    }
+                    self.activate_selected(event_loop);
+                }
+                output
+            }
             View::Control => self.draw_control(input),
         }
     }
@@ -473,28 +536,14 @@ impl Picker {
     }
 
     #[allow(clippy::too_many_lines)]
+    /// Lays out and draws the picker, returning the card clicked, if any.
     fn draw_picker(
         &mut self,
-        event_loop: &ActiveEventLoop,
         input: egui::RawInput,
         points: egui::Vec2,
-    ) -> egui::FullOutput {
+    ) -> (egui::FullOutput, Option<(Zone, usize)>) {
         let grid_width = points.x - 2.0 * MARGIN;
-        let pinned: Vec<(usize, usize)> = self
-            .filtered
-            .iter()
-            .copied()
-            .enumerate()
-            .filter(|(_, index)| self.items[*index].pinned)
-            .collect();
-        let unpinned: Vec<(usize, usize)> = self
-            .filtered
-            .iter()
-            .copied()
-            .enumerate()
-            .filter(|(_, index)| !self.items[*index].pinned)
-            .collect();
-        let pinned_width = if pinned.is_empty() {
+        let pinned_width = if self.pins.is_empty() {
             0.0
         } else {
             PINNED_COLUMN_WIDTH + GAP
@@ -507,39 +556,56 @@ impl Picker {
             (((grid_height + GAP) / (MIN_CARD_HEIGHT + GAP)).floor() as usize).max(1);
         let card_height = (grid_height - GAP * (visible_rows - 1) as f32) / visible_rows as f32;
 
-        let selected_item = self.filtered.get(self.selected).copied();
-        let selected_main = unpinned
-            .iter()
-            .position(|(_, index)| Some(*index) == selected_item)
-            .unwrap_or_default();
-        let first_row = (selected_main / columns).saturating_sub(visible_rows.saturating_sub(1));
+        // Each zone scrolls by its own cursor, so moving into the pins does
+        // not scroll the grid away from where you left it.
+        let selection = self.selection;
+        let first_row =
+            (selection.history / columns).saturating_sub(visible_rows.saturating_sub(1));
         let main_start = first_row * columns;
-        let main_end = (main_start + visible_rows * columns).min(unpinned.len());
-        let rows: Vec<&[(usize, usize)]> = unpinned[main_start..main_end].chunks(columns).collect();
-
-        let selected_pinned = pinned
+        let main_end = (main_start + visible_rows * columns).min(self.history.len());
+        let rows: Vec<Vec<(usize, usize)>> = self.history[main_start..main_end]
             .iter()
-            .position(|(_, index)| Some(*index) == selected_item)
-            .unwrap_or_default();
-        let pinned_start = selected_pinned.saturating_sub(visible_rows.saturating_sub(1));
-        let pinned_end = (pinned_start + visible_rows).min(pinned.len());
-        let visible_pinned = &pinned[pinned_start..pinned_end];
+            .copied()
+            .enumerate()
+            .map(|(offset, index)| (main_start + offset, index))
+            .collect::<Vec<_>>()
+            .chunks(columns)
+            .map(<[(usize, usize)]>::to_vec)
+            .collect();
+
+        let pinned_start = selection
+            .pins
+            .saturating_sub(visible_rows.saturating_sub(1));
+        let pinned_end = (pinned_start + visible_rows).min(self.pins.len());
+        let visible_pinned: Vec<(usize, usize)> = (pinned_start..pinned_end)
+            .map(|position| (position, self.pins[position]))
+            .collect();
         let pinned_card_height =
             (grid_height - 2.0 * CARD_PADDING - PINNED_HEADER_HEIGHT - GAP * visible_rows as f32)
                 / visible_rows as f32;
+        let pin_count = self.pins.len();
+        let pins_focused = selection.zone == Zone::Pins;
 
         let query = self.query.clone();
         let query_selected = self.query_selected;
         let status = self.status.clone();
         let now = unix_millis();
         let total = self.items.len();
-        let shown = self.filtered.len();
-        let position = if shown == 0 { 0 } else { self.selected + 1 };
+        let counter = if pins_focused {
+            format!("pin {}/{pin_count}", selection.pins + 1)
+        } else {
+            let shown = self.history.len();
+            let position = if shown == 0 { 0 } else { selection.history + 1 };
+            if shown + pin_count == total {
+                format!("{position}/{shown}")
+            } else {
+                format!("{position}/{shown} of {total}")
+            }
+        };
         let items = &self.items;
         let textures = &self.textures;
         let local = self.local.as_str();
-        let selected = self.selected;
-        let filtered_empty = self.filtered.is_empty();
+        let nothing_matches = self.history.is_empty() && self.pins.is_empty();
 
         let mut clicked = None;
         let output = self.egui.run_ui(input, |root| {
@@ -592,13 +658,8 @@ impl Picker {
                         ui.with_layout(
                             egui::Layout::right_to_left(egui::Align::Center),
                             |ui| {
-                                let counter = if shown == total {
-                                    format!("{position}/{total}")
-                                } else {
-                                    format!("{position}/{shown} of {total}")
-                                };
                                 ui.label(
-                                    egui::RichText::new(counter)
+                                    egui::RichText::new(counter.as_str())
                                         .monospace()
                                         .size(META_SIZE + 1.0)
                                         .weak(),
@@ -611,7 +672,7 @@ impl Picker {
                         ui.colored_label(DANGER, status);
                     }
 
-                    if filtered_empty {
+                    if nothing_matches {
                         ui.add_space(GAP);
                         ui.label(egui::RichText::new("No matching entries").weak());
                     }
@@ -621,7 +682,7 @@ impl Picker {
                             egui::vec2(main_width, grid_height),
                             egui::Layout::top_down(egui::Align::LEFT),
                             |ui| {
-                                if rows.is_empty() && !visible_pinned.is_empty() {
+                                if rows.is_empty() && pin_count > 0 {
                                     ui.label(
                                         egui::RichText::new("All matching entries are pinned")
                                             .weak(),
@@ -629,11 +690,14 @@ impl Picker {
                                 }
                                 for row in &rows {
                                     ui.horizontal(|ui| {
-                                        for (position, index) in *row {
+                                        for &(position, index) in row {
+                                            let selected = !pins_focused
+                                                && position == selection.history;
                                             if card(
                                                 ui,
-                                                &items[*index],
-                                                *position == selected,
+                                                &items[index],
+                                                selected,
+                                                None,
                                                 textures,
                                                 egui::vec2(card_width, card_height),
                                                 local,
@@ -641,7 +705,7 @@ impl Picker {
                                             )
                                             .clicked()
                                             {
-                                                clicked = Some(*position);
+                                                clicked = Some((Zone::History, position));
                                             }
                                         }
                                     });
@@ -649,7 +713,7 @@ impl Picker {
                             },
                         );
 
-                        if !visible_pinned.is_empty() {
+                        if pin_count > 0 {
                             egui::Frame::new()
                                 .fill(SURFACE)
                                 .corner_radius(6)
@@ -658,20 +722,46 @@ impl Picker {
                                     ui.vertical(|ui| {
                                         ui.set_width(PINNED_COLUMN_WIDTH - 2.0 * CARD_PADDING);
                                         ui.set_min_height(grid_height - 2.0 * CARD_PADDING);
-                                        ui.label(
-                                            egui::RichText::new(format!(
-                                                "PINNED  {}",
-                                                pinned.len()
-                                            ))
-                                            .monospace()
-                                            .size(META_SIZE + 1.0)
-                                            .color(ACCENT),
-                                        );
-                                        for (position, index) in visible_pinned {
+                                        // The header lights up while the
+                                        // column has focus, so it is clear
+                                        // which zone the arrows move in.
+                                        ui.horizontal(|ui| {
+                                            ui.label(
+                                                egui::RichText::new(format!(
+                                                    "PINNED  {pin_count}"
+                                                ))
+                                                .monospace()
+                                                .size(META_SIZE + 1.0)
+                                                .color(if pins_focused {
+                                                    ACCENT
+                                                } else {
+                                                    TEXT
+                                                }),
+                                            );
+                                            ui.with_layout(
+                                                egui::Layout::right_to_left(egui::Align::Center),
+                                                |ui| {
+                                                    ui.label(
+                                                        egui::RichText::new(if pins_focused {
+                                                            "tab history"
+                                                        } else {
+                                                            "tab"
+                                                        })
+                                                        .monospace()
+                                                        .size(META_SIZE)
+                                                        .weak(),
+                                                    );
+                                                },
+                                            );
+                                        });
+                                        for &(position, index) in &visible_pinned {
+                                            let selected =
+                                                pins_focused && position == selection.pins;
                                             if card(
                                                 ui,
-                                                &items[*index],
-                                                *position == selected,
+                                                &items[index],
+                                                selected,
+                                                (position < 9).then_some(position + 1),
                                                 textures,
                                                 egui::vec2(
                                                     PINNED_COLUMN_WIDTH - 2.0 * CARD_PADDING,
@@ -682,7 +772,7 @@ impl Picker {
                                             )
                                             .clicked()
                                             {
-                                                clicked = Some(*position);
+                                                clicked = Some((Zone::Pins, position));
                                             }
                                         }
                                     });
@@ -693,7 +783,7 @@ impl Picker {
                     ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
                         ui.label(
                             egui::RichText::new(
-                                "←↑↓→ move    enter copy    ^a select all    ^p pin    ^d delete    f1 control    esc close",
+                                "←↑↓→ move    tab pins    alt+1‥9 paste pin    enter copy    ^p pin    ^d delete    f1 control    esc",
                             )
                             .monospace()
                             .size(FOOTER_TEXT_SIZE),
@@ -702,18 +792,14 @@ impl Picker {
                 });
         });
 
-        if let Some(position) = clicked {
-            self.selected = position;
-            self.activate_selected(event_loop);
-        }
-
         self.columns = columns;
+        self.rows = visible_rows;
         self.visible = rows
             .iter()
             .flat_map(|row| row.iter().map(|(_, index)| *index))
             .chain(visible_pinned.iter().map(|(_, index)| *index))
             .collect();
-        output
+        (output, clicked)
     }
 
     fn paint(&mut self, event_loop: &ActiveEventLoop) {
@@ -845,10 +931,12 @@ impl ApplicationHandler for Picker {
 }
 
 /// Draws one history card at the size the grid allotted it.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn card(
     ui: &mut egui::Ui,
     item: &HistoryItem,
     selected: bool,
+    number: Option<usize>,
     textures: &HashMap<String, egui::TextureHandle>,
     size: egui::Vec2,
     local: &str,
@@ -864,12 +952,16 @@ fn card(
     } else {
         CARD_BACKGROUND
     };
-    let background = base_background.lerp_to_gamma(CARD_SELECTED, 0.35 * pin_progress);
+    // Inside the pinned column every card is pinned, so marking each one
+    // would leave the focused card as the only one without a distinct look.
+    // The pin accent only animates the move between zones out in the grid.
+    let pin_emphasis = if number.is_some() { 0.0 } else { pin_progress };
+    let background = base_background.lerp_to_gamma(CARD_SELECTED, 0.35 * pin_emphasis);
     let foreground = if selected { TEXT_SELECTED } else { TEXT };
     let stroke = if selected {
         egui::Stroke::new(1.0_f32, ACCENT)
-    } else if pin_progress > 0.0 {
-        egui::Stroke::new(1.0_f32, ACCENT.gamma_multiply(pin_progress))
+    } else if pin_emphasis > 0.0 {
+        egui::Stroke::new(1.0_f32, ACCENT.gamma_multiply(pin_emphasis))
     } else {
         egui::Stroke::NONE
     };
@@ -921,7 +1013,16 @@ fn card(
 
                     ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
                         ui.horizontal(|ui| {
-                            if pin_progress > 0.0 {
+                            // In the pinned column the number is the badge:
+                            // it names the alt shortcut that pastes the pin.
+                            if let Some(number) = number {
+                                ui.label(
+                                    egui::RichText::new(format!("alt {number}"))
+                                        .monospace()
+                                        .size(META_SIZE)
+                                        .color(ACCENT.gamma_multiply(pin_progress.max(0.6))),
+                                );
+                            } else if pin_progress > 0.0 {
                                 ui.label(
                                     egui::RichText::new("pin")
                                         .monospace()
@@ -1073,4 +1174,103 @@ fn clamp_preview(preview: &str) -> String {
         out.push('…');
     }
     out
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss
+)]
+mod snapshot {
+    //! Renders the picker offscreen, so its layout can be looked at without
+    //! a display: `cargo test -p clip-sync-desktop -- --ignored snapshot`
+    //! writes PNGs into `$CLIP_SYNC_SNAPSHOT_DIR` (default: the temp dir).
+
+    use super::*;
+
+    fn item(number: usize, text: &str, pinned_millis: Option<u64>) -> HistoryItem {
+        HistoryItem {
+            content_id: format!("{number:064}"),
+            preview: text.to_owned(),
+            source: if number % 3 == 0 { "kiwi" } else { "vd" }.to_owned(),
+            pinned: pinned_millis.is_some(),
+            pinned_millis,
+            is_image: false,
+            remote: number == 4,
+            size_bytes: 40 * number as u64 + 12,
+            created_millis: unix_millis().saturating_sub(number as u64 * 3_600_000),
+        }
+    }
+
+    fn picker() -> Picker {
+        let daemon = Daemon::discover(None).expect("resolve paths");
+        let mut picker = Picker::new(daemon, Instant::now(), false);
+        picker.local = "vd".to_owned();
+        picker.items = (0..40)
+            .map(|number| {
+                let pinned = match number {
+                    2 => Some(3_000),
+                    9 => Some(1_000),
+                    17 => Some(2_000),
+                    _ => None,
+                };
+                item(
+                    number,
+                    &format!("history entry {number} with some preview text"),
+                    pinned,
+                )
+            })
+            .collect();
+        picker.refilter();
+        picker
+    }
+
+    fn render(picker: &mut Picker, name: &str) {
+        let (width, height) = (
+            (WINDOW_WIDTH * f64::from(SCALE)) as u32,
+            (WINDOW_HEIGHT * f64::from(SCALE)) as u32,
+        );
+        let points = egui::vec2(width as f32, height as f32) / SCALE;
+        let mut pixels = vec![[0x14_u8, 0x11, 0x0c, 0xff]; (width * height) as usize];
+        // Several passes let egui settle its layout, and every pass is drawn
+        // because the font atlas arrives in the first one's texture update.
+        for _ in 0..3 {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, points)),
+                ..egui::RawInput::default()
+            };
+            let output = picker.draw_picker(input, points).0;
+            let primitives = picker.egui.tessellate(output.shapes, SCALE);
+            pixels.fill([0x14, 0x11, 0x0c, 0xff]);
+            let mut target = BufferMutRef::new(&mut pixels, width as usize, height as usize);
+            picker
+                .renderer
+                .render(&mut target, &primitives, &output.textures_delta, SCALE);
+        }
+        // The renderer writes BGRA; PNG wants RGBA.
+        let rgba: Vec<u8> = pixels
+            .iter()
+            .flat_map(|[b, g, r, a]| [*r, *g, *b, *a])
+            .collect();
+        let directory = std::env::var_os("CLIP_SYNC_SNAPSHOT_DIR")
+            .map_or_else(std::env::temp_dir, std::path::PathBuf::from);
+        let path = directory.join(format!("{name}.png"));
+        image::save_buffer(&path, &rgba, width, height, image::ExtendedColorType::Rgba8)
+            .expect("write snapshot");
+        eprintln!("wrote {}", path.display());
+    }
+
+    #[test]
+    #[ignore = "writes PNGs for visual review"]
+    fn snapshot() {
+        let mut picker = picker();
+        render(&mut picker, "picker-history");
+        picker.navigate(Move::Last);
+        picker
+            .selection
+            .toggle_zone(picker.history.len(), picker.pins.len());
+        picker.navigate(Move::Down);
+        render(&mut picker, "picker-pins");
+    }
 }

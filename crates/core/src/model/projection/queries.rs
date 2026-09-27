@@ -122,6 +122,7 @@ impl Projection {
                     content_id: *content_id,
                     last_activity: state.activity?,
                     pinned: state.is_pinned(),
+                    pin: state.pin.as_ref().map(|pin| pin.event),
                     item: state.item.as_ref(),
                 })
             })

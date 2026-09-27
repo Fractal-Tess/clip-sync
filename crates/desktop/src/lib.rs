@@ -3,6 +3,7 @@
 mod app;
 mod control;
 mod daemon;
+mod selection;
 mod theme;
 
 use std::{path::PathBuf, time::Instant};

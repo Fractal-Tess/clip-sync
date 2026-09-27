@@ -25,6 +25,8 @@ pub struct HistoryItem {
     pub preview: String,
     pub source: String,
     pub pinned: bool,
+    /// When it was pinned, which orders the pinned column.
+    pub pinned_millis: Option<u64>,
     pub is_image: bool,
     /// Stored on the device that copied it and fetched when activated.
     pub remote: bool,
@@ -125,6 +127,7 @@ impl Daemon {
                     item.source_device
                 },
                 pinned: item.pinned,
+                pinned_millis: item.pinned_millis,
                 size_bytes: item.logical_size,
                 // `origin_millis` is when the entry was copied on whichever
                 // node produced it; `physical_millis` is only when this node

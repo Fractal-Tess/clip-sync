@@ -158,6 +158,7 @@ mod tests {
             source_device: "kiwi".to_owned(),
             origin_millis: None,
             remote: false,
+            pinned_millis: None,
         }
     }
 

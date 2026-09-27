@@ -117,6 +117,7 @@ pub struct ContentView<'a> {
     content_id: ContentId,
     last_activity: EventKey,
     pinned: bool,
+    pin: Option<EventKey>,
     item: Option<&'a Register<ItemKind>>,
 }
 
@@ -151,6 +152,12 @@ impl<'a> ContentView<'a> {
     #[must_use]
     pub fn item(self) -> Option<&'a ItemKind> {
         self.item.map(|item| &item.value)
+    }
+
+    /// When the item was last pinned, so pins can keep a stable order.
+    #[must_use]
+    pub fn pinned_at(self) -> Option<EventKey> {
+        self.pin.filter(|_| self.pinned)
     }
 
     /// The operation that introduced the item: when and by which device.
