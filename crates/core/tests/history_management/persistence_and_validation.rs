@@ -5,10 +5,10 @@ fn history_store_persists_mutations_quota_and_restart_state() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("history.db");
     let key = storage_key();
+    let quota = 5;
 
-    let (node_id, next_counter, retained_id, exempt_id) = {
+    let (node_id, next_counter, retained_id, pinned_id) = {
         let mut history = HistoryStore::open(&path, &key).unwrap();
-        history.set_mesh_quota_and_enforce(5, 1).unwrap();
 
         let pinned = payload(1, 4);
         let pinned_id = content_id(&pinned);
@@ -20,46 +20,25 @@ fn history_store_persists_mutations_quota_and_restart_state() {
         history.copy(evicted, 4).unwrap();
         let retained = payload(3, 4);
         let retained_id = content_id(&retained);
-        let capture_batch = history.copy_and_enforce(retained, 5).unwrap();
+        let capture_batch = history.copy_and_enforce(retained, quota, 5).unwrap();
         assert_eq!(capture_batch.len(), 2);
         assert_eq!(capture_batch[1].operation().content_id(), Some(evicted_id));
-        let exempt = payload(4, 6);
-        let exempt_id = content_id(&exempt);
-        let share_batch = history.share_explicit_and_enforce(exempt, 6).unwrap();
-        assert_eq!(share_batch.len(), 1);
+
         history.unpin(pinned_id, 8).unwrap();
-        let second_delete = history.enforce_quota(9).unwrap();
+        let second_delete = history.enforce_quota(quota, 9).unwrap();
         assert_eq!(second_delete.len(), 1);
         assert_eq!(second_delete[0].operation().content_id(), Some(pinned_id));
 
         let node_id = history.replica().node_id();
         let next_counter = history.replica().last_counter() + 1;
-        (node_id, next_counter, retained_id, exempt_id)
+        (node_id, next_counter, retained_id, pinned_id)
     };
 
-    let mut restarted = HistoryStore::open(&path, &key).unwrap();
+    let restarted = HistoryStore::open(&path, &key).unwrap();
     assert_eq!(restarted.replica().node_id(), node_id);
     assert_eq!(restarted.replica().last_counter() + 1, next_counter);
-    assert_eq!(
-        restarted
-            .projection()
-            .effective_shared_settings()
-            .mesh_quota_bytes,
-        5
-    );
     assert!(restarted.projection().is_visible(retained_id));
-    assert!(restarted.projection().is_visible(exempt_id));
-    assert!(restarted.projection().is_quota_exempt(exempt_id));
-
-    restarted.delete_by_id(&exempt_id.to_string(), 10).unwrap();
-    drop(restarted);
-    let mut restarted = HistoryStore::open(&path, &key).unwrap();
-    assert!(!restarted.projection().is_visible(exempt_id));
-    restarted.share_explicit(payload(4, 6), 11).unwrap();
-    drop(restarted);
-    let restarted = HistoryStore::open(&path, &key).unwrap();
-    assert!(restarted.projection().is_visible(exempt_id));
-    assert!(restarted.projection().is_quota_exempt(exempt_id));
+    assert!(!restarted.projection().is_visible(pinned_id));
 }
 
 #[test]
@@ -132,9 +111,7 @@ fn peer_ingest_hlc_and_acknowledgements_survive_restart() {
             .unwrap()
             .has_seen(peer, remote.id())
     );
-    let local = restarted
-        .set_shared_setting(SharedSetting::CaptureThresholdBytes, 20, 11)
-        .unwrap();
+    let local = restarted.copy(payload(9, 3), 11).unwrap();
     assert!(local.timestamp() > remote.timestamp());
 }
 
@@ -158,36 +135,38 @@ fn invalid_store_id_is_typed_and_never_persisted() {
     assert!(history.projection().visible_items().is_empty());
 }
 
-#[test]
-fn invalid_known_setting_is_rejected_before_seen_state_changes() {
-    let operation = StampedOperation::new(
-        OpId::new(node(1), 1).unwrap(),
-        HlcTimestamp::new(1, 0),
-        Operation::SetSetting {
-            key: SharedSetting::MeshQuotaBytes.key().to_owned(),
-            value: clip_sync_core::model::SettingValue::Unsigned(0),
+fn unsafe_reference(node_id: NodeId) -> StampedOperation {
+    StampedOperation::new(
+        OpId::new(node_id, 1).unwrap(),
+        HlcTimestamp::new(10, 0),
+        Operation::AddReference {
+            content_id: content_id(&payload(5, 1)),
+            reference: Reference::Files(vec![FileEntry {
+                path: "../../etc/passwd".to_owned(),
+                directory: false,
+                executable: false,
+                size: 1,
+            }]),
         },
-    );
+    )
+}
+
+#[test]
+fn unsafe_reference_is_rejected_before_seen_state_changes() {
+    let operation = unsafe_reference(node(1));
     let mut projection = Projection::default();
     assert!(projection.apply(&operation).is_err());
     assert!(!projection.seen_ops().contains(operation.id()));
 }
 
 #[test]
-fn malformed_authenticated_setting_rolls_back_operation_and_acknowledgement() {
+fn unsafe_authenticated_reference_rolls_back_operation_and_acknowledgement() {
     let temp = tempfile::tempdir().unwrap();
-    let path = temp.path().join("malformed-setting.db");
+    let path = temp.path().join("unsafe-reference.db");
     let key = storage_key();
     let mut history = HistoryStore::open(&path, &key).unwrap();
     let peer = node(44);
-    let operation = StampedOperation::new(
-        OpId::new(peer, 1).unwrap(),
-        HlcTimestamp::new(10, 0),
-        Operation::SetSetting {
-            key: SharedSetting::CaptureThresholdBytes.key().to_owned(),
-            value: clip_sync_core::model::SettingValue::Unsigned(0),
-        },
-    );
+    let operation = unsafe_reference(peer);
     let mut advertised = clip_sync_core::model::SeenOps::default();
     advertised.record(operation.id());
 

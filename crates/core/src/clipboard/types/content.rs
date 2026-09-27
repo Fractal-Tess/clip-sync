@@ -5,7 +5,7 @@ use std::{collections::HashSet, sync::Arc};
 use thiserror::Error;
 
 use super::{
-    capture::{Generation, MAX_CAPTURE_BYTES},
+    capture::MAX_CAPTURE_BYTES,
     feedback::FeedbackMarker,
     mime::{MAX_MIME_TYPES_PER_OFFER, MimeType, OfferError, OfferMimeList},
 };
@@ -56,40 +56,6 @@ impl ClipboardRepresentation {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ClipboardContent {
     representations: Vec<ClipboardRepresentation>,
-}
-
-/// Size-only snapshot of the current live offer used for explicit sharing.
-#[derive(Clone, Debug)]
-pub struct CurrentClipboardInspection {
-    generation: Generation,
-    mime_list: OfferMimeList,
-    logical_size: u64,
-}
-
-impl CurrentClipboardInspection {
-    #[must_use]
-    pub const fn new(generation: Generation, mime_list: OfferMimeList, logical_size: u64) -> Self {
-        Self {
-            generation,
-            mime_list,
-            logical_size,
-        }
-    }
-
-    #[must_use]
-    pub const fn generation(&self) -> Generation {
-        self.generation
-    }
-
-    #[must_use]
-    pub const fn mime_list(&self) -> &OfferMimeList {
-        &self.mime_list
-    }
-
-    #[must_use]
-    pub const fn logical_size(&self) -> u64 {
-        self.logical_size
-    }
 }
 
 impl ClipboardContent {

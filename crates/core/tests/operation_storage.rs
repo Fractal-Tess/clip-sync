@@ -1,5 +1,5 @@
 use clip_sync_core::model::{
-    HlcTimestamp, NodeId, OpId, Operation, Payload, Representation, SettingValue, StampedOperation,
+    ContentId, HlcTimestamp, NodeId, OpId, Operation, Payload, Representation, StampedOperation,
 };
 use clip_sync_core::storage::{AppendOutcome, EncryptedStorage, StorageError, StorageKey};
 use rusqlite::Connection;
@@ -13,7 +13,9 @@ fn storage_key() -> StorageKey {
     .unwrap()
 }
 
-fn setting_operation(
+/// A touch whose content ID encodes `key` and `value`, so different values
+/// give different bytes under the same operation ID.
+fn marker_operation(
     node: NodeId,
     counter: u64,
     timestamp: HlcTimestamp,
@@ -23,11 +25,14 @@ fn setting_operation(
     StampedOperation::new(
         OpId::new(node, counter).unwrap(),
         timestamp,
-        Operation::SetSetting {
-            key: key.to_owned(),
-            value: SettingValue::Integer(value),
+        Operation::Touch {
+            content_id: marker(key, value),
         },
     )
+}
+
+fn marker(key: &str, value: i64) -> ContentId {
+    ContentId::from_bytes(*blake3::hash(format!("{key}={value}").as_bytes()).as_bytes())
 }
 
 #[test]
@@ -56,7 +61,7 @@ fn version_one_database_migrates_and_keeps_its_new_replica_identity() {
         let storage = EncryptedStorage::open(&path, &key).unwrap();
         assert_eq!(
             storage.meta_value("schema_version").unwrap().as_deref(),
-            Some("5")
+            Some("6")
         );
         assert!(storage.load_operations().unwrap().is_empty());
         storage.replica_metadata().unwrap()
@@ -66,54 +71,84 @@ fn version_one_database_migrates_and_keeps_its_new_replica_identity() {
     assert_eq!(storage.replica_metadata().unwrap(), metadata);
 }
 
+/// Builds a database exactly as 0.3 left it: schema 4, operations as JSON.
 #[test]
-fn version_four_database_backfills_operation_content_ids() {
+fn a_0_3_database_is_converted_to_protobuf_and_indexed() {
     let temp_dir = tempfile::tempdir().unwrap();
-    let path = temp_dir.path().join("content-index.db");
+    let path = temp_dir.path().join("legacy.db");
     let key_bytes = [29_u8; 32];
     let key = StorageKey::from_bytes(key_bytes);
+    let remote = NodeId::from_uuid(Uuid::from_u128(7));
     let payload = Payload::new(
         &[3; 32],
-        vec![Representation::new("text/plain", b"indexed".to_vec())],
+        vec![Representation::new("text/plain", b"kept".to_vec())],
     )
     .unwrap();
     let content_id = payload.descriptor().content_id();
-    let add = {
-        let mut storage = EncryptedStorage::open(&path, &key).unwrap();
-        let metadata = storage.replica_metadata().unwrap();
-        let add = StampedOperation::new(
-            OpId::new(metadata.node_id(), metadata.next_operation_counter()).unwrap(),
-            HlcTimestamp::new(1_000, 0),
-            Operation::Add {
-                content_id,
-                payload,
-            },
-        );
-        storage.append_local_operation(&add).unwrap();
-        storage.close().unwrap();
-        add
-    };
+    let legacy_add = format!(
+        r#"{{"id":{{"node":"{remote}","counter":1}},"timestamp":{{"physical_millis":1000,"logical":0}},"operation":{{"type":"add","content_id":"{content_id}","payload":{}}}}}"#,
+        serde_json::to_string(&payload).unwrap()
+    );
+    let legacy_setting = format!(
+        r#"{{"id":{{"node":"{remote}","counter":2}},"timestamp":{{"physical_millis":1001,"logical":0}},"operation":{{"type":"set_setting","key":"mesh_quota_bytes","value":{{"type":"unsigned","value":5}}}}}}"#
+    );
+    EncryptedStorage::open(&path, &key)
+        .unwrap()
+        .close()
+        .unwrap();
 
-    // Rewind the database to schema 4, before operations carried the column.
     let connection = Connection::open(&path).unwrap();
     connection
         .execute_batch(&format!(
             "PRAGMA key = \"x'{}'\";
-             DROP INDEX operations_content;
-             ALTER TABLE operations DROP COLUMN content_id;
+             DROP TABLE operations;
+             DROP TABLE local_sources;
+             CREATE TABLE operations (
+                 origin_node BLOB NOT NULL CHECK (length(origin_node) = 16),
+                 counter INTEGER NOT NULL,
+                 hlc_physical_millis INTEGER NOT NULL,
+                 hlc_logical INTEGER NOT NULL,
+                 encoding_version INTEGER NOT NULL CHECK (encoding_version = 1),
+                 payload BLOB NOT NULL,
+                 PRIMARY KEY (origin_node, counter)
+             ) STRICT, WITHOUT ROWID;
+             CREATE INDEX operations_event_order
+                 ON operations (hlc_physical_millis, hlc_logical, origin_node, counter);
              UPDATE storage_meta SET value = '4' WHERE key = 'schema_version';
              PRAGMA user_version = 4;",
             hex::encode(key_bytes)
         ))
         .unwrap();
+    for (counter, millis, json) in [(1, 1000, &legacy_add), (2, 1001, &legacy_setting)] {
+        connection
+            .execute(
+                "INSERT INTO operations VALUES (?1, ?2, ?3, 0, 1, ?4)",
+                rusqlite::params![
+                    &remote.as_uuid().as_bytes()[..],
+                    counter,
+                    millis,
+                    json.as_bytes()
+                ],
+            )
+            .unwrap();
+    }
     connection.close().unwrap();
 
     let storage = EncryptedStorage::open(&path, &key).unwrap();
     assert_eq!(
         storage.meta_value("schema_version").unwrap().as_deref(),
-        Some("5")
+        Some("6")
     );
-    assert_eq!(storage.load_operations().unwrap(), vec![add]);
+    let operations = storage.load_operations().unwrap();
+    assert_eq!(
+        operations[0].operation(),
+        &Operation::Add {
+            content_id,
+            payload
+        }
+    );
+    assert_eq!(operations[1].operation(), &Operation::Retired);
+    assert!(storage.rebuild_projection().unwrap().is_visible(content_id));
     storage.close().unwrap();
 
     let connection = Connection::open(&path).unwrap();
@@ -121,7 +156,11 @@ fn version_four_database_backfills_operation_content_ids() {
         .execute_batch(&format!("PRAGMA key = \"x'{}'\";", hex::encode(key_bytes)))
         .unwrap();
     let indexed: Vec<u8> = connection
-        .query_row("SELECT content_id FROM operations", [], |row| row.get(0))
+        .query_row(
+            "SELECT content_id FROM operations WHERE counter = 1",
+            [],
+            |row| row.get(0),
+        )
         .unwrap();
     assert_eq!(indexed, content_id.as_bytes());
 }
@@ -177,7 +216,7 @@ fn restart_recovers_operations_projection_and_replica_metadata() {
     let (operation, expected_metadata) = {
         let mut storage = EncryptedStorage::open(&path, &key).unwrap();
         let metadata = storage.replica_metadata().unwrap();
-        let operation = setting_operation(
+        let operation = marker_operation(
             metadata.node_id(),
             metadata.next_operation_counter(),
             HlcTimestamp::new(1_000, 0),
@@ -196,12 +235,11 @@ fn restart_recovers_operations_projection_and_replica_metadata() {
     let storage = EncryptedStorage::open(&path, &key).unwrap();
     assert_eq!(storage.replica_metadata().unwrap(), expected_metadata);
     assert_eq!(storage.load_operations().unwrap(), vec![operation]);
-    assert_eq!(
+    assert!(
         storage
             .rebuild_projection()
             .unwrap()
-            .setting("history_limit"),
-        Some(&SettingValue::Integer(250))
+            .is_visible(marker("history_limit", 250))
     );
 }
 
@@ -211,7 +249,7 @@ fn exact_operation_replay_is_idempotent_across_restart() {
     let path = temp_dir.path().join("idempotent.db");
     let key = storage_key();
     let node = NodeId::from_uuid(Uuid::from_u128(42));
-    let operation = setting_operation(node, 7, HlcTimestamp::new(500, 3), "quota", 1024);
+    let operation = marker_operation(node, 7, HlcTimestamp::new(500, 3), "quota", 1024);
 
     {
         let mut storage = EncryptedStorage::open(&path, &key).unwrap();
@@ -239,8 +277,8 @@ fn reusing_an_operation_id_with_different_bytes_is_rejected() {
     let path = temp_dir.path().join("conflict.db");
     let key = storage_key();
     let node = NodeId::from_uuid(Uuid::from_u128(7));
-    let original = setting_operation(node, 1, HlcTimestamp::new(10, 0), "theme", 1);
-    let conflicting = setting_operation(node, 1, HlcTimestamp::new(10, 0), "theme", 2);
+    let original = marker_operation(node, 1, HlcTimestamp::new(10, 0), "theme", 1);
+    let conflicting = marker_operation(node, 1, HlcTimestamp::new(10, 0), "theme", 2);
 
     let mut storage = EncryptedStorage::open(&path, &key).unwrap();
     storage.append_operation(&original).unwrap();
@@ -305,7 +343,7 @@ fn local_append_persists_counter_and_hlc_atomically() {
     let expected = {
         let mut storage = EncryptedStorage::open(&path, &key).unwrap();
         let initial = storage.replica_metadata().unwrap();
-        let first = setting_operation(
+        let first = marker_operation(
             initial.node_id(),
             initial.next_operation_counter(),
             HlcTimestamp::new(100, 2),
@@ -319,7 +357,7 @@ fn local_append_persists_counter_and_hlc_atomically() {
         assert_eq!(advanced.next_operation_counter(), 2);
         assert_eq!(advanced.last_hlc(), HlcTimestamp::new(100, 2));
 
-        let invalid = setting_operation(
+        let invalid = marker_operation(
             advanced.node_id(),
             advanced.next_operation_counter(),
             advanced.last_hlc(),
@@ -347,7 +385,7 @@ fn operations_outside_sqlite_integer_bounds_are_rejected() {
     let key = storage_key();
     let mut storage = EncryptedStorage::open(&path, &key).unwrap();
     let node = NodeId::from_uuid(Uuid::from_u128(123));
-    let operation = setting_operation(
+    let operation = marker_operation(
         node,
         i64::MAX as u64 + 1,
         HlcTimestamp::new(1, 0),
@@ -371,9 +409,9 @@ fn remote_batch_is_atomic_on_operation_conflict() {
     let path = temp_dir.path().join("remote-batch-atomic.db");
     let key = storage_key();
     let node = NodeId::from_uuid(Uuid::from_u128(700));
-    let original = setting_operation(node, 1, HlcTimestamp::new(10, 0), "value", 1);
-    let new_operation = setting_operation(node, 2, HlcTimestamp::new(11, 0), "next", 2);
-    let conflict = setting_operation(node, 1, HlcTimestamp::new(10, 0), "value", 99);
+    let original = marker_operation(node, 1, HlcTimestamp::new(10, 0), "value", 1);
+    let new_operation = marker_operation(node, 2, HlcTimestamp::new(11, 0), "next", 2);
+    let conflict = marker_operation(node, 1, HlcTimestamp::new(10, 0), "value", 99);
 
     let mut storage = EncryptedStorage::open(&path, &key).unwrap();
     storage.append_operation(&original).unwrap();
@@ -396,7 +434,7 @@ fn remote_batch_persists_observed_clock_without_advancing_local_counter() {
     let path = temp_dir.path().join("remote-clock.db");
     let key = storage_key();
     let remote = NodeId::from_uuid(Uuid::from_u128(701));
-    let operation = setting_operation(remote, 1, HlcTimestamp::new(500, 3), "remote", 1);
+    let operation = marker_operation(remote, 1, HlcTimestamp::new(500, 3), "remote", 1);
 
     {
         let mut storage = EncryptedStorage::open(&path, &key).unwrap();
@@ -433,7 +471,7 @@ fn remote_batch_cannot_claim_a_new_local_operation_id() {
     let key = storage_key();
     let mut storage = EncryptedStorage::open(&path, &key).unwrap();
     let metadata = storage.local_replica_metadata().unwrap();
-    let forged = setting_operation(
+    let forged = marker_operation(
         metadata.node_id(),
         metadata.next_operation_counter(),
         HlcTimestamp::new(100, 0),

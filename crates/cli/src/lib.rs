@@ -2,10 +2,7 @@ mod commands;
 mod devices;
 mod diagnostics;
 mod history;
-mod settings;
-mod share;
 mod support;
-mod transfer;
 mod views;
 
 #[cfg(test)]
@@ -21,9 +18,6 @@ use commands::{Cli, Command};
 use devices::{device_command, peers};
 use diagnostics::{doctor, status};
 use history::history_command;
-use settings::config_command;
-use share::share_clipboard;
-use transfer::transfer_command;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LaunchKind {
@@ -81,11 +75,8 @@ impl ParsedInvocation {
         match self.cli.command {
             Some(Command::Status(output)) => status(&paths, output).await,
             Some(Command::Peers(output)) => peers(&paths, output).await,
-            Some(Command::Config { command }) => config_command(&paths, command).await,
             Some(Command::History { command }) => history_command(&paths, command).await,
             Some(Command::Doctor(output)) => doctor(&paths, output).await,
-            Some(Command::ShareClipboard(output)) => share_clipboard(&paths, output).await,
-            Some(Command::Transfer { command }) => transfer_command(&paths, command).await,
             Some(Command::Device { command }) => device_command(&paths, command).await,
             None | Some(Command::Desktop(_) | Command::Daemon) => {
                 bail!("invocation is not a client command")

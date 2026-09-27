@@ -4,16 +4,17 @@ use prost::Message;
 use quinn::{RecvStream, SendStream};
 use thiserror::Error;
 
-pub const PROTOCOL_VERSION: u32 = 3;
+/// 4 replaced JSON operations with Protobuf and chunk transfers with
+/// on-demand fetches; 3 and earlier cannot interoperate.
+pub const PROTOCOL_VERSION: u32 = 4;
 pub const MAX_CONTROL_FRAME_BYTES: usize = 96 * 1024 * 1024;
 pub const MAX_FRONTIER_BYTES: usize = 1024 * 1024;
 pub const MAX_MEMBERSHIP_BYTES: usize = 1024 * 1024;
 pub const MAX_HOSTNAME_BYTES: usize = 255;
 pub const MAX_BATCH_OPERATIONS: usize = 128;
 pub const STREAM_KIND_SYNC: u8 = 1;
-pub const STREAM_KIND_CHUNK: u8 = 2;
-pub const MAX_ENCRYPTED_CHUNK_BYTES: usize = 4 * 1024 * 1024 + 48;
-pub const MAX_CHUNK_CONTROL_BYTES: usize = 512;
+pub const STREAM_KIND_FETCH: u8 = 3;
+pub const MAX_FETCH_CONTROL_BYTES: usize = 4096;
 
 /// Metadata-free rolling-version preflight exchanged after PSK
 /// authentication and before node identity, membership, or frontier data.
@@ -61,28 +62,25 @@ pub struct SyncResponse {
     pub known_members: Vec<u8>,
 }
 
+/// Asks the origin for a reference's bytes. `counter` names the exact
+/// operation the requester holds, so an origin that has since re-published
+/// the item refuses rather than sending bytes of a different shape.
 #[derive(Clone, PartialEq, Message)]
-pub struct ChunkStreamRequest {
+pub struct FetchRequest {
     #[prost(bytes = "vec", tag = "1")]
-    pub transfer_id: Vec<u8>,
-    #[prost(bytes = "vec", tag = "2")]
-    pub manifest_id: Vec<u8>,
-    #[prost(bytes = "vec", tag = "3")]
-    pub chunk_id: Vec<u8>,
-    #[prost(uint32, tag = "4")]
-    pub logical_size: u32,
+    pub content_id: Vec<u8>,
+    #[prost(uint64, tag = "2")]
+    pub counter: u64,
 }
 
+/// Precedes the raw bytes: every file (or representation) in reference
+/// order, each exactly as long as the reference says.
 #[derive(Clone, PartialEq, Message)]
-pub struct ChunkStreamResponse {
+pub struct FetchHeader {
     #[prost(bool, tag = "1")]
     pub available: bool,
-    #[prost(bytes = "vec", tag = "2")]
-    pub transfer_id: Vec<u8>,
-    #[prost(bytes = "vec", tag = "3")]
-    pub chunk_id: Vec<u8>,
-    #[prost(uint32, tag = "4")]
-    pub encrypted_size: u32,
+    #[prost(string, tag = "2")]
+    pub reason: String,
 }
 
 pub async fn write_message<M: Message>(
@@ -172,18 +170,15 @@ pub enum ProtocolError {
 
 #[cfg(test)]
 mod tests {
-    use clip_sync_core::config::DEFAULT_CAPTURE_THRESHOLD_BYTES;
-
     use super::MAX_CONTROL_FRAME_BYTES;
 
     #[test]
-    fn control_frame_carries_worst_case_default_capture_encoding() {
-        let worst_case_json_bytes = DEFAULT_CAPTURE_THRESHOLD_BYTES
-            .checked_mul(4)
-            .expect("default threshold fits");
+    fn control_frame_carries_the_largest_inline_copy() {
+        let largest_inline = clip_sync_core::config::LocalConfig::default().inline_limit_bytes;
+        // Protobuf adds a few bytes per representation on top of the payload.
         assert!(
             u64::try_from(MAX_CONTROL_FRAME_BYTES).expect("frame limit fits u64")
-                > worst_case_json_bytes
+                > largest_inline.saturating_mul(4)
         );
     }
 }

@@ -3,7 +3,10 @@ use std::collections::BTreeSet;
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior};
 use zeroize::Zeroizing;
 
-use crate::model::{HlcTimestamp, NodeId, SeenOps, StampedOperation};
+use crate::{
+    model::{HlcTimestamp, NodeId, SeenOps, StampedOperation},
+    replication::{decode_operation, encode_operation},
+};
 
 use super::{
     EncryptedStorage, Result, StorageError,
@@ -12,7 +15,9 @@ use super::{
     metadata::{read_replica_metadata, update_replica_metadata},
 };
 
-pub(super) const OPERATION_ENCODING_VERSION: i64 = 1;
+/// Protobuf, see [`crate::replication::encode_operation`]. Version 1 was the
+/// 0.3 JSON encoding, converted by schema migration 6.
+pub(super) const OPERATION_ENCODING_VERSION: i64 = 2;
 const MAX_SQLITE_INTEGER: u64 = i64::MAX as u64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -321,13 +326,11 @@ fn serialize_operation(operation: &StampedOperation) -> Result<Zeroizing<Vec<u8>
         "operation HLC physical milliseconds",
         operation.timestamp().physical_millis(),
     )?;
-    serde_json::to_vec(operation)
-        .map(Zeroizing::new)
-        .map_err(StorageError::OperationSerialization)
+    Ok(Zeroizing::new(encode_operation(operation)))
 }
 
 pub(super) fn decode_stored_operation(encoded: &[u8]) -> Result<StampedOperation> {
-    serde_json::from_slice(encoded).map_err(StorageError::OperationDeserialization)
+    decode_operation(encoded).map_err(StorageError::OperationDecode)
 }
 
 fn insert_serialized_operation(

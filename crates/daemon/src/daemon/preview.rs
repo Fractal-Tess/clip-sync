@@ -1,9 +1,8 @@
 use std::io::Cursor;
 
 use anyhow::Context;
-use tokio_util::sync::CancellationToken;
 
-use clip_sync_core::{storage::HistoryStore, transfer::TransferCoordinator};
+use clip_sync_core::storage::{HistoryStore, LocalSource};
 use clip_sync_ipc::protocol::ImagePreviewResponse;
 
 const IMAGE_PREVIEW_WIDTH: u32 = 320;
@@ -12,10 +11,12 @@ const MAX_IMAGE_PREVIEW_SOURCE_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_IMAGE_PREVIEW_DIMENSION: u32 = 8192;
 const MAX_IMAGE_PREVIEW_DECODE_BYTES: u64 = 128 * 1024 * 1024;
 
+/// Thumbnails an image item whose bytes are on this device: inline items,
+/// and large images this device copied. An image stored only on another
+/// device is not fetched just to draw a thumbnail.
 pub(super) fn image_preview(
     encoded_content_id: &str,
     history: &HistoryStore,
-    transfers: &TransferCoordinator,
 ) -> anyhow::Result<ImagePreviewResponse> {
     let content_id = encoded_content_id
         .parse()
@@ -24,51 +25,28 @@ pub(super) fn image_preview(
         anyhow::bail!("history item is deleted");
     }
 
-    let payload = history
-        .load_payload(content_id)
-        .context("load image payload")?;
-    let (mime_type, bytes) = if let Some(payload) = payload {
-        let representation = payload
-            .representations()
-            .iter()
-            .find(|representation| image_format_for_mime(representation.mime()).is_some())
-            .context("history item has no supported raster image")?;
-        let source_size = u64::try_from(representation.bytes().len())
-            .context("image preview source size does not fit in u64")?;
-        if source_size > MAX_IMAGE_PREVIEW_SOURCE_BYTES {
-            anyhow::bail!("image is too large to preview safely");
-        }
-        (
-            representation.mime().to_owned(),
-            representation.bytes().to_vec(),
-        )
-    } else {
-        let (_, _, manifest) = history
-            .projection()
-            .completed_manifest_for_content(content_id)
-            .context("image payload is not available locally")?;
-        let clip_sync_core::payload::StoredManifest::MimeBundle(bundle) = manifest else {
-            anyhow::bail!("history item has no supported raster image");
-        };
-        let representation = bundle
-            .representations()
-            .iter()
-            .find(|representation| image_format_for_mime(representation.mime()).is_some())
-            .context("history item has no supported raster image")?;
-        if representation.blob().logical_size() > MAX_IMAGE_PREVIEW_SOURCE_BYTES {
-            anyhow::bail!("image is too large to preview safely");
-        }
-        let capacity = usize::try_from(representation.blob().logical_size())
-            .context("image preview source size does not fit in memory")?;
-        let mut bytes = Vec::with_capacity(capacity);
-        transfers
-            .store()
-            .read_blob(representation.blob(), &mut bytes, &CancellationToken::new())
-            .context("read encrypted image preview source")?;
-        (representation.mime().to_owned(), bytes)
+    let payload = match history.load_payload(content_id).context("load image")? {
+        Some(payload) => payload,
+        None => match history.local_source(content_id).context("load image")? {
+            Some(LocalSource::Data(payload)) => payload,
+            _ => anyhow::bail!("image is stored on another device"),
+        },
     };
-
-    decode_image_preview(encoded_content_id, mime_type, bytes)
+    let representation = payload
+        .representations()
+        .iter()
+        .find(|representation| image_format_for_mime(representation.mime()).is_some())
+        .context("history item has no supported raster image")?;
+    let source_size = u64::try_from(representation.bytes().len())
+        .context("image preview source size does not fit in u64")?;
+    if source_size > MAX_IMAGE_PREVIEW_SOURCE_BYTES {
+        anyhow::bail!("image is too large to preview safely");
+    }
+    decode_image_preview(
+        encoded_content_id,
+        representation.mime().to_owned(),
+        representation.bytes().to_vec(),
+    )
 }
 
 pub(super) fn decode_image_preview(

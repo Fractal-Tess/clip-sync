@@ -3,8 +3,8 @@
 //!
 //! The database key is random per host and lives in an owner-only file next
 //! to the database, so changing the mesh secret never touches local storage.
-//! The content-identity and chunk-store keys derive from the mesh secret,
-//! because every host must compute the same content IDs.
+//! The content-identity key derives from the mesh secret, because every host
+//! must compute the same content IDs.
 
 use std::{
     fs::{self, File, OpenOptions},
@@ -23,7 +23,6 @@ use zeroize::Zeroizing;
 
 use crate::{
     crypto::{MeshSecret, SecretError},
-    payload::ChunkStoreKey,
     storage::StorageKey,
 };
 
@@ -109,7 +108,6 @@ impl Drop for StoreLock {
 #[derive(Clone)]
 pub struct StateKeys {
     storage: StorageKey,
-    chunks: ChunkStoreKey,
     content_identity: Zeroizing<[u8; KEY_BYTES]>,
 }
 
@@ -136,7 +134,6 @@ impl StateKeys {
         };
         Ok(Self {
             storage: StorageKey::from_bytes(*storage),
-            chunks: secret.chunk_store_key()?,
             content_identity: secret.content_key()?,
         })
     }
@@ -144,11 +141,6 @@ impl StateKeys {
     #[must_use]
     pub const fn storage_key(&self) -> &StorageKey {
         &self.storage
-    }
-
-    #[must_use]
-    pub const fn chunk_store_key(&self) -> &ChunkStoreKey {
-        &self.chunks
     }
 
     #[must_use]
@@ -175,12 +167,10 @@ fn migrate_legacy_keyslot(
     }
     let keyslot_path = state_dir.join(LEGACY_KEYSLOT_FILENAME);
     let legacy = legacy::read(&keyslot_path, secret)?;
-    // The keyslot kept the chunk and content keys of the secret it was
-    // created under. Deriving them from the current secret is only safe when
-    // they still match, i.e. the secret was never rotated.
-    let content_matches = legacy.content_identity[..].ct_eq(&secret.content_key()?[..]);
-    let chunks_match = legacy.chunks[..].ct_eq(&secret.chunk_store_key()?.as_bytes()[..]);
-    if !bool::from(content_matches & chunks_match) {
+    // The keyslot kept the content key of the secret it was created under.
+    // Deriving it from the current secret is only safe when they still
+    // match, i.e. the secret was never rotated.
+    if !bool::from(legacy.content_identity[..].ct_eq(&secret.content_key()?[..])) {
         return Err(StateKeyError::RotatedLegacyKeyslot);
     }
     write_key_file(&state_dir.join(KEY_FILENAME), &legacy.storage)?;
@@ -343,7 +333,6 @@ mod legacy {
 
     pub(super) struct LegacyKeys {
         pub(super) storage: Zeroizing<[u8; KEY_BYTES]>,
-        pub(super) chunks: Zeroizing<[u8; KEY_BYTES]>,
         pub(super) content_identity: Zeroizing<[u8; KEY_BYTES]>,
     }
 
@@ -384,9 +373,9 @@ mod legacy {
             key.copy_from_slice(&plaintext[start..start + KEY_BYTES]);
             key
         };
+        // Index 1 held the retired chunk-store key.
         Ok(LegacyKeys {
             storage: key_at(0),
-            chunks: key_at(1),
             content_identity: key_at(2),
         })
     }
@@ -406,7 +395,7 @@ mod tests {
     fn write_legacy_keyslot(state_dir: &Path, secret: &MeshSecret, storage: [u8; 32]) {
         let mut plaintext = vec![legacy::FINAL_STATE];
         plaintext.extend_from_slice(&storage);
-        plaintext.extend_from_slice(secret.chunk_store_key().unwrap().as_bytes());
+        plaintext.extend_from_slice(&[0; 32]);
         plaintext.extend_from_slice(secret.content_key().unwrap().as_ref());
         let mut encoded = legacy::MAGIC.to_vec();
         encoded.push(legacy::VERSION);

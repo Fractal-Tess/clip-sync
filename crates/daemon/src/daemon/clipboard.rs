@@ -6,13 +6,12 @@ use tokio_util::sync::CancellationToken;
 use clip_sync_core::{
     clipboard::backend::{ClipboardBackend, ClipboardEvent},
     storage::HistoryStore,
-    transfer::TransferCoordinator,
 };
 
 use crate::{ipc::DaemonState, mesh::MeshHandle};
 
 use super::{
-    capture::{AutomaticClipboardCaptureResult, capture_automatic_clipboard},
+    capture::{CaptureLimits, capture_clipboard},
     runtime::unix_time_millis,
     views::history_items,
 };
@@ -22,9 +21,9 @@ pub(super) async fn handle_clipboard_event(
     history: &mut HistoryStore,
     state: &DaemonState,
     content_key: &[u8; 32],
+    limits: CaptureLimits,
     mesh: &MeshHandle,
-    transfers: &mut TransferCoordinator,
-) -> anyhow::Result<()> {
+) {
     match event {
         ClipboardEvent::Ready => {
             state
@@ -32,33 +31,18 @@ pub(super) async fn handle_clipboard_event(
                 .await;
         }
         ClipboardEvent::Captured { content, .. } => {
-            let result = capture_automatic_clipboard(
-                &content,
-                content_key,
-                transfers,
-                history,
-                mesh,
-                unix_time_millis()?,
-                &CancellationToken::new(),
-            )
-            .await?;
-            state.set_history(history_items(history.replica())).await;
-            match result {
-                AutomaticClipboardCaptureResult::Payload { .. } => {
-                    tracing::debug!(
-                        history_entries = history.projection().visible_items().len(),
-                        "captured clipboard history entry"
-                    );
+            let captured = match unix_time_millis() {
+                Ok(now) => {
+                    capture_clipboard(&content, content_key, limits, history, mesh, now).await
                 }
-                AutomaticClipboardCaptureResult::Files { transfer_id, .. } => {
-                    tracing::debug!(
-                        %transfer_id,
-                        history_entries = history.projection().visible_items().len(),
-                        "captured clipboard file snapshot"
-                    );
-                }
-                AutomaticClipboardCaptureResult::RejectedFiles => {
-                    tracing::debug!("clipboard file offer was not captured");
+                Err(error) => Err(error),
+            };
+            match captured {
+                Ok(_) => state.set_history(history_items(history.replica())).await,
+                // A copy that cannot be recorded (a symlink, a file list that
+                // vanished) must not stop the daemon; the next copy works.
+                Err(error) => {
+                    tracing::warn!(error = %format!("{error:#}"), "clipboard copy was not recorded");
                 }
             }
         }
@@ -75,7 +59,6 @@ pub(super) async fn handle_clipboard_event(
         | ClipboardEvent::OwnContent { .. }
         | ClipboardEvent::Cleared { .. } => {}
     }
-    Ok(())
 }
 
 pub(super) fn spawn_clipboard_watch<B>(

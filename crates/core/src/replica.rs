@@ -2,9 +2,8 @@ use thiserror::Error;
 
 use crate::model::{
     ApplyOutcome, ContentId, HlcError, HlcTimestamp, HybridLogicalClock, NodeId, OpId, OpIdError,
-    Operation, Projection, ProjectionError, SharedSetting, StampedOperation,
+    Operation, Projection, ProjectionError, StampedOperation,
 };
-use crate::transfer::TransferId;
 
 mod authoring;
 
@@ -144,14 +143,8 @@ pub enum ReplicaError {
     CounterExhausted,
     #[error("content {0} is not visible")]
     ContentNotVisible(ContentId),
-    #[error("transfer {0} is not available")]
-    TransferNotFound(TransferId),
-    #[error("transfer {0} was cancelled")]
-    TransferCancelled(TransferId),
     #[error("content ID is invalid: {0}")]
     InvalidContentId(String),
-    #[error("shared setting {setting:?} cannot be set to {value}")]
-    InvalidSharedSetting { setting: SharedSetting, value: u64 },
     #[error("the local device cannot forget itself")]
     CannotForgetLocalDevice,
     #[error("remote clock {remote}ms is too far ahead of local clock {local}ms")]

@@ -1,13 +1,5 @@
-use crate::{
-    payload::{ManifestId, StoredManifest},
-    transfer::{TransferId, TransferPhase},
-};
-
-use super::super::{
-    ContentId, EffectiveSharedSettings, EventKey, NodeId, OpId, PayloadDescriptor, SeenOps,
-    SettingValue, SharedSetting,
-};
-use super::{ContentState, ContentView, Projection, QuotaPlan, TransferView, transfer_view};
+use super::super::{ContentId, EventKey, NodeId, OpId, SeenOps};
+use super::{ContentView, ItemKind, Projection, QuotaPlan};
 
 impl Projection {
     #[must_use]
@@ -19,65 +11,39 @@ impl Projection {
     pub fn is_visible(&self, content_id: ContentId) -> bool {
         self.content
             .get(&content_id)
-            .is_some_and(|state| self.content_is_visible(content_id, state))
+            .is_some_and(super::ContentState::is_visible)
     }
 
     #[must_use]
     pub fn is_pinned(&self, content_id: ContentId) -> bool {
         self.content
             .get(&content_id)
-            .is_some_and(|state| self.content_is_visible(content_id, state) && state.is_pinned())
+            .is_some_and(super::ContentState::is_pinned)
     }
 
+    /// The item's description, or `None` while its add has not arrived.
     #[must_use]
-    pub fn is_quota_exempt(&self, content_id: ContentId) -> bool {
-        self.content.get(&content_id).is_some_and(|state| {
-            self.content_is_visible(content_id, state) && state.is_quota_exempt()
-        })
-    }
-
-    #[must_use]
-    pub fn payload_descriptor(&self, content_id: ContentId) -> Option<&PayloadDescriptor> {
+    pub fn item(&self, content_id: ContentId) -> Option<&ItemKind> {
         self.content
             .get(&content_id)
-            .and_then(|state| state.payload.as_ref())
-            .map(|payload| &payload.value.descriptor)
+            .and_then(|state| state.item.as_ref())
+            .map(|item| &item.value)
     }
 
-    /// The operation whose payload won the content's register. Storage reads
-    /// the bytes from that operation when the item is activated or previewed.
+    /// The operation whose item won the content's register. Storage reads
+    /// inline bytes from it, and its author is a reference's origin.
     #[must_use]
-    pub fn payload_operation(&self, content_id: ContentId) -> Option<OpId> {
+    pub fn item_operation(&self, content_id: ContentId) -> Option<OpId> {
+        self.item_event(content_id).map(EventKey::operation_id)
+    }
+
+    /// Originating event for a retained content item.
+    #[must_use]
+    pub fn item_event(&self, content_id: ContentId) -> Option<EventKey> {
         self.content
             .get(&content_id)
-            .and_then(|state| state.payload.as_ref())
-            .map(|payload| payload.event.operation_id())
-    }
-
-    #[must_use]
-    pub fn setting(&self, key: &str) -> Option<&SettingValue> {
-        self.settings.get(key).map(|setting| &setting.value)
-    }
-
-    #[must_use]
-    pub fn setting_event(&self, key: &str) -> Option<super::super::EventKey> {
-        self.settings.get(key).map(|setting| setting.event)
-    }
-
-    #[must_use]
-    pub fn effective_shared_settings(&self) -> EffectiveSharedSettings {
-        let mut effective = EffectiveSharedSettings::default();
-        if let Some(SettingValue::Unsigned(value)) =
-            self.setting(SharedSetting::MeshQuotaBytes.key())
-        {
-            effective.mesh_quota_bytes = *value;
-        }
-        if let Some(SettingValue::Unsigned(value)) =
-            self.setting(SharedSetting::CaptureThresholdBytes.key())
-        {
-            effective.capture_threshold_bytes = *value;
-        }
-        effective
+            .and_then(|state| state.item.as_ref())
+            .map(|item| item.event)
     }
 
     #[must_use]
@@ -89,121 +55,16 @@ impl Projection {
         self.known_members.iter().copied()
     }
 
-    #[must_use]
-    pub fn transfer(&self, transfer_id: TransferId) -> Option<TransferView<'_>> {
-        self.transfers
-            .get(&transfer_id)
-            .map(|state| transfer_view(transfer_id, state))
-    }
-
-    #[must_use]
-    pub fn transfers(&self) -> Vec<TransferView<'_>> {
-        self.transfers
-            .iter()
-            .map(|(id, state)| transfer_view(*id, state))
-            .collect()
-    }
-
-    #[must_use]
-    pub fn completed_manifest_for_content(
-        &self,
-        content_id: ContentId,
-    ) -> Option<(TransferId, ManifestId, &StoredManifest)> {
-        self.transfers
-            .iter()
-            .filter_map(|(id, state)| {
-                if state.phase() != TransferPhase::Complete {
-                    return None;
-                }
-                let metadata = &state.begin.as_ref()?.value;
-                let activity = state.activity()?;
-                (metadata.content_id == content_id).then_some((
-                    activity,
-                    *id,
-                    metadata.manifest_id,
-                    &metadata.manifest,
-                ))
-            })
-            .max_by_key(|(activity, id, _, _)| (*activity, *id))
-            .map(|(_, id, manifest_id, manifest)| (id, manifest_id, manifest))
-    }
-
-    /// Originating event for a retained content item.
-    #[must_use]
-    pub fn origin_event_for_content(&self, content_id: ContentId) -> Option<EventKey> {
-        if let Some(payload) = self.content.get(&content_id)?.payload.as_ref() {
-            return Some(payload.event);
-        }
-        let (transfer_id, _, _) = self.manifest_for_content(content_id)?;
-        self.transfers
-            .get(&transfer_id)?
-            .begin
-            .as_ref()
-            .map(|begin| begin.event)
-    }
-
-    /// Originating device for a retained content item.
-    #[must_use]
-    pub fn origin_node_for_content(&self, content_id: ContentId) -> Option<NodeId> {
-        self.origin_event_for_content(content_id)
-            .map(|event| event.operation_id().node())
-    }
-
-    #[must_use]
-    pub fn manifest_for_content(
-        &self,
-        content_id: ContentId,
-    ) -> Option<(TransferId, ManifestId, &StoredManifest)> {
-        self.transfers
-            .iter()
-            .filter_map(|(id, state)| {
-                if state.phase() == TransferPhase::Cancelled {
-                    return None;
-                }
-                let metadata = &state.begin.as_ref()?.value;
-                let activity = state.activity()?;
-                (metadata.content_id == content_id).then_some((
-                    activity,
-                    *id,
-                    metadata.manifest_id,
-                    &metadata.manifest,
-                ))
-            })
-            .max_by_key(|(activity, id, _, _)| (*activity, *id))
-            .map(|(_, id, manifest_id, manifest)| (id, manifest_id, manifest))
-    }
-
     pub fn forgotten_devices(&self) -> impl Iterator<Item = NodeId> + '_ {
         self.forgotten_devices.keys().copied()
     }
 
-    /// Stable, non-secret revision derived from the winning shared-setting
-    /// registers. It is written to TOML so a daemon can recognize its own
-    /// atomic replacement after a restart or config-watch notification.
-    #[must_use]
-    pub fn shared_settings_revision(&self) -> String {
-        let mut hash = blake3::Hasher::new();
-        hash.update(b"clip-sync/shared-settings-revision/v1");
-        for setting in [
-            SharedSetting::MeshQuotaBytes,
-            SharedSetting::CaptureThresholdBytes,
-        ] {
-            hash.update(setting.key().as_bytes());
-            if let Some(event) = self.setting_event(setting.key()) {
-                hash.update(&event.timestamp().physical_millis().to_be_bytes());
-                hash.update(&event.timestamp().logical().to_be_bytes());
-                hash.update(event.operation_id().node().as_uuid().as_bytes());
-                hash.update(&event.operation_id().counter().to_be_bytes());
-            } else {
-                hash.update(&[0; 36]);
-            }
-        }
-        hash.finalize().to_hex().to_string()
-    }
-
-    /// Computes the oldest-first eviction set from only quota-chargeable
-    /// entries. Pins and explicit oversized shares are excluded from both the
-    /// usage total and the candidate set.
+    /// Computes the oldest-first eviction set. Only inline items are charged:
+    /// they are the ones every device stores. Pins are excluded, and so are
+    /// references, whose bytes never leave their origin.
+    ///
+    /// An item whose add has not arrived yet (a touch or pin overtook it) has
+    /// no known size and is left out until it does.
     #[must_use]
     pub fn quota_plan(&self, quota_bytes: u64) -> QuotaPlan {
         let mut chargeable_bytes = 0_u128;
@@ -211,19 +72,14 @@ impl Projection {
         let mut candidates = Vec::new();
 
         for (content_id, state) in &self.content {
-            if !self.content_is_visible(*content_id, state) {
+            if !state.is_visible() {
                 continue;
             }
-            let size = if let Some(payload) = state.payload.as_ref() {
-                u128::from(payload.value.descriptor.logical_size())
-            } else if let Some((_, _, manifest)) = self.manifest_for_content(*content_id) {
-                u128::from(manifest.logical_size())
-            } else {
-                // A touch or pin overtook its add; the size is unknown
-                // until the add arrives, so the item is not charged yet.
+            let Some(item) = state.item.as_ref() else {
                 continue;
             };
-            if state.is_pinned() || state.is_quota_exempt() {
+            let size = u128::from(item.value.logical_size());
+            if state.is_pinned() || matches!(item.value, ItemKind::Reference(_)) {
                 excluded_bytes += size;
             } else {
                 chargeable_bytes += size;
@@ -254,28 +110,19 @@ impl Projection {
         }
     }
 
-    #[must_use]
-    pub fn effective_quota_plan(&self) -> QuotaPlan {
-        self.quota_plan(self.effective_shared_settings().mesh_quota_bytes)
-    }
-
     /// Visible entries in deterministic newest-first timeline order.
     #[must_use]
     pub fn visible_items(&self) -> Vec<ContentView<'_>> {
         let mut visible = self
             .content
             .iter()
+            .filter(|(_, state)| state.is_visible())
             .filter_map(|(content_id, state)| {
-                if !self.content_is_visible(*content_id, state) {
-                    return None;
-                }
-
                 Some(ContentView {
                     content_id: *content_id,
                     last_activity: state.activity?,
                     pinned: state.is_pinned(),
-                    quota_exempt: state.is_quota_exempt(),
-                    payload: state.payload.as_ref().map(|payload| &payload.value),
+                    item: state.item.as_ref(),
                 })
             })
             .collect::<Vec<_>>();
@@ -286,24 +133,5 @@ impl Projection {
                 .then_with(|| left.content_id.cmp(&right.content_id))
         });
         visible
-    }
-
-    fn content_is_visible(&self, content_id: ContentId, state: &ContentState) -> bool {
-        if !state.is_visible() {
-            return false;
-        }
-        if state.payload.is_some() {
-            return true;
-        }
-        let mut has_transfer = false;
-        let has_live_transfer = self.transfers.values().any(|transfer| {
-            let matches_content = transfer
-                .begin
-                .as_ref()
-                .is_some_and(|begin| begin.value.content_id == content_id);
-            has_transfer |= matches_content;
-            matches_content && transfer.phase() != TransferPhase::Cancelled
-        });
-        !has_transfer || has_live_transfer
     }
 }

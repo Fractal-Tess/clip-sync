@@ -1,52 +1,35 @@
-//! The control centre: what the daemon is doing and how it is configured.
+//! The control centre: what the daemon is doing and who it is talking to.
 //!
-//! Unlike the picker this view is mouse-driven and edits state, so it collects
+//! Configuration lives in each host's config file, so nothing here edits it.
+//! Unlike the picker this view is mouse-driven, so it collects
 //! [`Action`]s during the UI pass and hands them back to the caller, which
 //! applies them once the frame is over and egui no longer borrows anything.
 
-use clip_sync_ipc::protocol::{
-    DiagnosticCheck, PeersResponse, SharedSettingKind, StatusResponse, TransferItem,
-};
+use clip_sync_ipc::protocol::{DiagnosticCheck, PeersResponse, StatusResponse};
 
-use crate::{
-    daemon::{Daemon, Settings},
-    theme,
-};
+use crate::{daemon::Daemon, theme};
 
 /// A daemon mutation requested by a widget during the UI pass.
 pub enum Action {
     Refresh,
-    CancelTransfer(String),
     ForgetDevice(String),
-    SetShared(SharedSettingKind, u64),
-    SetInterfaces(Vec<String>),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
     Status,
     Peers,
-    Transfers,
     Diagnostics,
-    Settings,
 }
 
 impl Tab {
-    const ALL: [Self; 5] = [
-        Self::Status,
-        Self::Peers,
-        Self::Transfers,
-        Self::Diagnostics,
-        Self::Settings,
-    ];
+    const ALL: [Self; 3] = [Self::Status, Self::Peers, Self::Diagnostics];
 
     fn label(self) -> &'static str {
         match self {
             Self::Status => "Status",
             Self::Peers => "Peers",
-            Self::Transfers => "Transfers",
             Self::Diagnostics => "Diagnostics",
-            Self::Settings => "Settings",
         }
     }
 }
@@ -56,14 +39,7 @@ pub struct Control {
     tab_index: usize,
     status: Option<StatusResponse>,
     peers: Option<PeersResponse>,
-    transfers: Vec<TransferItem>,
     diagnostics: Vec<DiagnosticCheck>,
-    settings: Option<Settings>,
-    /// Mesh quota in mebibytes, which is the unit people actually think in.
-    quota_draft: u64,
-    /// Capture threshold in kibibytes.
-    threshold_draft: u64,
-    interfaces_draft: String,
     error: Option<String>,
     notice: Option<String>,
 }
@@ -90,14 +66,7 @@ impl Control {
 
         record(daemon.status().map(|value| self.status = Some(value)));
         record(daemon.peers().map(|value| self.peers = Some(value)));
-        record(daemon.transfers().map(|value| self.transfers = value));
         record(daemon.diagnostics().map(|value| self.diagnostics = value));
-        record(daemon.settings().map(|value| {
-            self.quota_draft = value.shared.mesh_quota_bytes / (1024 * 1024);
-            self.threshold_draft = value.shared.capture_threshold_bytes / 1024;
-            self.interfaces_draft = value.local.peer_interfaces.join(", ");
-            self.settings = Some(value);
-        }));
 
         self.error = failure;
     }
@@ -107,16 +76,7 @@ impl Control {
     pub fn apply(&mut self, daemon: &Daemon, action: Action) {
         let outcome = match action {
             Action::Refresh => Ok("Reloaded"),
-            Action::CancelTransfer(id) => {
-                daemon.cancel_transfer(&id).map(|()| "Transfer cancelled")
-            }
             Action::ForgetDevice(id) => daemon.forget_device(&id).map(|()| "Device forgotten"),
-            Action::SetShared(setting, value) => {
-                daemon.set_shared_setting(setting, value).map(|()| "Saved")
-            }
-            Action::SetInterfaces(interfaces) => {
-                daemon.set_peer_interfaces(interfaces).map(|()| "Saved")
-            }
         };
         match outcome {
             Ok(message) => {
@@ -182,7 +142,7 @@ impl Control {
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                // Settings rows and diagnostic detail read badly when stretched
+                // Field rows and diagnostic detail read badly when stretched
                 // across a maximised window, so the column stops growing.
                 ui.set_max_width(ui.available_width().min(720.0));
 
@@ -195,9 +155,7 @@ impl Control {
                 match self.tab() {
                     Tab::Status => self.status_tab(ui),
                     Tab::Peers => self.peers_tab(ui, actions),
-                    Tab::Transfers => self.transfers_tab(ui, actions),
                     Tab::Diagnostics => self.diagnostics_tab(ui),
-                    Tab::Settings => self.settings_tab(ui, actions),
                 }
             });
     }
@@ -221,7 +179,7 @@ impl Control {
 
         ui.horizontal_wrapped(|ui| {
             tile(ui, "Uptime", &uptime(status.uptime_seconds));
-            tile(ui, "Discovered", &status.discovered_peers.to_string());
+            tile(ui, "Configured", &status.discovered_peers.to_string());
             tile(ui, "Connected", &status.connected_peers.to_string());
         });
         ui.add_space(4.0);
@@ -320,50 +278,6 @@ impl Control {
         });
     }
 
-    fn transfers_tab(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
-        if self.transfers.is_empty() {
-            ui.add_space(8.0);
-            ui.label(egui::RichText::new("Nothing is transferring right now.").weak());
-            return;
-        }
-        for transfer in &self.transfers {
-            card(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new(&transfer.peer)
-                            .strong()
-                            .color(theme::TEXT_SELECTED),
-                    );
-                    ui.label(egui::RichText::new(&transfer.state).size(10.0).weak());
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.small_button("Cancel").clicked() {
-                            actions.push(Action::CancelTransfer(transfer.transfer_id.clone()));
-                        }
-                    });
-                });
-                let fraction = if transfer.total_bytes == 0 {
-                    0.0
-                } else {
-                    transfer.completed_bytes as f32 / transfer.total_bytes as f32
-                };
-                ui.add(
-                    egui::ProgressBar::new(fraction)
-                        .desired_height(6.0)
-                        .fill(theme::ACCENT),
-                );
-                ui.label(
-                    egui::RichText::new(format!(
-                        "{} of {}",
-                        bytes(transfer.completed_bytes),
-                        bytes(transfer.total_bytes)
-                    ))
-                    .size(10.0)
-                    .weak(),
-                );
-            });
-        }
-    }
-
     fn diagnostics_tab(&mut self, ui: &mut egui::Ui) {
         if self.diagnostics.is_empty() {
             ui.label(egui::RichText::new("The daemon reported no checks.").weak());
@@ -387,136 +301,6 @@ impl Control {
             });
         }
     }
-
-    fn settings_tab(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
-        let Some(settings) = self.settings.as_ref() else {
-            ui.label(egui::RichText::new("The daemon did not report its configuration.").weak());
-            return;
-        };
-
-        let saved_quota = settings.shared.mesh_quota_bytes / (1024 * 1024);
-        let saved_threshold = settings.shared.capture_threshold_bytes / 1024;
-        let saved_interfaces = settings.local.peer_interfaces.join(", ");
-
-        section(ui, "Shared across the mesh", |ui| {
-            ui.label(
-                egui::RichText::new(format!(
-                    // The revision is a content hash; a prefix is enough to tell
-                    // two of them apart, and the full string is unreadable.
-                    "revision {}",
-                    settings
-                        .shared
-                        .revision
-                        .chars()
-                        .take(12)
-                        .collect::<String>()
-                ))
-                .monospace()
-                .size(9.0)
-                .weak(),
-            );
-            ui.horizontal(|ui| {
-                label_cell(ui, "History quota");
-                ui.add_sized(
-                    VALUE_SIZE,
-                    egui::DragValue::new(&mut self.quota_draft).suffix(" MiB"),
-                );
-                if ui
-                    .add_enabled(self.quota_draft != saved_quota, egui::Button::new("Save"))
-                    .clicked()
-                {
-                    actions.push(Action::SetShared(
-                        SharedSettingKind::MeshQuotaBytes,
-                        self.quota_draft * 1024 * 1024,
-                    ));
-                }
-            });
-            ui.horizontal(|ui| {
-                label_cell(ui, "Capture threshold");
-                ui.add_sized(
-                    VALUE_SIZE,
-                    egui::DragValue::new(&mut self.threshold_draft).suffix(" KiB"),
-                );
-                if ui
-                    .add_enabled(
-                        self.threshold_draft != saved_threshold,
-                        egui::Button::new("Save"),
-                    )
-                    .clicked()
-                {
-                    actions.push(Action::SetShared(
-                        SharedSettingKind::CaptureThresholdBytes,
-                        self.threshold_draft * 1024,
-                    ));
-                }
-            });
-            ui.label(
-                egui::RichText::new("Changes here replicate to every device in the mesh.")
-                    .size(10.0)
-                    .weak(),
-            );
-        });
-
-        section(ui, "This node only", |ui| {
-            ui.horizontal(|ui| {
-                label_cell(ui, "Peer interfaces");
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.interfaces_draft)
-                        .hint_text("all interfaces")
-                        .desired_width(220.0),
-                );
-                if ui
-                    .add_enabled(
-                        self.interfaces_draft != saved_interfaces,
-                        egui::Button::new("Save"),
-                    )
-                    .clicked()
-                {
-                    actions.push(Action::SetInterfaces(parse_interfaces(
-                        &self.interfaces_draft,
-                    )));
-                }
-            });
-            field(ui, "Listen port", &settings.local.listen_port.to_string());
-            field(
-                ui,
-                "Discovery interval",
-                &format!("{}s", settings.local.discovery_interval_seconds),
-            );
-            field(
-                ui,
-                "Reconcile interval",
-                &format!("{}s", settings.local.reconcile_interval_seconds),
-            );
-            field(
-                ui,
-                "Reconnect backoff",
-                &format!(
-                    "{}s – {}s",
-                    settings.local.reconnect_min_seconds, settings.local.reconnect_max_seconds
-                ),
-            );
-            field(
-                ui,
-                "Mesh key file",
-                if settings.local.mesh_key_file_configured {
-                    "configured"
-                } else {
-                    "not configured"
-                },
-            );
-            field(ui, "Config", &settings.local.config_path);
-        });
-    }
-}
-
-/// Splits a comma or whitespace separated interface list, dropping blanks.
-fn parse_interfaces(raw: &str) -> Vec<String> {
-    raw.split([',', ' ', '\t'])
-        .map(str::trim)
-        .filter(|part| !part.is_empty())
-        .map(ToOwned::to_owned)
-        .collect()
 }
 
 fn banner(ui: &mut egui::Ui, color: egui::Color32, message: &str) {
@@ -584,8 +368,6 @@ fn tile(ui: &mut egui::Ui, label: &str, value: &str) {
 
 /// Width every label column in the view shares, so values line up down the page.
 const LABEL_WIDTH: f32 = 148.0;
-/// Size every editable value shares, so the Save buttons line up too.
-const VALUE_SIZE: [f32; 2] = [120.0, 20.0];
 
 /// Width of the device identifier column, sized for a UUID.
 const DEVICE_WIDTH: f32 = 300.0;

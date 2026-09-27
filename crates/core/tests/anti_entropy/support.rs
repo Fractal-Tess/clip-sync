@@ -2,7 +2,7 @@ pub(super) use clip_sync_core::model::{
     HlcTimestamp, NodeId, OpId, Operation, Payload, Projection, Representation, SeenOps,
     StampedOperation,
 };
-pub(super) use clip_sync_core::replication::BatchLimits;
+pub(super) use clip_sync_core::replication::{BatchLimits, decode_operation};
 use clip_sync_core::storage::{HistoryStore, OperationBatch, StorageKey};
 use tempfile::TempDir;
 pub(super) use uuid::Uuid;
@@ -74,6 +74,15 @@ impl Peer {
         self.store.ingest_batch(operations, NOW_MILLIS).unwrap();
     }
 
+    /// Stores a batch exactly as it arrives over the network.
+    pub(super) fn receive_encoded(&mut self, encoded: &[Vec<u8>]) {
+        let operations = encoded
+            .iter()
+            .map(|bytes| decode_operation(bytes).unwrap())
+            .collect::<Vec<_>>();
+        self.receive(&operations);
+    }
+
     pub(super) fn seen(&self) -> &SeenOps {
         self.store.projection().seen_ops()
     }
@@ -99,7 +108,7 @@ impl Peer {
 /// Sends one batch from `sender` to `receiver` and returns it.
 pub(super) fn sync_batch(sender: &Peer, receiver: &mut Peer, limits: &BatchLimits) -> usize {
     let batch = sender.batch_for(receiver.seen(), limits);
-    receiver.receive(&batch.operations);
+    receiver.receive_encoded(&batch.operations);
     batch.operations.len()
 }
 

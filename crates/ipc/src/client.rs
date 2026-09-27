@@ -9,11 +9,10 @@ use tokio_util::codec::Framed;
 use super::{
     IpcError,
     framing::codec,
-    protocol::{IPC_PROTOCOL_VERSION, Request, Response, request},
+    protocol::{IPC_PROTOCOL_VERSION, Request, Response},
 };
 
 const IPC_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
-const IPC_SHARE_REQUEST_TIMEOUT: Duration = Duration::from_mins(30);
 
 /// Sends one request to the daemon and waits for its response.
 ///
@@ -23,8 +22,7 @@ const IPC_SHARE_REQUEST_TIMEOUT: Duration = Duration::from_mins(30);
 /// correlation, or the bounded response wait fails.
 pub async fn request(socket: &Path, request: Request) -> Result<Response, IpcError> {
     let request_id = request.request_id;
-    let timeout = request_timeout(&request);
-    let response = tokio::time::timeout(timeout, request_inner(socket, request))
+    let response = tokio::time::timeout(IPC_REQUEST_TIMEOUT, request_inner(socket, request))
         .await
         .map_err(|_| IpcError::Timeout)??;
     if response.protocol_version != IPC_PROTOCOL_VERSION {
@@ -40,17 +38,6 @@ pub async fn request(socket: &Path, request: Request) -> Result<Response, IpcErr
         });
     }
     Ok(response)
-}
-
-pub(super) fn request_timeout(request: &Request) -> Duration {
-    if matches!(
-        request.body.as_ref(),
-        Some(request::Body::ShareClipboard(_))
-    ) {
-        IPC_SHARE_REQUEST_TIMEOUT
-    } else {
-        IPC_REQUEST_TIMEOUT
-    }
 }
 
 async fn request_inner(socket: &Path, request: Request) -> Result<Response, IpcError> {
@@ -77,28 +64,8 @@ mod tests {
     use super::*;
     use crate::{
         framing::codec,
-        protocol::{ShareClipboardRequest, StatusRequest, StatusResponse, response},
+        protocol::{StatusRequest, StatusResponse, request, response},
     };
-
-    #[test]
-    fn share_requests_keep_a_finite_extended_deadline() {
-        let share = Request {
-            protocol_version: IPC_PROTOCOL_VERSION,
-            request_id: 1,
-            body: Some(request::Body::ShareClipboard(ShareClipboardRequest {
-                confirmed: true,
-            })),
-        };
-        let status = Request {
-            protocol_version: IPC_PROTOCOL_VERSION,
-            request_id: 2,
-            body: Some(request::Body::Status(StatusRequest {})),
-        };
-
-        assert_eq!(request_timeout(&share), IPC_SHARE_REQUEST_TIMEOUT);
-        assert_eq!(request_timeout(&status), IPC_REQUEST_TIMEOUT);
-        assert!(request_timeout(&share) > request_timeout(&status));
-    }
 
     #[tokio::test]
     async fn client_rejects_mismatched_response_request_id() {

@@ -52,6 +52,7 @@ async fn history_search_is_bounded_and_case_insensitive() {
                 pinned: false,
                 physical_millis: 2,
                 origin_millis: Some(2),
+                remote: false,
             },
             HistoryItem {
                 content_id: "beta".to_owned(),
@@ -63,6 +64,7 @@ async fn history_search_is_bounded_and_case_insensitive() {
                 pinned: false,
                 physical_millis: 1,
                 origin_millis: Some(1),
+                remote: false,
             },
         ])
         .await;
@@ -107,6 +109,7 @@ async fn history_response_honors_offset_and_reports_total() {
             pinned: false,
             physical_millis: index,
             origin_millis: Some(index),
+            remote: false,
         })
         .collect();
     state.set_history(items).await;
@@ -248,6 +251,7 @@ async fn history_search_uses_authenticated_device_name_aliases() {
             pinned: true,
             physical_millis: 1,
             origin_millis: Some(1),
+            remote: false,
         }])
         .await;
 
@@ -291,6 +295,7 @@ async fn history_search_matches_every_word_in_newest_first_order() {
                 pinned: true,
                 physical_millis: 1_704_067_199_000,
                 origin_millis: Some(1_704_067_199_000),
+                remote: false,
             },
             HistoryItem {
                 content_id: "new".to_owned(),
@@ -302,6 +307,7 @@ async fn history_search_matches_every_word_in_newest_first_order() {
                 pinned: true,
                 physical_millis: 1_704_067_199_500,
                 origin_millis: Some(1_704_067_199_500),
+                remote: false,
             },
             HistoryItem {
                 content_id: "wrong-device".to_owned(),
@@ -313,6 +319,7 @@ async fn history_search_matches_every_word_in_newest_first_order() {
                 pinned: true,
                 physical_millis: 1_704_067_199_900,
                 origin_millis: Some(1_704_067_199_900),
+                remote: false,
             },
         ])
         .await;
@@ -391,6 +398,7 @@ async fn large_history_search_stays_responsive_and_bounded() {
             pinned: index % 10 == 0,
             physical_millis: index,
             origin_millis: Some(index),
+            remote: false,
         })
         .collect();
     state.set_history(items).await;
@@ -416,48 +424,4 @@ async fn large_history_search_stays_responsive_and_bounded() {
         elapsed < Duration::from_secs(1),
         "50k-entry metadata search took {elapsed:?}"
     );
-}
-
-#[tokio::test]
-async fn config_response_is_redacted_and_complete_for_local_ui_fields() {
-    let temporary = tempfile::tempdir().expect("temporary directory");
-    let (commands, _command_rx) = mpsc::unbounded_channel();
-    let state = DaemonState::new(
-        "test-node".to_owned(),
-        temporary.path().join("config.toml"),
-        Config::default(),
-        commands,
-    );
-
-    let response = state
-        .handle(Request {
-            protocol_version: IPC_PROTOCOL_VERSION,
-            request_id: 11,
-            body: Some(request::Body::Config(protocol::ConfigRequest {})),
-        })
-        .await;
-    let Some(response::Body::Config(config)) = response.body else {
-        panic!("expected config response");
-    };
-    let value: serde_json::Value =
-        serde_json::from_slice(&config.redacted_json).expect("valid config JSON");
-    let local = value
-        .get("local")
-        .and_then(serde_json::Value::as_object)
-        .expect("local config object");
-
-    for field in [
-        "listen_port",
-        "discovery_interval_seconds",
-        "reconcile_interval_seconds",
-        "reconnect_min_seconds",
-        "reconnect_max_seconds",
-        "peer_interfaces",
-        "mesh_key_file_configured",
-        "config_path",
-    ] {
-        assert!(local.contains_key(field), "missing {field}");
-    }
-    assert!(!local.contains_key("mesh_key_file"));
-    assert!(!String::from_utf8_lossy(&config.redacted_json).contains("/run/secrets"));
 }

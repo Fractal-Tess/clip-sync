@@ -91,7 +91,7 @@ fn duplicate_batch_entries_are_idempotent() {
     let batch = sender.batch_for(receiver.seen(), &BatchLimits::default());
     // The same batch arrives three times, as after network retries.
     for _ in 0..3 {
-        receiver.receive(&batch.operations);
+        receiver.receive_encoded(&batch.operations);
     }
 
     assert_eq!(receiver.operations().len(), 3);

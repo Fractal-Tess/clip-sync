@@ -1,6 +1,6 @@
 use std::{
     env, fs,
-    io::{Read, Write},
+    io::Read,
     net::IpAddr,
     path::{Path, PathBuf},
 };
@@ -9,15 +9,16 @@ use directories::BaseDirs;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::model::EffectiveSharedSettings;
-pub use crate::model::{DEFAULT_CAPTURE_THRESHOLD_BYTES, DEFAULT_MESH_QUOTA_BYTES};
 pub const DEFAULT_LISTEN_PORT: u16 = 24_892;
 const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
+const MIB: u64 = 1024 * 1024;
 
+/// Per-host settings, read once at start. Nothing here replicates; keys from
+/// older versions (the `[shared]` section, share and transfer limits) are
+/// ignored so an old file still loads.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
-    pub shared: SharedConfig,
     pub local: LocalConfig,
 }
 
@@ -50,114 +51,40 @@ impl Config {
         Ok(config)
     }
 
-    /// Atomically saves validated configuration as TOML.
+    /// Validates resource limits and required settings.
     ///
     /// # Errors
     ///
-    /// Returns an error when validation, encoding, or file replacement fails.
-    pub fn save(&self, path: &Path) -> Result<(), ConfigError> {
-        self.validate()?;
-        let target = writable_target(path)?;
-        let parent = target.parent().ok_or(ConfigError::MissingParent)?;
-        fs::create_dir_all(parent)?;
-
-        let encoded = toml::to_string_pretty(self)?;
-        let temporary = parent.join(format!(
-            ".{}.{}.tmp",
-            target
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("config.toml"),
-            uuid::Uuid::new_v4()
-        ));
-        let result = (|| {
-            let mut options = fs::OpenOptions::new();
-            options.write(true).create_new(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                options.mode(0o600);
-            }
-            let mut file = options.open(&temporary)?;
-            if let Ok(metadata) = fs::metadata(&target) {
-                file.set_permissions(metadata.permissions())?;
-            }
-            file.write_all(encoded.as_bytes())?;
-            file.sync_all()?;
-            drop(file);
-            fs::rename(&temporary, &target)?;
-            sync_directory(parent)?;
-            Ok(())
-        })();
-        if result.is_err() {
-            let _ = fs::remove_file(&temporary);
-        }
-        result
-    }
-
-    /// Rewrites only replicated settings while preserving local bootstrap
-    /// values from the latest valid file on disk.
-    ///
-    /// The revision is derived from the winning replicated registers. Config
-    /// watchers can suppress a reload when both values and revision match.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error instead of overwriting a concurrently malformed file.
-    pub fn rewrite_shared(
-        path: &Path,
-        settings: EffectiveSharedSettings,
-        revision: impl Into<String>,
-    ) -> Result<Self, ConfigError> {
-        let mut config = Self::load(path)?;
-        config.shared = SharedConfig {
-            mesh_quota_bytes: settings.mesh_quota_bytes,
-            capture_threshold_bytes: settings.capture_threshold_bytes,
-            revision: revision.into(),
-        };
-        config.save(path)?;
-        Ok(config)
-    }
-
-    /// Validates resource limits and required local settings.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when a required value is zero or empty.
+    /// Returns an error when a required value is zero, empty, or out of range.
     pub fn validate(&self) -> Result<(), ConfigError> {
-        if self.shared.mesh_quota_bytes == 0 {
+        let local = &self.local;
+        if local.inline_limit_bytes == 0 {
             return Err(ConfigError::Invalid(
-                "shared.mesh_quota_bytes must be greater than zero",
+                "local.inline_limit_bytes must be greater than zero",
             ));
         }
-        if self.shared.capture_threshold_bytes == 0 {
+        if local.max_capture_bytes < local.inline_limit_bytes {
             return Err(ConfigError::Invalid(
-                "shared.capture_threshold_bytes must be greater than zero",
+                "local.max_capture_bytes must be at least local.inline_limit_bytes",
             ));
         }
-        if self.shared.revision.len() > 128
-            || !self
-                .shared
-                .revision
-                .bytes()
-                .all(|byte| byte.is_ascii_hexdigit())
-        {
+        if local.history_quota_bytes == 0 {
             return Err(ConfigError::Invalid(
-                "shared.revision must be empty or at most 128 hexadecimal characters",
+                "local.history_quota_bytes must be greater than zero",
             ));
         }
-        if self.local.discovery_interval_seconds == 0 {
+        if local.discovery_interval_seconds == 0 {
             return Err(ConfigError::Invalid(
                 "local.discovery_interval_seconds must be greater than zero",
             ));
         }
-        if self.local.peer_interfaces.len() > 32 {
+        if local.peer_interfaces.len() > 32 {
             return Err(ConfigError::Invalid(
                 "local.peer_interfaces must contain at most 32 interface names",
             ));
         }
         let mut interfaces = std::collections::BTreeSet::new();
-        for interface in &self.local.peer_interfaces {
+        for interface in &local.peer_interfaces {
             if interface.is_empty()
                 || interface.len() > 15
                 || !interface
@@ -174,13 +101,13 @@ impl Config {
                 ));
             }
         }
-        if self.local.peer_addresses.len() > 512 {
+        if local.peer_addresses.len() > 512 {
             return Err(ConfigError::Invalid(
                 "local.peer_addresses must contain at most 512 IP addresses",
             ));
         }
         let mut peer_addresses = std::collections::BTreeSet::new();
-        for address in &self.local.peer_addresses {
+        for address in &local.peer_addresses {
             if address.is_unspecified() || address.is_multicast() || !peer_addresses.insert(address)
             {
                 return Err(ConfigError::Invalid(
@@ -188,38 +115,26 @@ impl Config {
                 ));
             }
         }
-        if self.local.listen_port == 0 {
+        if local.listen_port == 0 {
             return Err(ConfigError::Invalid(
                 "local.listen_port must be greater than zero",
             ));
         }
-        if self.local.reconcile_interval_seconds == 0 {
+        if local.reconcile_interval_seconds == 0 {
             return Err(ConfigError::Invalid(
                 "local.reconcile_interval_seconds must be greater than zero",
             ));
         }
-        if self.local.reconnect_max_seconds < self.local.reconnect_min_seconds
-            || self.local.reconnect_min_seconds == 0
+        if local.reconnect_max_seconds < local.reconnect_min_seconds
+            || local.reconnect_min_seconds == 0
         {
             return Err(ConfigError::Invalid(
                 "local reconnect bounds must be nonzero and ordered",
             ));
         }
-        if self.local.mesh_key_file.as_os_str().is_empty() {
+        if local.mesh_key_file.as_os_str().is_empty() {
             return Err(ConfigError::Invalid(
                 "local.mesh_key_file must not be empty",
-            ));
-        }
-        if self.local.maximum_explicit_share_bytes < self.shared.capture_threshold_bytes {
-            return Err(ConfigError::Invalid(
-                "local.maximum_explicit_share_bytes must be at least the capture threshold",
-            ));
-        }
-        if self.local.max_concurrent_chunk_streams == 0
-            || self.local.max_concurrent_chunk_streams > 32
-        {
-            return Err(ConfigError::Invalid(
-                "local.max_concurrent_chunk_streams must be between 1 and 32",
             ));
         }
         Ok(())
@@ -228,60 +143,31 @@ impl Config {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
-pub struct SharedConfig {
-    pub mesh_quota_bytes: u64,
-    pub capture_threshold_bytes: u64,
-    /// Daemon-authored fingerprint of the winning replicated registers.
-    pub revision: String,
-}
-
-impl Default for SharedConfig {
-    fn default() -> Self {
-        Self {
-            mesh_quota_bytes: DEFAULT_MESH_QUOTA_BYTES,
-            capture_threshold_bytes: DEFAULT_CAPTURE_THRESHOLD_BYTES,
-            revision: String::new(),
-        }
-    }
-}
-
-impl SharedConfig {
-    #[must_use]
-    pub fn matches(&self, settings: EffectiveSharedSettings, revision: &str) -> bool {
-        self.mesh_quota_bytes == settings.mesh_quota_bytes
-            && self.capture_threshold_bytes == settings.capture_threshold_bytes
-            && self.revision == revision
-    }
-}
-
-impl From<EffectiveSharedSettings> for SharedConfig {
-    fn from(settings: EffectiveSharedSettings) -> Self {
-        Self {
-            mesh_quota_bytes: settings.mesh_quota_bytes,
-            capture_threshold_bytes: settings.capture_threshold_bytes,
-            revision: String::new(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
 pub struct LocalConfig {
     pub mesh_key_file: PathBuf,
     pub listen_port: u16,
+    /// How often the configured interfaces' addresses are re-read.
     pub discovery_interval_seconds: u64,
     pub reconcile_interval_seconds: u64,
     pub reconnect_min_seconds: u64,
     pub reconnect_max_seconds: u64,
-    /// Linux interfaces used for authenticated discovery and mesh connections.
-    /// An empty list disables network discovery and incoming mesh listeners.
+    /// Linux interfaces mesh listeners bind to. An empty list disables
+    /// incoming connections and dialling.
     pub peer_interfaces: Vec<String>,
-    /// Stable peer IPs to dial directly when multicast discovery is unavailable.
+    /// The other hosts' addresses; every connection still authenticates.
     pub peer_addresses: Vec<IpAddr>,
-    pub maximum_explicit_share_bytes: u64,
-    pub transfer_free_space_reserve_bytes: u64,
-    pub materialization_free_space_reserve_bytes: u64,
-    pub max_concurrent_chunk_streams: usize,
+    /// Copies up to this size replicate to every host. Larger copies stay on
+    /// this host and are fetched by a peer only when it pastes them.
+    pub inline_limit_bytes: u64,
+    /// The largest non-file copy this host keeps at all. Copied files are
+    /// never read at copy time, so they have no size limit.
+    pub max_capture_bytes: u64,
+    /// Once inline history exceeds this, its oldest unpinned items are
+    /// deleted on every host.
+    pub history_quota_bytes: u64,
+    /// Space for copies fetched from other hosts; the oldest are removed
+    /// first, since the originals remain on their hosts.
+    pub fetch_cache_bytes: u64,
     /// Set to `false` on headless hosts. The daemon then never connects to
     /// Wayland and only stores and relays history for the other devices.
     pub clipboard: bool,
@@ -298,10 +184,10 @@ impl Default for LocalConfig {
             reconnect_max_seconds: 60,
             peer_interfaces: Vec::new(),
             peer_addresses: Vec::new(),
-            maximum_explicit_share_bytes: 4 * 1024 * 1024 * 1024,
-            transfer_free_space_reserve_bytes: 64 * 1024 * 1024,
-            materialization_free_space_reserve_bytes: 8 * 1024 * 1024,
-            max_concurrent_chunk_streams: 4,
+            inline_limit_bytes: 5 * MIB,
+            max_capture_bytes: 512 * MIB,
+            history_quota_bytes: 1024 * MIB,
+            fetch_cache_bytes: 10 * 1024 * MIB,
             clipboard: true,
         }
     }
@@ -312,11 +198,13 @@ pub struct AppPaths {
     pub config: PathBuf,
     pub state_dir: PathBuf,
     pub runtime_dir: PathBuf,
+    pub cache_dir: PathBuf,
     pub socket: PathBuf,
 }
 
 impl AppPaths {
-    /// Resolves configuration, state, runtime, and IPC paths from XDG variables.
+    /// Resolves configuration, state, cache, runtime, and IPC paths from XDG
+    /// variables.
     ///
     /// # Errors
     ///
@@ -327,15 +215,17 @@ impl AppPaths {
             config_override.unwrap_or_else(|| base.config_dir().join("clip-sync/config.toml"));
         let state_root =
             xdg_path("XDG_STATE_HOME")?.unwrap_or_else(|| base.home_dir().join(".local/state"));
-        let state_dir = state_root.join("clip-sync");
+        let cache_root =
+            xdg_path("XDG_CACHE_HOME")?.unwrap_or_else(|| base.home_dir().join(".cache"));
         let runtime_root = xdg_path("XDG_RUNTIME_DIR")?.ok_or(ConfigError::MissingRuntime)?;
         let runtime_dir = runtime_root.join("clip-sync");
         let socket = runtime_dir.join("daemon.sock");
 
         Ok(Self {
             config,
-            state_dir,
+            state_dir: state_root.join("clip-sync"),
             runtime_dir,
+            cache_dir: cache_root.join("clip-sync"),
             socket,
         })
     }
@@ -373,56 +263,16 @@ pub enum ConfigError {
         variable: &'static str,
         path: PathBuf,
     },
-    #[error("the config path has no parent directory")]
-    MissingParent,
     #[error("could not read the config: {0}")]
     Read(std::io::Error),
     #[error("config exceeds the 1 MiB size limit")]
     TooLarge,
     #[error("invalid TOML: {0}")]
     TomlDecode(#[from] toml::de::Error),
-    #[error("could not encode TOML: {0}")]
-    TomlEncode(#[from] toml::ser::Error),
     #[error("config is invalid: {0}")]
     Invalid(&'static str),
     #[error("config I/O failed: {0}")]
     Io(#[from] std::io::Error),
-    #[error("config path contains too many symbolic-link hops")]
-    SymlinkLoop,
-}
-
-fn writable_target(path: &Path) -> Result<PathBuf, ConfigError> {
-    let mut target = path.to_owned();
-    for _ in 0..16 {
-        match fs::symlink_metadata(&target) {
-            Ok(metadata) if metadata.file_type().is_symlink() => {
-                let link = fs::read_link(&target)?;
-                target = if link.is_absolute() {
-                    link
-                } else {
-                    target
-                        .parent()
-                        .ok_or(ConfigError::MissingParent)?
-                        .join(link)
-                };
-            }
-            Ok(_) => return Ok(target),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(target),
-            Err(error) => return Err(error.into()),
-        }
-    }
-    Err(ConfigError::SymlinkLoop)
-}
-
-#[cfg(unix)]
-fn sync_directory(path: &Path) -> Result<(), ConfigError> {
-    fs::File::open(path)?.sync_all()?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn sync_directory(_path: &Path) -> Result<(), ConfigError> {
-    Ok(())
 }
 
 #[cfg(test)]
@@ -431,54 +281,55 @@ mod tests {
 
     #[test]
     fn defaults_match_product_decisions() {
-        let config = Config::default();
-        assert_eq!(config.shared.mesh_quota_bytes, 1024 * 1024 * 1024);
-        assert_eq!(config.shared.capture_threshold_bytes, 20 * 1024 * 1024);
-        assert_eq!(config.local.listen_port, 24_892);
+        let local = Config::default().local;
+        assert_eq!(local.inline_limit_bytes, 5 * MIB);
+        assert_eq!(local.history_quota_bytes, 1024 * MIB);
+        assert_eq!(local.fetch_cache_bytes, 10 * 1024 * MIB);
+        assert_eq!(local.listen_port, 24_892);
+        assert!(local.clipboard);
     }
 
     #[test]
-    fn config_round_trips() {
-        let temp = tempfile::tempdir().expect("temporary directory");
+    fn a_0_3_config_still_loads() {
+        let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("config.toml");
-        let config = Config::default();
+        fs::write(
+            &path,
+            r#"
+            [shared]
+            mesh_quota_bytes = 1073741824
+            capture_threshold_bytes = 20971520
+            revision = "5f69"
 
-        config.save(&path).expect("save config");
-        let loaded = Config::load(&path).expect("load config");
-
-        assert_eq!(loaded, config);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            assert_eq!(
-                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
-                0o600
-            );
-        }
+            [local]
+            listen_port = 24892
+            peer_interfaces = ["wt0"]
+            maximum_explicit_share_bytes = 4294967296
+            max_concurrent_chunk_streams = 4
+            "#,
+        )
+        .unwrap();
+        let config = Config::load(&path).unwrap();
+        assert_eq!(config.local.peer_interfaces, ["wt0"]);
+        assert_eq!(config.local.inline_limit_bytes, 5 * MIB);
     }
 
     #[test]
-    fn rejects_zero_quota() {
-        let config = Config {
-            shared: SharedConfig {
-                mesh_quota_bytes: 0,
-                ..SharedConfig::default()
-            },
-            ..Config::default()
-        };
+    fn rejects_zero_quota_and_inverted_capture_limits() {
+        let mut config = Config::default();
+        config.local.history_quota_bytes = 0;
+        assert!(matches!(config.validate(), Err(ConfigError::Invalid(_))));
 
+        let mut config = Config::default();
+        config.local.max_capture_bytes = config.local.inline_limit_bytes - 1;
         assert!(matches!(config.validate(), Err(ConfigError::Invalid(_))));
     }
 
     #[test]
     fn rejects_oversized_config_before_parsing() {
-        let temp = tempfile::tempdir().expect("temporary directory");
+        let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("config.toml");
-        fs::write(
-            &path,
-            vec![b'x'; usize::try_from(MAX_CONFIG_BYTES + 1).unwrap()],
-        )
-        .unwrap();
+        fs::write(&path, vec![b'#'; 1024 * 1024 + 1]).unwrap();
         assert!(matches!(Config::load(&path), Err(ConfigError::TooLarge)));
     }
 
@@ -497,13 +348,6 @@ mod tests {
                 ..
             }
         ));
-    }
-
-    #[test]
-    fn rejects_malformed_shared_revision() {
-        let mut config = Config::default();
-        config.shared.revision = "not-a-register-revision".to_owned();
-        assert!(matches!(config.validate(), Err(ConfigError::Invalid(_))));
     }
 
     #[test]
@@ -536,47 +380,5 @@ mod tests {
 
         config.local.peer_addresses = vec!["239.255.67.83".parse().expect("IP")];
         assert!(matches!(config.validate(), Err(ConfigError::Invalid(_))));
-    }
-
-    #[test]
-    fn replicated_rewrite_preserves_local_values_and_revision() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("config.toml");
-        let mut original = Config::default();
-        original.local.listen_port = 31_337;
-        original.save(&path).unwrap();
-
-        let settings = EffectiveSharedSettings {
-            mesh_quota_bytes: 99,
-            capture_threshold_bytes: 77,
-        };
-        let rewritten = Config::rewrite_shared(&path, settings, "a1b2").unwrap();
-        assert_eq!(rewritten.local.listen_port, 31_337);
-        assert!(rewritten.shared.matches(settings, "a1b2"));
-        assert_eq!(Config::load(&path).unwrap(), rewritten);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn atomic_save_updates_symlink_target_without_replacing_link() {
-        use std::os::unix::fs::symlink;
-
-        let temp = tempfile::tempdir().unwrap();
-        let target = temp.path().join("managed.toml");
-        let link = temp.path().join("config.toml");
-        Config::default().save(&target).unwrap();
-        symlink("managed.toml", &link).unwrap();
-
-        let mut changed = Config::default();
-        changed.local.listen_port = 30_001;
-        changed.save(&link).unwrap();
-
-        assert!(
-            fs::symlink_metadata(&link)
-                .unwrap()
-                .file_type()
-                .is_symlink()
-        );
-        assert_eq!(Config::load(&target).unwrap().local.listen_port, 30_001);
     }
 }

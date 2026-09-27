@@ -4,6 +4,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use thiserror::Error;
 
 const CONTENT_DOMAIN: &[u8] = b"clip-sync/content-id/v1\0";
+const FILE_REFERENCE_DOMAIN: &[u8] = b"clip-sync/file-reference-id/v1\0";
 pub const MAX_PAYLOAD_REPRESENTATIONS: usize = 128;
 pub const MAX_PAYLOAD_MIME_BYTES: usize = 256;
 const TEXT_PREVIEW_CHARACTERS: usize = 160;
@@ -35,6 +36,27 @@ impl ContentId {
         }
 
         Ok(Self(*hasher.finalize().as_bytes()))
+    }
+
+    /// Identity of a copied set of files on one device. The paths alone
+    /// cannot identify them: the same path on two hosts names different
+    /// files, so the originating device is part of the identity.
+    #[must_use]
+    pub fn from_file_reference(
+        key: &[u8; blake3::KEY_LEN],
+        origin: super::NodeId,
+        uri_list: &[u8],
+    ) -> Self {
+        let mut hasher = blake3::Hasher::new_keyed(key);
+        hasher.update(FILE_REFERENCE_DOMAIN);
+        hasher.update(origin.as_uuid().as_bytes());
+        hasher.update(uri_list);
+        Self(*hasher.finalize().as_bytes())
+    }
+
+    #[must_use]
+    pub const fn from_bytes(bytes: [u8; blake3::OUT_LEN]) -> Self {
+        Self(bytes)
     }
 
     #[must_use]
@@ -135,6 +157,14 @@ pub struct RepresentationDescriptor {
 
 impl RepresentationDescriptor {
     #[must_use]
+    pub fn new(mime: impl Into<String>, byte_len: u64) -> Self {
+        Self {
+            mime: mime.into(),
+            byte_len,
+        }
+    }
+
+    #[must_use]
     pub fn mime(&self) -> &str {
         &self.mime
     }
@@ -220,6 +250,45 @@ impl Payload {
             },
             representations,
         })
+    }
+
+    /// Rebuilds a payload decoded from storage or the network. The
+    /// representations must already be in canonical order; the content ID is
+    /// taken as given and checked separately with [`Self::validate`], which
+    /// needs the mesh content key.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an empty, oversized, duplicate, or non-canonical
+    /// representation set.
+    pub fn from_parts(
+        content_id: ContentId,
+        representations: Vec<Representation>,
+    ) -> Result<Self, ContentError> {
+        let descriptors = representations
+            .iter()
+            .map(|representation| {
+                Ok(RepresentationDescriptor {
+                    mime: representation.mime.clone(),
+                    byte_len: usize_to_u64(representation.bytes.len())?,
+                })
+            })
+            .collect::<Result<Vec<_>, ContentError>>()?;
+        let logical_size = descriptors.iter().try_fold(0_u64, |total, descriptor| {
+            total
+                .checked_add(descriptor.byte_len)
+                .ok_or(ContentError::SizeOverflow)
+        })?;
+        let payload = Self {
+            descriptor: PayloadDescriptor {
+                content_id,
+                logical_size,
+                representations: descriptors,
+            },
+            representations,
+        };
+        payload.validate_structure()?;
+        Ok(payload)
     }
 
     #[must_use]

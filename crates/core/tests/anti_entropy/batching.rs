@@ -92,7 +92,7 @@ fn batch_skips_operations_the_peer_holds_above_a_gap() {
     let counters = batch
         .operations
         .iter()
-        .map(|operation| operation.id().counter())
+        .map(|bytes| decode_operation(bytes).unwrap().id().counter())
         .collect::<Vec<_>>();
     assert_eq!(counters, vec![2, 3, 5]);
 }
@@ -114,7 +114,7 @@ fn does_not_falsely_acknowledge_gaps() {
     assert_eq!(batch.operations.len(), 4);
 
     let mut receiver = Peer::new();
-    receiver.receive(&batch.operations);
+    receiver.receive_encoded(&batch.operations);
 
     // The frontier stops at 2 because op 3 is missing; 4 and 5 are sparse.
     assert_eq!(receiver.seen().frontier(n), 2);

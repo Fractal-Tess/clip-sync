@@ -1,19 +1,15 @@
 use std::{collections::BTreeMap, fs, time::Duration};
 
 use anyhow::Context;
-use tokio::{task::JoinHandle, time::MissedTickBehavior};
+use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use clip_sync_core::{
-    clipboard::{backend::ClipboardEvent, wayland::WaylandBackend},
+    clipboard::wayland::WaylandBackend,
     config::{AppPaths, Config},
     crypto::MeshSecret,
-    payload::{
-        ChunkStore, ChunkStoreConfig, ExplicitSharePolicy, Materializer, MaterializerConfig,
-    },
     state_keys::{StateKeys, StoreLock},
     storage::HistoryStore,
-    transfer::{TransferCoordinator, TransferStateLimits},
 };
 
 use crate::{
@@ -23,20 +19,13 @@ use crate::{
 };
 
 use super::{
-    activation::schedule_materialization_cleanup,
+    activation::{Activation, FetchFinished},
+    capture::CaptureLimits,
     clipboard::{handle_clipboard_event, spawn_clipboard_watch},
     commands::handle_daemon_command,
-    config_supervision::{apply_config_reload, initialize_shared_settings, spawn_config_watch},
-    mesh_persistence::{
-        MeshPersistenceContext, handle_mesh_chunk_command, handle_mesh_store_request,
-    },
+    mesh_persistence::{MeshPersistenceContext, handle_mesh_store_request},
     views::{device_items, history_items},
 };
-
-/// How often the daemon reclaims chunk-store residue that the catalog cannot
-/// see. Interrupted writes are rare, and the sweep enumerates the whole store,
-/// so this stays well clear of the hot reconciliation path.
-const CHUNK_STORE_MAINTENANCE_INTERVAL: Duration = Duration::from_mins(5);
 
 pub(super) const CLIPBOARD_DISABLED_DETAIL: &str =
     "disabled by configuration; this host only stores and relays history";
@@ -47,7 +36,7 @@ pub(super) const CLIPBOARD_DISABLED_DETAIL: &str =
 ///
 /// Returns an error when runtime setup, IPC serving, or signal handling fails.
 #[allow(clippy::too_many_lines)]
-pub async fn run(paths: AppPaths, mut config: Config) -> anyhow::Result<()> {
+pub async fn run(paths: AppPaths, config: Config) -> anyhow::Result<()> {
     fs::create_dir_all(&paths.state_dir).context("create state directory")?;
     fs::create_dir_all(&paths.runtime_dir).context("create runtime directory")?;
     make_private_directory(&paths.state_dir).context("secure state directory")?;
@@ -64,53 +53,16 @@ pub async fn run(paths: AppPaths, mut config: Config) -> anyhow::Result<()> {
     let storage_path = paths.state_dir.join("history.db");
     let mut history = HistoryStore::open(&storage_path, state_keys.storage_key())
         .with_context(|| format!("open encrypted history at {}", storage_path.display()))?;
-    initialize_shared_settings(&mut history, &paths.config, &mut config)
-        .context("reconcile shared mesh settings with config")?;
+    remove_retired_directories(&paths);
 
     let content_key = state_keys.content_identity_key();
     let transport_psk = mesh_secret
         .transport_psk()
         .context("derive mesh transport key")?;
-    let chunk_store = ChunkStore::open(
-        paths.state_dir.join("chunks"),
-        state_keys.chunk_store_key(),
-        ChunkStoreConfig {
-            max_payload_bytes: config.local.maximum_explicit_share_bytes,
-            max_chunks_per_manifest: 65_536,
-            ..ChunkStoreConfig::default()
-        },
-    )
-    .context("open encrypted chunk store")?;
-    let materializer = Materializer::new(
-        paths.runtime_dir.join("materialized"),
-        MaterializerConfig {
-            free_space_reserve_bytes: config.local.materialization_free_space_reserve_bytes,
-        },
-    )
-    .context("open runtime materializer")?;
-    let abandoned_materializations = materializer
-        .cleanup_abandoned()
-        .context("clean materializations left by a previous daemon")?;
-    if abandoned_materializations != 0 {
-        tracing::info!(
-            removed = abandoned_materializations,
-            "removed abandoned runtime materializations"
-        );
-    }
-    let mut transfers = TransferCoordinator::new(
-        chunk_store,
-        materializer,
-        ExplicitSharePolicy {
-            automatic_capture_threshold_bytes: config.shared.capture_threshold_bytes,
-            mesh_quota_bytes: config.shared.mesh_quota_bytes,
-            maximum_explicit_share_bytes: config.local.maximum_explicit_share_bytes,
-            free_space_reserve_bytes: config.local.transfer_free_space_reserve_bytes,
-        },
-        TransferStateLimits::default(),
-    );
-    transfers
-        .reconcile_projection(history.projection())
-        .context("recover transfer state")?;
+    let limits = CaptureLimits {
+        inline_limit_bytes: config.local.inline_limit_bytes,
+        history_quota_bytes: config.local.history_quota_bytes,
+    };
 
     let hostname = hostname::get()
         .context("read system hostname")?
@@ -140,7 +92,6 @@ pub async fn run(paths: AppPaths, mut config: Config) -> anyhow::Result<()> {
     mesh_config.reconcile_interval = Duration::from_secs(config.local.reconcile_interval_seconds);
     mesh_config.reconnect_min = Duration::from_secs(config.local.reconnect_min_seconds);
     mesh_config.reconnect_max = Duration::from_secs(config.local.reconnect_max_seconds);
-    mesh_config.max_concurrent_chunk_streams = config.local.max_concurrent_chunk_streams;
     mesh_config.initial_seen = history.projection().seen_ops().clone();
     let acknowledgements = history
         .acknowledgements()
@@ -152,9 +103,8 @@ pub async fn run(paths: AppPaths, mut config: Config) -> anyhow::Result<()> {
         .chain(std::iter::once(history.replica().node_id()))
         .collect();
     mesh_config.forgotten_devices = history.projection().forgotten_devices().collect();
-    let (mesh, mut mesh_rx, mut mesh_chunk_rx) =
-        MeshRuntime::spawn_with_transfers(mesh_config, transport_psk, shutdown.clone())
-            .context("start mesh runtime")?;
+    let (mesh, mut mesh_rx) = MeshRuntime::spawn(mesh_config, transport_psk, shutdown.clone())
+        .context("start mesh runtime")?;
     let mesh_handle = mesh.handle();
     state.set_mesh(mesh_handle.clone()).await;
     let discovery = spawn_discovery(
@@ -163,23 +113,11 @@ pub async fn run(paths: AppPaths, mut config: Config) -> anyhow::Result<()> {
         hostname,
         shutdown.clone(),
     );
-    let (config_tx, mut config_rx) = tokio::sync::mpsc::unbounded_channel();
-    let config_watch = spawn_config_watch(
-        paths.config.clone(),
-        config.clone(),
-        config_tx,
-        shutdown.clone(),
-    );
 
     let clipboard = WaylandBackend::new();
     clipboard
-        .set_capture_threshold(
-            history
-                .projection()
-                .effective_shared_settings()
-                .capture_threshold_bytes,
-        )
-        .context("apply effective clipboard capture threshold")?;
+        .set_capture_threshold(config.local.max_capture_bytes)
+        .context("apply clipboard capture limit")?;
     let (clipboard_tx, mut clipboard_rx) = tokio::sync::mpsc::channel(128);
     let mut clipboard_finished = !config.local.clipboard;
     let mut clipboard_watch = if config.local.clipboard {
@@ -196,6 +134,7 @@ pub async fn run(paths: AppPaths, mut config: Config) -> anyhow::Result<()> {
         tracing::info!("clipboard disabled by configuration; storing and relaying history only");
         tokio::spawn(async {})
     };
+    let (fetch_tx, mut fetch_rx) = tokio::sync::mpsc::unbounded_channel::<FetchFinished>();
 
     tracing::info!(socket = %paths.socket.display(), "clip-sync daemon started");
     let server = ipc::serve(&paths.socket, state.clone(), shutdown.clone());
@@ -203,22 +142,9 @@ pub async fn run(paths: AppPaths, mut config: Config) -> anyhow::Result<()> {
     tokio::pin!(server);
     tokio::pin!(termination);
     let mut server_finished = false;
-    let mut active_materialization = None;
-    let mut pending_materialization_cleanup = None;
-    let materialization_root = paths.runtime_dir.join("materialized");
-    let mut chunk_store_maintenance = tokio::time::interval_at(
-        tokio::time::Instant::now() + CHUNK_STORE_MAINTENANCE_INTERVAL,
-        CHUNK_STORE_MAINTENANCE_INTERVAL,
-    );
-    chunk_store_maintenance.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
     loop {
         tokio::select! {
-            _ = chunk_store_maintenance.tick() => {
-                if let Err(error) = transfers.store_mut().sweep_orphans() {
-                    tracing::warn!(%error, "chunk-store orphan sweep failed");
-                }
-            }
             result = &mut server, if !server_finished => {
                 server_finished = true;
                 result.context("serve local IPC")?;
@@ -237,47 +163,41 @@ pub async fn run(paths: AppPaths, mut config: Config) -> anyhow::Result<()> {
             }
             command = command_rx.recv() => {
                 if let Some(command) = command {
-                    handle_daemon_command(
-                        command,
-                        &clipboard,
-                        &mut history,
-                        &state,
-                        &mesh_handle,
-                        &mut transfers,
-                        content_key,
-                        &paths.config,
-                        &mut config,
-                        &mut active_materialization,
-                        &mut pending_materialization_cleanup,
-                        &materialization_root,
-                    ).await;
+                    let mut activation = Activation {
+                        clipboard: &clipboard,
+                        history: &mut history,
+                        state: &state,
+                        mesh: &mesh_handle,
+                        cache_dir: &paths.cache_dir,
+                        fetches: &fetch_tx,
+                    };
+                    handle_daemon_command(command, &mut activation, config.local.clipboard).await;
+                }
+            }
+            finished = fetch_rx.recv() => {
+                if let Some(finished) = finished {
+                    Activation {
+                        clipboard: &clipboard,
+                        history: &mut history,
+                        state: &state,
+                        mesh: &mesh_handle,
+                        cache_dir: &paths.cache_dir,
+                        fetches: &fetch_tx,
+                    }
+                    .finish_fetch(finished)
+                    .await;
                 }
             }
             event = clipboard_rx.recv() => {
                 if let Some(event) = event {
-                    if matches!(
-                        event,
-                        ClipboardEvent::NewOffer { .. }
-                            | ClipboardEvent::Captured { .. }
-                            | ClipboardEvent::Cleared { .. }
-                    ) && let Some(manifest_id) = active_materialization.take()
-                    {
-                        let cancellation = CancellationToken::new();
-                        schedule_materialization_cleanup(
-                            materialization_root.clone(),
-                            manifest_id,
-                            cancellation.clone(),
-                        );
-                        pending_materialization_cleanup = Some((manifest_id, cancellation));
-                    }
                     handle_clipboard_event(
                         event,
                         &mut history,
                         &state,
                         content_key,
+                        limits,
                         &mesh_handle,
-                        &mut transfers,
-                    ).await?;
+                    ).await;
                 }
             }
             request = mesh_rx.recv() => {
@@ -286,34 +206,9 @@ pub async fn run(paths: AppPaths, mut config: Config) -> anyhow::Result<()> {
                         history: &mut history,
                         state: &state,
                         content_key,
-                        clipboard: &clipboard,
                         mesh: &mesh_handle,
-                        config_path: &paths.config,
-                        config: &mut config,
-                        transfers: &mut transfers,
                     };
                     handle_mesh_store_request(request, &mut context).await;
-                }
-            }
-            changed = config_rx.recv() => {
-                if let Some(changed) = changed
-                    && let Err(error) = apply_config_reload(
-                        changed,
-                        &paths.config,
-                        &mut config,
-                        &mut history,
-                        &clipboard,
-                        &mesh_handle,
-                        &state,
-                        &mut transfers,
-                    ).await
-                {
-                    tracing::warn!(%error, "config reload was rejected");
-                }
-            }
-            command = mesh_chunk_rx.recv() => {
-                if let Some(command) = command {
-                    handle_mesh_chunk_command(command, &mut transfers, &mesh_handle);
                 }
             }
             result = &mut termination => {
@@ -332,11 +227,26 @@ pub async fn run(paths: AppPaths, mut config: Config) -> anyhow::Result<()> {
         tracing::warn!(%error, "Wayland clipboard supervisor failed");
     }
     finish_task(discovery).await;
-    finish_task(config_watch).await;
     mesh.wait().await;
     tracing::info!("clip-sync daemon stopped");
     Ok(())
 }
+
+/// 0.3 kept an encrypted chunk store and materialized transfers; neither is
+/// used any more.
+fn remove_retired_directories(paths: &AppPaths) {
+    for directory in [
+        paths.state_dir.join("chunks"),
+        paths.runtime_dir.join("materialized"),
+    ] {
+        if directory.exists()
+            && let Err(error) = fs::remove_dir_all(&directory)
+        {
+            tracing::warn!(%error, path = %directory.display(), "could not remove a retired directory");
+        }
+    }
+}
+
 pub(super) fn unix_time_millis() -> anyhow::Result<u64> {
     let millis = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

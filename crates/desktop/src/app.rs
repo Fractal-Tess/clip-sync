@@ -947,6 +947,16 @@ fn card(
                                         .weak(),
                                 );
                             }
+                            // Large items stay on the device that copied them
+                            // and are fetched on paste; say so before Enter.
+                            if item.remote {
+                                ui.label(
+                                    egui::RichText::new("fetch")
+                                        .monospace()
+                                        .size(META_SIZE)
+                                        .weak(),
+                                );
+                            }
                             // Age and size sit on the right so they line up
                             // down the column and stay readable as a pair,
                             // rather than shifting with the badges beside them.

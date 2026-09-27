@@ -9,7 +9,7 @@ use tokio_util::sync::CancellationToken;
 
 use clip_sync_core::{
     model::{NodeId, OpId, Operation, SeenOps, StampedOperation},
-    replication::{Codec, JsonV1Codec},
+    replication::decode_operation,
 };
 
 use super::super::protocol::{
@@ -162,14 +162,9 @@ async fn batch_for_peer(
         .map_err(|_| MeshError::PersistenceTimeout)?
         .map_err(|_| MeshError::PersistenceUnavailable)?
         .map_err(MeshError::PersistenceRejected)?;
-    let operations = batch
-        .operations
-        .iter()
-        .map(|operation| JsonV1Codec.encode_op(operation))
-        .collect::<Result<Vec<_>, _>>()?;
     let frontier = encode_frontier(&*context.seen.read().await)?;
     let known_members = encode_membership(&*context.known_members.read().await)?;
-    Ok((frontier, known_members, operations, batch.has_more))
+    Ok((frontier, known_members, batch.operations, batch.has_more))
 }
 
 pub(super) async fn persist_and_record(
@@ -181,7 +176,7 @@ pub(super) async fn persist_and_record(
 ) -> Result<(), MeshError> {
     let operations = operations
         .iter()
-        .map(|operation| JsonV1Codec.decode_op(operation))
+        .map(|operation| decode_operation(operation))
         .collect::<Result<Vec<_>, _>>()?;
     // The batch itself moves to the store; only what the runtime needs
     // afterwards is kept, so large payloads are never held twice.

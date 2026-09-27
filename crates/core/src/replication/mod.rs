@@ -7,7 +7,7 @@
 
 mod codec;
 
-pub use codec::{Codec, CodecError, Envelope, JsonV1Codec};
+pub use codec::{CodecError, decode_operation, encode_operation};
 
 /// Resource limits for a single anti-entropy batch.
 #[derive(Clone, Copy, Debug)]

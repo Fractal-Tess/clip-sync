@@ -14,10 +14,11 @@ use super::{
     operations::{OPERATION_ENCODING_VERSION, decode_stored_operation},
 };
 
-/// Operations a peer is missing, bounded by [`BatchLimits`].
+/// Operations a peer is missing, bounded by [`BatchLimits`]. They are the
+/// stored encoding, which is also the wire encoding, so they are sent as-is.
 #[derive(Debug, Default)]
 pub struct OperationBatch {
-    pub operations: Vec<StampedOperation>,
+    pub operations: Vec<Vec<u8>>,
     pub has_more: bool,
 }
 
@@ -156,9 +157,7 @@ impl EncryptedStorage {
                     return Ok(batch);
                 }
                 total_bytes = total_bytes.saturating_add(payload.len());
-                batch
-                    .operations
-                    .push(decode_stored_operation(payload.as_slice())?);
+                batch.operations.push(payload.to_vec());
             }
         }
         Ok(batch)

@@ -14,9 +14,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use super::backend::{BackendError, ClipboardBackend, ClipboardEvent};
-use super::types::{
-    ClipboardContent, CurrentClipboardInspection, FeedbackMarker, MAX_CAPTURE_BYTES, ProbeResult,
-};
+use super::types::{ClipboardContent, FeedbackMarker, MAX_CAPTURE_BYTES, ProbeResult};
 
 mod capture;
 mod connection;
@@ -157,56 +155,6 @@ impl ClipboardBackend for WaylandBackend {
             .map_err(|_| BackendError::WatchNotRunning)?;
 
         reply_rx.await.map_err(|_| BackendError::WatchNotRunning)?
-    }
-
-    async fn inspect_current_clipboard(
-        &self,
-        maximum_bytes: u64,
-    ) -> Result<CurrentClipboardInspection, BackendError> {
-        let sender = self.active_sender()?;
-        let (reply_tx, reply_rx) = oneshot::channel();
-        sender
-            .send(ClipboardCommand::ReadCurrent {
-                expected_generation: None,
-                maximum_bytes,
-                retain_bytes: false,
-                reply: reply_tx,
-            })
-            .map_err(|_| BackendError::WatchNotRunning)?;
-        let result = reply_rx
-            .await
-            .map_err(|_| BackendError::WatchNotRunning)??;
-        Ok(CurrentClipboardInspection::new(
-            result.generation,
-            result.mime_list,
-            result.logical_size,
-        ))
-    }
-
-    async fn capture_current_clipboard(
-        &self,
-        inspection: &CurrentClipboardInspection,
-    ) -> Result<ClipboardContent, BackendError> {
-        let sender = self.active_sender()?;
-        let (reply_tx, reply_rx) = oneshot::channel();
-        sender
-            .send(ClipboardCommand::ReadCurrent {
-                expected_generation: Some(inspection.generation()),
-                maximum_bytes: inspection.logical_size(),
-                retain_bytes: true,
-                reply: reply_tx,
-            })
-            .map_err(|_| BackendError::WatchNotRunning)?;
-        let result = reply_rx
-            .await
-            .map_err(|_| BackendError::WatchNotRunning)??;
-        let content =
-            ClipboardContent::new_with_limit(result.representations, inspection.logical_size())
-                .map_err(|error| BackendError::ClipboardCommand(error.to_string()))?;
-        if content.total_bytes() != inspection.logical_size() {
-            return Err(BackendError::CurrentOfferChanged);
-        }
-        Ok(content)
     }
 }
 

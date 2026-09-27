@@ -138,6 +138,12 @@ impl EncryptedStorage {
                  payload = excluded.payload",
             (COMPACTED_SEEN_ENCODING_VERSION, snapshot),
         )?;
+        for content_id in content_ids {
+            transaction.execute(
+                "DELETE FROM local_sources WHERE content_id = ?1",
+                [&content_id.as_bytes()[..]],
+            )?;
+        }
         for operation in &compacted {
             let node = *operation.node().as_uuid().as_bytes();
             let counter = sqlite_integer("operation counter", operation.counter())?;

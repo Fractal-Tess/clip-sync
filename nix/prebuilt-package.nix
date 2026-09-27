@@ -7,6 +7,7 @@
   libxkbcommon,
   wayland,
   iproute2,
+  libnotify,
   version,
   artifact,
 }:
@@ -41,7 +42,7 @@ stdenvNoCC.mkDerivation {
   # buildInputs.
   preFixup = ''
     wrapProgram "$out/bin/clip-sync" \
-      --prefix PATH : ${lib.makeBinPath [ iproute2 ]} \
+      --prefix PATH : ${lib.makeBinPath [ iproute2 libnotify ]} \
       --prefix LD_LIBRARY_PATH : ${
         lib.makeLibraryPath [
           libxkbcommon

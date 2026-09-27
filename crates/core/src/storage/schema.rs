@@ -6,11 +6,12 @@ use rusqlite::{Connection, OptionalExtension};
 use zeroize::Zeroizing;
 
 use super::{
-    Result, StorageError, StorageKey, key::SQLCIPHER_KEY_HEX_CHARS,
-    operations::decode_stored_operation,
+    Result, StorageError, StorageKey, key::SQLCIPHER_KEY_HEX_CHARS, legacy,
+    operations::OPERATION_ENCODING_VERSION,
 };
+use crate::replication::encode_operation;
 
-const SCHEMA_VERSION: u32 = 5;
+const SCHEMA_VERSION: u32 = 6;
 
 const MIGRATION_1: &str = "
     BEGIN IMMEDIATE;
@@ -264,6 +265,9 @@ pub(super) fn apply_migrations(connection: &Connection, current_version: u32) ->
     if current_version < 5 {
         migrate_to_5(connection)?;
     }
+    if current_version < 6 {
+        migrate_to_6(connection)?;
+    }
     Ok(())
 }
 
@@ -280,7 +284,8 @@ fn migrate_to_5(connection: &Connection) -> Result<()> {
                 let node: Vec<u8> = row.get(0)?;
                 let counter: i64 = row.get(1)?;
                 let encoded = Zeroizing::new(row.get::<_, Vec<u8>>(2)?);
-                let operation = decode_stored_operation(encoded.as_slice())?;
+                let operation =
+                    legacy::convert(encoded.as_slice()).map_err(StorageError::LegacyOperation)?;
                 if let Some(content_id) = operation.operation().content_id() {
                     rows.push((node, counter, *content_id.as_bytes()));
                 }
@@ -310,6 +315,93 @@ fn migrate_to_5(connection: &Connection) -> Result<()> {
     }
 }
 
+/// Converts every operation from the 0.3 JSON encoding to Protobuf and adds
+/// the table recording where locally authored references live.
+///
+/// The table is rebuilt because its encoding-version constraint changes.
+/// Settings and manifest-share operations become `Retired`; see
+/// [`legacy::convert`]. Rows are converted one at a time, so memory stays
+/// bounded by the largest single operation.
+const MIGRATION_6_TABLES: &str = "
+    CREATE TABLE operations_v6 (
+        origin_node BLOB NOT NULL CHECK (length(origin_node) = 16),
+        counter INTEGER NOT NULL CHECK (counter BETWEEN 1 AND 9223372036854775807),
+        hlc_physical_millis INTEGER NOT NULL
+            CHECK (hlc_physical_millis BETWEEN 0 AND 9223372036854775807),
+        hlc_logical INTEGER NOT NULL CHECK (hlc_logical BETWEEN 0 AND 4294967295),
+        encoding_version INTEGER NOT NULL CHECK (encoding_version = 2),
+        payload BLOB NOT NULL,
+        content_id BLOB CHECK (content_id IS NULL OR length(content_id) = 32),
+        PRIMARY KEY (origin_node, counter)
+    ) STRICT, WITHOUT ROWID;
+    CREATE TABLE local_sources (
+        content_id BLOB PRIMARY KEY NOT NULL CHECK (length(content_id) = 32),
+        source BLOB NOT NULL
+    ) STRICT, WITHOUT ROWID;
+";
+
+const MIGRATION_6_SWAP: &str = "
+    DROP TABLE operations;
+    ALTER TABLE operations_v6 RENAME TO operations;
+    CREATE INDEX operations_event_order
+        ON operations (hlc_physical_millis, hlc_logical, origin_node, counter);
+    CREATE INDEX operations_content ON operations (content_id)
+        WHERE content_id IS NOT NULL;
+    UPDATE storage_meta SET value = '6' WHERE key = 'schema_version';
+    PRAGMA user_version = 6;
+";
+
+fn migrate_to_6(connection: &Connection) -> Result<()> {
+    connection.execute_batch("BEGIN IMMEDIATE;")?;
+    let result = (|| {
+        connection.execute_batch(MIGRATION_6_TABLES)?;
+        {
+            let mut rows = connection.prepare(
+                "SELECT origin_node, counter, hlc_physical_millis, hlc_logical, payload
+                 FROM operations",
+            )?;
+            let mut insert = connection.prepare(
+                "INSERT INTO operations_v6 (
+                     origin_node, counter, hlc_physical_millis, hlc_logical,
+                     encoding_version, payload, content_id
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            )?;
+            let mut query = rows.query([])?;
+            while let Some(row) = query.next()? {
+                let encoded = Zeroizing::new(row.get::<_, Vec<u8>>(4)?);
+                let operation =
+                    legacy::convert(encoded.as_slice()).map_err(StorageError::LegacyOperation)?;
+                let converted = Zeroizing::new(encode_operation(&operation));
+                let content_id = operation
+                    .operation()
+                    .content_id()
+                    .map(|content_id| content_id.as_bytes().to_vec());
+                insert.execute(rusqlite::params![
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    OPERATION_ENCODING_VERSION,
+                    converted.as_slice(),
+                    content_id,
+                ])?;
+            }
+        }
+        connection.execute_batch(MIGRATION_6_SWAP)?;
+        Ok(())
+    })();
+    match result {
+        Ok(()) => {
+            connection.execute_batch("COMMIT;")?;
+            Ok(())
+        }
+        Err(error) => {
+            let _ = connection.execute_batch("ROLLBACK;");
+            Err(error)
+        }
+    }
+}
+
 pub(super) fn verify_current_schema(connection: &Connection) -> Result<()> {
     let version = existing_schema_version(connection)?;
     if version != SCHEMA_VERSION {
@@ -324,6 +416,7 @@ pub(super) fn verify_current_schema(connection: &Connection) -> Result<()> {
         "peer_acknowledgements",
         "known_members",
         "compacted_seen",
+        "local_sources",
     ] {
         let exists = connection.query_row(
             "SELECT EXISTS(

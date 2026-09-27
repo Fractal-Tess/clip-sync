@@ -18,12 +18,12 @@ clip-sync synchronizes retained clipboard history between trusted devices withou
 
 - **No master node.** Every authorized peer stores and forwards retained history.
 - **History before interruption.** Remote copies enter a merged history until deliberately activated.
-- **Offline reconciliation.** Peers catch up after reconnecting.
-- **Interface-scoped networking.** Authenticated discovery and transport run only on explicitly selected Linux interfaces.
-- **Encrypted persistence.** SQLCipher stores history metadata and operations; large payloads use fixed-size encrypted chunks.
-- **Arbitrary clipboard content.** Text, images, multiple MIME representations, and safe file snapshots are supported.
-- **Bounded transfers.** Large shares are chunked, resumable, cancellable, and relayable.
-- **Keyboard-first control.** Search, pagination, Vim-style navigation, activation, pinning, deletion, transfers, peers, settings, and diagnostics are available from one desktop window.
+- **Offline reconciliation.** Peers catch up after reconnecting, directly or through any other peer.
+- **Large items stay put.** Copied files, and anything over 5 MiB, stay on the host that copied them; another host fetches them from the originals when you paste there.
+- **Interface-scoped networking.** Peers are a fixed address list, reached only over explicitly selected Linux interfaces.
+- **Encrypted persistence.** SQLCipher stores history under a random per-host key.
+- **Arbitrary clipboard content.** Text, images, multiple MIME representations, and files are supported.
+- **Keyboard-first picker.** Search, navigation, activation, pinning, and deletion from one window, plus a control centre for peers and diagnostics.
 
 The initial target is NixOS on Hyprland/wlroots. Platform boundaries are kept narrow, but other operating systems are not currently supported.
 
@@ -31,17 +31,19 @@ The initial target is NixOS on Hyprland/wlroots. Platform boundaries are kept na
 
 The Rust workspace has five crates with a single lockfile and a strict authority boundary:
 
-- `clip-sync-core` owns domain models, encrypted persistence, clipboard backends, replication, transfer, and transport primitives.
+- `clip-sync-core` owns domain models, encrypted persistence, clipboard backends, replication, copied-file handling, and transport primitives.
 - `clip-sync-ipc` is an independent leaf containing the versioned Protobuf wire contract, bounded framing, and Unix-socket client.
 - `clip-sync-daemon` owns discovery, mesh and history orchestration, daemon state, and the IPC server.
 - `clip-sync-cli` owns parsing and client/offline command execution without starting a daemon or owning a runtime.
 - `clip-sync-desktop` is the application host, producing the only executable. It renders the picker and control centre with egui on a CPU rasterizer, so the window has no browser engine or GPU dependency.
 
-The daemon is the sole owner of clipboard access, encrypted storage, retention, transfer state, and mesh networking. The CLI and desktop window communicate with it through an owner-only Unix socket using protocol-v6 Protobuf IPC. They never open storage or mesh state directly, and neither client automatically starts the daemon.
+The daemon is the sole owner of clipboard access, encrypted storage, retention, and mesh networking. The CLI and desktop window communicate with it through an owner-only Unix socket using versioned Protobuf IPC. They never open storage or mesh state directly, and neither client automatically starts the daemon.
 
-ClipSync sends small HMAC-authenticated UDP multicast beacons on each configured interface. Interfaces that cannot route multicast, including many point-to-point tunnels, fall back to rate-limited authenticated unicast probe windows with a hard per-cycle bound. A valid beacon exposes only the sender address and QUIC port; host and application metadata are exchanged only after the existing mesh-secret-authenticated QUIC handshake succeeds. QUIC listeners bind only to addresses on the selected interfaces, and the Peers view reports only live authenticated connections.
+Peers are the fixed `peer_addresses` from configuration; nothing is broadcast or probed. QUIC listeners bind only to addresses on the selected `peer_interfaces`, and each peer is dialled from the local address whose network contains it. Every connection authenticates with the mesh secret before any host or history data is exchanged, and the Peers view reports only live authenticated connections.
 
-`crates/desktop` contains both windows. The picker is the default view; `F1` swaps to the control centre, which carries the status, peers, transfers, diagnostics, and settings tabs. Image previews are fetched only after the grid is on screen, so decoding never delays the first frame.
+History is a log of operations every host keeps and relays. Copies up to `inline_limit_bytes` carry their bytes and so exist on every host. Larger copies publish only a description; the copying host records where the bytes are (the original files, or its own store for non-file content) and serves them when another host pastes the item. A file moved or edited after copying is refused rather than served changed.
+
+`crates/desktop` contains both windows. The picker is the default view; `F1` swaps to the control centre, which carries the status, peers, and diagnostics tabs. Image previews are fetched only after the grid is on screen, so decoding never delays the first frame.
 
 ## Commands
 
@@ -53,27 +55,15 @@ clip-sync desktop
 clip-sync daemon
 clip-sync status --json
 clip-sync peers --json
-clip-sync history search 'd:kiwi,t:text,p:false,"error message"' --json
+clip-sync history search 'release notes' --json
+clip-sync history activate <content-id> --json
 clip-sync history pin <content-id> --json
 clip-sync history delete <content-id> --json
-clip-sync share-clipboard --confirm --json
-clip-sync transfer list --json
-clip-sync transfer cancel <transfer-id> --json
 clip-sync device forget <node-id> --json
-clip-sync config set mesh-quota 1073741824 --json
 clip-sync doctor --json
-clip-sync rekey --old-key-file OLD --new-key-file NEW
 ```
 
-History search combines case-insensitive free text with typed filters. Commas and whitespace chain filters conjunctively, while quoted phrases preserve separators. `d:`, `t:`, and `p:` abbreviate `device:`, `type:`, and `pinned:`.
-
-```console
-clip-sync history search '"release notes",d:kiwi,t:text,p:true'
-clip-sync history search 'before:2026-07-29T12:00:00Z,min-size:4KiB,max-size:2MB'
-clip-sync history search 'before:1785326400000'
-```
-
-`before:` accepts RFC 3339 or Unix milliseconds. Inclusive size bounds accept bytes, `KB`, `KiB`, `MB`, `MiB`, `GB`, and `GiB`.
+History search matches case-insensitive words, all of which must appear in an item's preview, MIME types, or source device.
 
 ## Desktop development
 
@@ -101,7 +91,6 @@ Picker shortcuts:
 
 ```console
 nix develop
-cargo run -p clip-sync-desktop --bin clip-sync -- config init
 cargo run -p clip-sync-desktop --bin clip-sync -- doctor
 cargo run -p clip-sync-desktop --bin clip-sync -- daemon
 # In another shell:
@@ -126,7 +115,7 @@ GitHub Actions runs the Rust validation suite on pushes and pull requests. Stabl
 ### Development principles
 
 - Preserve masterless behavior; do not introduce a hidden coordinator or privileged peer.
-- Keep the daemon authoritative for storage, clipboard, transfer, and mesh state.
+- Keep the daemon authoritative for storage, clipboard, and mesh state.
 - Fail closed on authentication, decryption, permission, or validation failures.
 - Stream untrusted payloads and enforce explicit resource bounds.
 - Never log clipboard contents, filenames, previews, keys, secrets, or plaintext search queries.
@@ -223,46 +212,37 @@ sops.secrets.clip_sync_mesh_key = {
 Reference the runtime path in the local configuration:
 
 ```toml
-[shared]
-mesh_quota_bytes = 1073741824
-capture_threshold_bytes = 20971520
-revision = ""
-
 [local]
 mesh_key_file = "/run/secrets/clip_sync_mesh_key"
 listen_port = 24892
-discovery_interval_seconds = 15
-reconcile_interval_seconds = 5
-reconnect_min_seconds = 1
-reconnect_max_seconds = 60
-peer_interfaces = ["eth0", "wt0"]
-peer_addresses = ["100.91.0.2", "100.91.126.8"]
-maximum_explicit_share_bytes = 4294967296
-transfer_free_space_reserve_bytes = 67108864
-materialization_free_space_reserve_bytes = 8388608
-max_concurrent_chunk_streams = 4
+peer_interfaces = ["wt0"]
+peer_addresses = ["100.91.0.2", "100.91.0.3", "100.91.126.8"]
+# Copies up to this size replicate to every host; larger ones are fetched on paste.
+inline_limit_bytes = 5242880
+# The largest non-file copy kept at all. Copied files have no limit.
+max_capture_bytes = 536870912
+# Once inline history exceeds this, its oldest unpinned items are deleted everywhere.
+history_quota_bytes = 1073741824
+# Space for items fetched from other hosts; the oldest are evicted first.
+fetch_cache_bytes = 10737418240
+# false on a headless host: it then only stores and relays history.
+clipboard = true
 ```
 
-`peer_addresses` keeps stable mesh or VPN peers dialable when the selected
-interface does not route multicast. Every connection still authenticates with
-the mesh secret; addresses only replace discovery, not authentication.
+Every setting is per host; nothing replicates configuration. A host's own
+address may appear in `peer_addresses`, so one list can serve every host.
 
-### Mesh-secret rotation
+### Changing the mesh secret
 
-Stop the daemon and rotate every retained node before deploying the replacement secret as its configured `mesh_key_file`:
-
-```console
-systemctl --user stop clip-sync
-clip-sync rekey \
-  --old-key-file /run/secrets/clip_sync_mesh_key_old \
-  --new-key-file /run/secrets/clip_sync_mesh_key_new
-```
-
-The command is interruption-safe and idempotent when rerun with the same secrets. Do not delete or edit `history.keyslot` or `history.keyslot.next` during recovery. Deploy the new configured secret only after every node reports a verified rotation. Never use the production secret for smoke tests.
+The database key is a random per-host `history.key` beside the database, so
+the mesh secret only authenticates peers. To change it, deploy the new secret
+to every host and restart their daemons; hosts on different secrets simply
+cannot connect until they match. Content IDs are keyed by the mesh secret,
+so the same text copied before and after the change appears twice.
 
 ## Security
 
-Clipboard history routinely contains passwords, tokens, private keys, messages, and proprietary data. **Do not use this pre-release for sensitive clipboard contents.** The protocol, cryptographic construction, storage format, and transfer behavior have not received an independent security review.
+Clipboard history routinely contains passwords, tokens, private keys, messages, and proprietary data. **Do not use this pre-release for sensitive clipboard contents.** The protocol, cryptographic construction, storage format, and fetch behavior have not received an independent security review.
 
 The current trust model assumes that devices belong to one user, operating systems and the secret manager are trusted, and selected network interfaces are appropriate for peer communication. Discovery beacons are authenticated but not confidential and reveal that a host is listening for ClipSync; unauthenticated beacons are ignored. Every holder of the mesh secret has equal authority to read or mutate retained history. clip-sync does not protect against a compromised authorized peer, compromised desktop session, clipboard-source application behavior, or plaintext while an item is actively exposed to another application.
 

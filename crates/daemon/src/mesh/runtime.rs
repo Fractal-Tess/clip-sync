@@ -13,10 +13,9 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 use clip_sync_core::{
-    model::{NodeId, Operation, SeenOps, StampedOperation},
+    model::{ContentId, NodeId, OpId, Operation, Reference, SeenOps, StampedOperation},
     replication::BatchLimits,
-    storage::OperationBatch,
-    transfer::TransferChunk,
+    storage::{LocalSource, OperationBatch},
     transport::Psk,
 };
 
@@ -26,12 +25,13 @@ use super::protocol::MAX_BATCH_OPERATIONS;
 
 mod control;
 mod error;
+mod fetch;
 mod handshake;
 mod listener;
 mod session;
-mod transfer;
 
 pub use error::MeshError;
+pub use fetch::Fetched;
 
 const SERVER_NAME: &str = "clip-sync.mesh";
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -42,9 +42,8 @@ const MAX_CONCURRENT_HANDSHAKES: usize = 32;
 const MAX_ACTIVE_CONNECTIONS: usize = 128;
 const MAX_GENERATION_TASKS: usize =
     MAX_DISCOVERED_PEERS + MAX_ACTIVE_CONNECTIONS + MAX_CONCURRENT_HANDSHAKES;
-const MAX_CONCURRENT_CHUNK_STREAMS: usize = 4;
-const MAX_MISSING_CHUNKS_PER_ROUND: usize = 64;
-const CHUNK_BROKER_TIMEOUT: Duration = Duration::from_secs(30);
+/// Fetches served at once per connection; sync exchanges are unaffected.
+const MAX_CONCURRENT_FETCHES: usize = 4;
 const CLOSE_DUPLICATE: u32 = 0x201;
 const CLOSE_FORGOTTEN: u32 = 0x202;
 const CLOSE_SHUTDOWN: u32 = 0x203;
@@ -60,7 +59,6 @@ pub struct MeshRuntimeConfig {
     pub reconnect_min: Duration,
     pub reconnect_max: Duration,
     pub batch_limits: BatchLimits,
-    pub max_concurrent_chunk_streams: usize,
     /// Durable seen summary, including operation IDs whose payload rows were
     /// safely compacted. The runtime advertises it and keeps it current.
     pub initial_seen: SeenOps,
@@ -82,7 +80,6 @@ impl MeshRuntimeConfig {
                 max_ops: MAX_BATCH_OPERATIONS,
                 max_bytes: 4 * 1024 * 1024,
             },
-            max_concurrent_chunk_streams: MAX_CONCURRENT_CHUNK_STREAMS,
             initial_seen: SeenOps::default(),
             known_members: BTreeSet::from([node_id]),
             forgotten_devices: BTreeSet::new(),
@@ -97,6 +94,7 @@ impl MeshRuntimeConfig {
 pub enum MeshStoreRequest {
     Persist(PersistBatch),
     Batch(BatchRequest),
+    Source(SourceRequest),
 }
 
 /// A batch which must become durable before the network peer is acknowledged.
@@ -160,22 +158,30 @@ impl BatchRequest {
     }
 }
 
-/// Daemon-owned chunk-store work requested only by authenticated sessions.
+/// Asks the store where a reference this device authored reads its bytes
+/// from. `operation` is the one the requesting peer holds; the store refuses
+/// when the item has since been re-published or deleted.
 #[derive(Debug)]
-pub enum MeshChunkCommand {
-    Missing {
-        maximum: usize,
-        reply: oneshot::Sender<Result<Vec<TransferChunk>, String>>,
-    },
-    Export {
-        request: TransferChunk,
-        reply: oneshot::Sender<Result<Vec<u8>, String>>,
-    },
-    Import {
-        request: TransferChunk,
-        encrypted: Vec<u8>,
-        reply: oneshot::Sender<Result<(), String>>,
-    },
+pub struct SourceRequest {
+    content_id: ContentId,
+    operation: OpId,
+    reply: oneshot::Sender<Result<LocalSource, String>>,
+}
+
+impl SourceRequest {
+    #[must_use]
+    pub const fn content_id(&self) -> ContentId {
+        self.content_id
+    }
+
+    #[must_use]
+    pub const fn operation(&self) -> OpId {
+        self.operation
+    }
+
+    pub fn complete(self, result: Result<LocalSource, String>) {
+        let _ = self.reply.send(result);
+    }
 }
 
 /// Cloneable daemon-facing control surface.
@@ -270,9 +276,33 @@ impl MeshHandle {
         self.device_hostnames.read().await.clone()
     }
 
-    /// Wakes live authenticated sessions after transfer state changes.
-    pub fn notify_transfers(&self) {
-        bump_revision(&self.revision);
+    /// Fetches a reference's bytes from its origin, which must be connected.
+    /// Files land in `destination`; see [`Fetched`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MeshError::OriginOffline`] when the origin is not connected,
+    /// or the transfer, validation, or file error that stopped the fetch.
+    pub async fn fetch(
+        &self,
+        content_id: ContentId,
+        operation: OpId,
+        reference: &Reference,
+        destination: &std::path::Path,
+    ) -> Result<Fetched, MeshError> {
+        let connection = self
+            .registry
+            .lock()
+            .await
+            .get(&operation.node())
+            .map(|active| active.connection.clone())
+            .ok_or(MeshError::OriginOffline)?;
+        fetch::fetch(&connection, content_id, operation, reference, destination).await
+    }
+
+    /// Whether a device currently has a live authenticated session.
+    pub async fn is_connected(&self, node: NodeId) -> bool {
+        self.registry.lock().await.contains_key(&node)
     }
 
     async fn forget_identity(&self, node_id: NodeId) {
@@ -302,12 +332,6 @@ pub struct MeshRuntime {
     task: JoinHandle<()>,
 }
 
-type RuntimeSpawn = (
-    MeshRuntime,
-    mpsc::Receiver<MeshStoreRequest>,
-    Option<mpsc::Receiver<MeshChunkCommand>>,
-);
-
 impl MeshRuntime {
     /// Creates an initially unbound runtime. Call [`MeshHandle::update_discovery`]
     /// when an interface discovery snapshot is available.
@@ -320,39 +344,6 @@ impl MeshRuntime {
         psk: Psk,
         shutdown: CancellationToken,
     ) -> Result<(Self, mpsc::Receiver<MeshStoreRequest>), MeshError> {
-        let (runtime, store_rx, _) = Self::spawn_inner(config, psk, shutdown, false)?;
-        Ok((runtime, store_rx))
-    }
-
-    /// Creates a runtime with a daemon-owned encrypted chunk broker.
-    ///
-    /// # Errors
-    ///
-    /// Returns the same configuration/operation errors as [`Self::spawn`].
-    #[allow(clippy::type_complexity)]
-    pub fn spawn_with_transfers(
-        config: MeshRuntimeConfig,
-        psk: Psk,
-        shutdown: CancellationToken,
-    ) -> Result<
-        (
-            Self,
-            mpsc::Receiver<MeshStoreRequest>,
-            mpsc::Receiver<MeshChunkCommand>,
-        ),
-        MeshError,
-    > {
-        let (runtime, store_rx, chunk_rx) = Self::spawn_inner(config, psk, shutdown, true)?;
-        let chunk_rx = chunk_rx.ok_or(MeshError::ChunkBrokerUnavailable)?;
-        Ok((runtime, store_rx, chunk_rx))
-    }
-
-    fn spawn_inner(
-        config: MeshRuntimeConfig,
-        psk: Psk,
-        shutdown: CancellationToken,
-        transfers: bool,
-    ) -> Result<RuntimeSpawn, MeshError> {
         handshake::validate_local_config(&config)?;
         let seen = Arc::new(RwLock::new(config.initial_seen.clone()));
         let mut initial_members = config.known_members.clone();
@@ -368,12 +359,6 @@ impl MeshRuntime {
         let (revision, _) = watch::channel(0_u64);
         let (status, _) = watch::channel(MeshRuntimeStatus::default());
         let (store_tx, store_rx) = mpsc::channel(32);
-        let (chunk_tx, chunk_rx) = if transfers {
-            let (tx, rx) = mpsc::channel(32);
-            (Some(tx), Some(rx))
-        } else {
-            (None, None)
-        };
         let handle = MeshHandle {
             discovery,
             revision: revision.clone(),
@@ -391,7 +376,6 @@ impl MeshRuntime {
             revision,
             status,
             store_tx,
-            chunk_tx,
             registry,
             known_members,
             forgotten_devices,
@@ -404,7 +388,6 @@ impl MeshRuntime {
                 task,
             },
             store_rx,
-            chunk_rx,
         ))
     }
 
@@ -428,7 +411,6 @@ struct RuntimeContext {
     revision: watch::Sender<u64>,
     status: watch::Sender<MeshRuntimeStatus>,
     store_tx: mpsc::Sender<MeshStoreRequest>,
-    chunk_tx: Option<mpsc::Sender<MeshChunkCommand>>,
     registry: Arc<Mutex<BTreeMap<NodeId, ActiveConnection>>>,
     known_members: Arc<RwLock<BTreeSet<NodeId>>>,
     forgotten_devices: Arc<RwLock<BTreeSet<NodeId>>>,

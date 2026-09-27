@@ -6,13 +6,17 @@ use std::{
 };
 
 use clip_sync_core::{
-    model::{NodeId, Operation, Payload, Representation},
-    storage::{HistoryStore, StorageKey},
+    files,
+    model::{ContentId, ItemKind, NodeId, OpId, Operation, Payload, Reference, Representation},
+    storage::{HistoryStore, LocalSource, StorageKey},
     transport::Psk,
 };
 use clip_sync_daemon::{
     discovery::{DiscoveredPeer, DiscoverySnapshot},
-    mesh::{MeshError, MeshHandle, MeshRuntime, MeshRuntimeConfig, MeshStoreRequest, PersistBatch},
+    mesh::{
+        Fetched, MeshError, MeshHandle, MeshRuntime, MeshRuntimeConfig, MeshStoreRequest,
+        PersistBatch, SourceRequest,
+    },
 };
 use tokio::{
     sync::{mpsc, oneshot},
@@ -30,6 +34,14 @@ enum NodeCommand {
     },
     VisibleCount {
         reply: oneshot::Sender<usize>,
+    },
+    CopyFiles {
+        paths: Vec<std::path::PathBuf>,
+        reply: oneshot::Sender<ContentId>,
+    },
+    Reference {
+        content_id: ContentId,
+        reply: oneshot::Sender<Option<(OpId, Reference)>>,
     },
 }
 
@@ -117,6 +129,40 @@ impl TestNode {
         count.await.unwrap()
     }
 
+    async fn copy_files(&self, paths: &[&Path]) -> ContentId {
+        let (reply, copied) = oneshot::channel();
+        self.commands
+            .send(NodeCommand::CopyFiles {
+                paths: paths.iter().map(|path| path.to_path_buf()).collect(),
+                reply,
+            })
+            .await
+            .unwrap();
+        copied.await.unwrap()
+    }
+
+    /// Waits for a reference to sync here, then fetches it from its origin.
+    async fn fetch(&self, content_id: ContentId, destination: &Path) -> Result<Fetched, MeshError> {
+        let (operation, reference) = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let (reply, item) = oneshot::channel();
+                self.commands
+                    .send(NodeCommand::Reference { content_id, reply })
+                    .await
+                    .unwrap();
+                if let Some(item) = item.await.unwrap() {
+                    return item;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("reference did not sync");
+        self.handle
+            .fetch(content_id, operation, &reference, destination)
+            .await
+    }
+
     async fn stop(self) {
         self.shutdown.cancel();
         self.runtime.wait().await;
@@ -149,6 +195,7 @@ async fn run_storage_worker(
                             .map_err(|error| error.to_string());
                         request.complete(result);
                     }
+                    MeshStoreRequest::Source(request) => answer_source(request, &history),
                 }
             }
             command = commands.recv() => {
@@ -168,10 +215,53 @@ async fn run_storage_worker(
                     NodeCommand::VisibleCount { reply } => {
                         let _ = reply.send(history.projection().visible_items().len());
                     }
+                    NodeCommand::CopyFiles { paths, reply } => {
+                        let uri_list = files::uri_list_for_paths(
+                            paths.iter().map(|path| (path.as_path(), path.is_dir())),
+                        )
+                        .unwrap();
+                        let (reference, sources) = files::describe_files(&paths).unwrap();
+                        let content_id = ContentId::from_file_reference(
+                            &CONTENT_KEY,
+                            history.replica().node_id(),
+                            &uri_list,
+                        );
+                        let operation = history
+                            .add_reference(
+                                content_id,
+                                reference,
+                                &LocalSource::Files(sources),
+                                now_millis(),
+                            )
+                            .unwrap();
+                        mesh.record_local(&operation).await.unwrap();
+                        let _ = reply.send(content_id);
+                    }
+                    NodeCommand::Reference { content_id, reply } => {
+                        let projection = history.projection();
+                        let item = match projection.item(content_id) {
+                            Some(ItemKind::Reference(reference)) => projection
+                                .item_operation(content_id)
+                                .map(|operation| (operation, reference.clone())),
+                            _ => None,
+                        };
+                        let _ = reply.send(item);
+                    }
                 }
             }
         }
     }
+}
+
+/// Mirrors the daemon: serve only the exact version the peer holds.
+fn answer_source(request: SourceRequest, history: &HistoryStore) {
+    let current =
+        history.projection().item_operation(request.content_id()) == Some(request.operation());
+    let result = match history.local_source(request.content_id()) {
+        Ok(Some(source)) if current => Ok(source),
+        _ => Err("not available".to_owned()),
+    };
+    request.complete(result);
 }
 
 fn persist_remote(batch: &PersistBatch, history: &mut HistoryStore) -> anyhow::Result<()> {
@@ -485,4 +575,108 @@ async fn repeated_suspend_resume_churn_keeps_runtime_state_bounded() {
     assert!(status.last_listener_error.is_none());
 
     node.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn copied_files_are_fetched_from_their_origin_on_demand() {
+    init_tracing();
+    let temp = tempfile::tempdir().unwrap();
+    let port = unused_port();
+    let (a_ip, b_ip) = (loopback(1), loopback(2));
+    let a = TestNode::start(&temp.path().join("a.db"), a_ip, port);
+    let b = TestNode::start(&temp.path().join("b.db"), b_ip, port);
+    a.discover(&[b_ip]);
+    b.discover(&[a_ip]);
+
+    let originals = temp.path().join("originals");
+    let album = originals.join("album");
+    std::fs::create_dir_all(album.join("raw")).unwrap();
+    let large = (0..3_000_000_u32)
+        .map(|value| (value % 251).to_le_bytes()[0])
+        .collect::<Vec<_>>();
+    std::fs::write(album.join("a.jpg"), &large).unwrap();
+    std::fs::write(album.join("raw/b.cr3"), b"raw bytes").unwrap();
+    std::fs::write(album.join("empty"), b"").unwrap();
+    let notes = originals.join("notes.txt");
+    std::fs::write(&notes, b"notes").unwrap();
+
+    let content_id = a.copy_files(&[&album, &notes]).await;
+    let destination = temp.path().join("cache/fetched/item");
+    let Fetched::Files(root) = b.fetch(content_id, &destination).await.unwrap() else {
+        panic!("expected files");
+    };
+    assert_eq!(std::fs::read(root.join("album/a.jpg")).unwrap(), large);
+    assert_eq!(
+        std::fs::read(root.join("album/raw/b.cr3")).unwrap(),
+        b"raw bytes"
+    );
+    assert!(std::fs::read(root.join("album/empty")).unwrap().is_empty());
+    assert_eq!(std::fs::read(root.join("notes.txt")).unwrap(), b"notes");
+    // The origin was only read, never copied.
+    assert_eq!(std::fs::read(album.join("a.jpg")).unwrap(), large);
+
+    a.stop().await;
+    b.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_file_changed_after_copying_is_refused_not_mixed() {
+    init_tracing();
+    let temp = tempfile::tempdir().unwrap();
+    let port = unused_port();
+    let (a_ip, b_ip) = (loopback(1), loopback(2));
+    let a = TestNode::start(&temp.path().join("a.db"), a_ip, port);
+    let b = TestNode::start(&temp.path().join("b.db"), b_ip, port);
+    a.discover(&[b_ip]);
+    b.discover(&[a_ip]);
+
+    let file = temp.path().join("draft.txt");
+    std::fs::write(&file, b"first version").unwrap();
+    let content_id = a.copy_files(&[&file]).await;
+    std::fs::write(&file, b"edited after copying").unwrap();
+
+    let destination = temp.path().join("cache/fetched/item");
+    assert!(matches!(
+        b.fetch(content_id, &destination).await,
+        Err(MeshError::SourceUnavailable(_))
+    ));
+    assert!(
+        !destination.exists(),
+        "a failed fetch must leave nothing behind"
+    );
+
+    a.stop().await;
+    b.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fetching_from_an_offline_origin_fails_cleanly() {
+    init_tracing();
+    let temp = tempfile::tempdir().unwrap();
+    let port = unused_port();
+    let (a_ip, b_ip) = (loopback(1), loopback(2));
+    let a = TestNode::start(&temp.path().join("a.db"), a_ip, port);
+    let b = TestNode::start(&temp.path().join("b.db"), b_ip, port);
+    a.discover(&[b_ip]);
+    b.discover(&[a_ip]);
+
+    let file = temp.path().join("big.iso");
+    std::fs::write(&file, vec![9_u8; 1024]).unwrap();
+    let content_id = a.copy_files(&[&file]).await;
+    wait_for_count(&b, 1, "reference sync").await;
+    a.stop().await;
+
+    let destination = temp.path().join("cache/fetched/item");
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match b.fetch(content_id, &destination).await {
+                Err(MeshError::OriginOffline) => return,
+                Err(_) | Ok(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+            }
+        }
+    })
+    .await
+    .expect("the origin should be reported offline");
+
+    b.stop().await;
 }

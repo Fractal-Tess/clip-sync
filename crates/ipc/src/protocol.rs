@@ -1,6 +1,6 @@
 use prost::{Enumeration, Message, Oneof};
 
-pub const IPC_PROTOCOL_VERSION: u32 = 6;
+pub const IPC_PROTOCOL_VERSION: u32 = 7;
 
 #[derive(Clone, PartialEq, Message)]
 pub struct Request {
@@ -8,27 +8,20 @@ pub struct Request {
     pub protocol_version: u32,
     #[prost(uint64, tag = "2")]
     pub request_id: u64,
-    #[prost(
-        oneof = "request::Body",
-        tags = "10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23"
-    )]
+    #[prost(oneof = "request::Body", tags = "10, 12, 13, 14, 15, 16, 20, 22")]
     pub body: Option<request::Body>,
 }
 
 pub mod request {
     use super::{
-        ActivateRequest, ConfigRequest, DiagnosticsRequest, ForgetDeviceRequest, HistoryRequest,
-        HistoryUpdateRequest, ImagePreviewRequest, Oneof, PeerInterfacesUpdateRequest,
-        PeersRequest, ShareClipboardRequest, SharedSettingUpdateRequest, StatusRequest,
-        TransferCancelRequest, TransfersRequest,
+        ActivateRequest, DiagnosticsRequest, ForgetDeviceRequest, HistoryRequest,
+        HistoryUpdateRequest, ImagePreviewRequest, Oneof, PeersRequest, StatusRequest,
     };
 
     #[derive(Clone, PartialEq, Oneof)]
     pub enum Body {
         #[prost(message, tag = "10")]
         Status(StatusRequest),
-        #[prost(message, tag = "11")]
-        Config(ConfigRequest),
         #[prost(message, tag = "12")]
         History(HistoryRequest),
         #[prost(message, tag = "13")]
@@ -39,20 +32,10 @@ pub mod request {
         HistoryUpdate(HistoryUpdateRequest),
         #[prost(message, tag = "16")]
         Diagnostics(DiagnosticsRequest),
-        #[prost(message, tag = "17")]
-        ShareClipboard(ShareClipboardRequest),
-        #[prost(message, tag = "18")]
-        Transfers(TransfersRequest),
-        #[prost(message, tag = "19")]
-        TransferCancel(TransferCancelRequest),
         #[prost(message, tag = "20")]
         ForgetDevice(ForgetDeviceRequest),
-        #[prost(message, tag = "21")]
-        SharedSettingUpdate(SharedSettingUpdateRequest),
         #[prost(message, tag = "22")]
         ImagePreview(ImagePreviewRequest),
-        #[prost(message, tag = "23")]
-        PeerInterfacesUpdate(PeerInterfacesUpdateRequest),
     }
 }
 
@@ -60,22 +43,10 @@ pub mod request {
 pub struct StatusRequest {}
 
 #[derive(Clone, Copy, PartialEq, Eq, Message)]
-pub struct ConfigRequest {}
-
-#[derive(Clone, Copy, PartialEq, Eq, Message)]
 pub struct PeersRequest {}
 
 #[derive(Clone, Copy, PartialEq, Eq, Message)]
 pub struct DiagnosticsRequest {}
-
-#[derive(Clone, Copy, PartialEq, Eq, Message)]
-pub struct ShareClipboardRequest {
-    #[prost(bool, tag = "1")]
-    pub confirmed: bool,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Message)]
-pub struct TransfersRequest {}
 
 #[derive(Clone, PartialEq, Eq, Message)]
 pub struct HistoryRequest {
@@ -117,37 +88,9 @@ pub struct HistoryUpdateRequest {
 }
 
 #[derive(Clone, PartialEq, Eq, Message)]
-pub struct TransferCancelRequest {
-    #[prost(string, tag = "1")]
-    pub transfer_id: String,
-}
-
-#[derive(Clone, PartialEq, Eq, Message)]
 pub struct ForgetDeviceRequest {
     #[prost(string, tag = "1")]
     pub device_id: String,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Enumeration)]
-#[repr(i32)]
-pub enum SharedSettingKind {
-    Unspecified = 0,
-    MeshQuotaBytes = 1,
-    CaptureThresholdBytes = 2,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Message)]
-pub struct SharedSettingUpdateRequest {
-    #[prost(enumeration = "SharedSettingKind", tag = "1")]
-    pub setting: i32,
-    #[prost(uint64, tag = "2")]
-    pub value: u64,
-}
-
-#[derive(Clone, PartialEq, Eq, Message)]
-pub struct PeerInterfacesUpdateRequest {
-    #[prost(string, repeated, tag = "1")]
-    pub interfaces: Vec<String>,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -156,26 +99,20 @@ pub struct Response {
     pub protocol_version: u32,
     #[prost(uint64, tag = "2")]
     pub request_id: u64,
-    #[prost(
-        oneof = "response::Body",
-        tags = "10, 11, 12, 13, 14, 15, 16, 17, 18, 19"
-    )]
+    #[prost(oneof = "response::Body", tags = "10, 12, 13, 14, 15, 16, 19")]
     pub body: Option<response::Body>,
 }
 
 pub mod response {
     use super::{
-        ConfigResponse, DiagnosticsResponse, ErrorResponse, HistoryResponse, ImagePreviewResponse,
-        MutationResponse, Oneof, PeersResponse, ShareClipboardResponse, StatusResponse,
-        TransfersResponse,
+        DiagnosticsResponse, ErrorResponse, HistoryResponse, ImagePreviewResponse,
+        MutationResponse, Oneof, PeersResponse, StatusResponse,
     };
 
     #[derive(Clone, PartialEq, Oneof)]
     pub enum Body {
         #[prost(message, tag = "10")]
         Status(StatusResponse),
-        #[prost(message, tag = "11")]
-        Config(ConfigResponse),
         #[prost(message, tag = "12")]
         Error(ErrorResponse),
         #[prost(message, tag = "13")]
@@ -186,10 +123,6 @@ pub mod response {
         Peers(PeersResponse),
         #[prost(message, tag = "16")]
         Diagnostics(DiagnosticsResponse),
-        #[prost(message, tag = "17")]
-        Transfers(TransfersResponse),
-        #[prost(message, tag = "18")]
-        ShareClipboard(ShareClipboardResponse),
         #[prost(message, tag = "19")]
         ImagePreview(ImagePreviewResponse),
     }
@@ -211,12 +144,6 @@ pub struct StatusResponse {
     pub discovered_peers: u32,
     #[prost(uint32, tag = "8")]
     pub connected_peers: u32,
-}
-
-#[derive(Clone, PartialEq, Message)]
-pub struct ConfigResponse {
-    #[prost(bytes = "vec", tag = "1")]
-    pub redacted_json: Vec<u8>,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -247,6 +174,10 @@ pub struct HistoryItem {
     pub source_device: String,
     #[prost(uint64, optional, tag = "9")]
     pub origin_millis: Option<u64>,
+    /// The bytes stay on the device that copied the item and are fetched
+    /// from it when the item is activated here.
+    #[prost(bool, tag = "10")]
+    pub remote: bool,
 }
 
 #[derive(Clone, PartialEq, Eq, Message)]
@@ -271,26 +202,6 @@ pub struct MutationResponse {
     pub message: String,
     #[prost(string, optional, tag = "3")]
     pub resource_id: Option<String>,
-}
-
-#[derive(Clone, PartialEq, Eq, Message)]
-pub struct ShareClipboardResponse {
-    #[prost(bool, tag = "1")]
-    pub shared: bool,
-    #[prost(bool, tag = "2")]
-    pub confirmation_required: bool,
-    #[prost(uint64, tag = "3")]
-    pub logical_size: u64,
-    #[prost(string, repeated, tag = "4")]
-    pub mime_types: Vec<String>,
-    #[prost(bool, tag = "5")]
-    pub quota_exempt: bool,
-    #[prost(string, optional, tag = "6")]
-    pub transfer_id: Option<String>,
-    #[prost(string, optional, tag = "7")]
-    pub content_id: Option<String>,
-    #[prost(string, tag = "8")]
-    pub message: String,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -355,28 +266,6 @@ pub struct DiagnosticCheck {
     pub ok: bool,
     #[prost(string, tag = "3")]
     pub detail: String,
-}
-
-#[derive(Clone, PartialEq, Message)]
-pub struct TransfersResponse {
-    #[prost(message, repeated, tag = "1")]
-    pub transfers: Vec<TransferItem>,
-}
-
-#[derive(Clone, PartialEq, Eq, Message)]
-pub struct TransferItem {
-    #[prost(string, tag = "1")]
-    pub transfer_id: String,
-    #[prost(string, tag = "2")]
-    pub content_id: String,
-    #[prost(string, tag = "3")]
-    pub peer: String,
-    #[prost(string, tag = "4")]
-    pub state: String,
-    #[prost(uint64, tag = "5")]
-    pub completed_bytes: u64,
-    #[prost(uint64, tag = "6")]
-    pub total_bytes: u64,
 }
 
 #[derive(Clone, PartialEq, Message)]

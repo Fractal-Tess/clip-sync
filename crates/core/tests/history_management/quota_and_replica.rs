@@ -1,11 +1,9 @@
 use super::support::*;
 
 #[test]
-fn deterministic_quota_excludes_pins_and_explicit_oversized_shares() {
+fn deterministic_quota_excludes_pins_and_references() {
+    let quota = 5;
     let mut replica = Replica::new(node(1));
-    replica
-        .set_shared_setting(SharedSetting::MeshQuotaBytes, 5, 1)
-        .unwrap();
 
     let pinned = payload(1, 4);
     let pinned_id = content_id(&pinned);
@@ -16,41 +14,43 @@ fn deterministic_quota_excludes_pins_and_explicit_oversized_shares() {
     let oldest_chargeable_id = content_id(&oldest_chargeable);
     replica.copy(oldest_chargeable, 4).unwrap();
 
-    let exempt = payload(3, 6);
-    let exempt_id = content_id(&exempt);
-    let explicit = replica.share_explicit(exempt, 5).unwrap();
-    assert!(matches!(
-        explicit.operation(),
-        Operation::AddQuotaExempt { .. }
-    ));
+    // A large copy stays on its origin, so it costs other hosts nothing.
+    let reference_id = content_id(&payload(3, 6));
+    replica
+        .add_reference(
+            reference_id,
+            Reference::Data(vec![clip_sync_core::model::RepresentationDescriptor::new(
+                "application/octet-stream",
+                6,
+            )]),
+            5,
+        )
+        .unwrap();
 
     let newest_chargeable = payload(4, 4);
     let newest_chargeable_id = content_id(&newest_chargeable);
     replica.copy(newest_chargeable, 6).unwrap();
 
-    let plan = replica.projection().effective_quota_plan();
+    let plan = replica.projection().quota_plan(quota);
     assert_eq!(plan.chargeable_bytes(), 8);
     assert_eq!(plan.excluded_bytes(), 10);
     assert_eq!(plan.evictions(), &[oldest_chargeable_id]);
-    assert!(replica.projection().is_quota_exempt(exempt_id));
 
-    let evictions = replica.enforce_quota(7).unwrap();
+    let evictions = replica.enforce_quota(quota, 7).unwrap();
     assert_eq!(evictions.len(), 1);
     assert_eq!(
         evictions[0].operation().content_id(),
         Some(oldest_chargeable_id)
     );
     assert!(replica.projection().is_visible(pinned_id));
-    assert!(replica.projection().is_visible(exempt_id));
+    assert!(replica.projection().is_visible(reference_id));
     assert!(replica.projection().is_visible(newest_chargeable_id));
 }
 
 #[test]
 fn independent_quota_authors_select_same_ids_and_converge() {
+    let quota = 5;
     let mut origin = Replica::new(node(1));
-    origin
-        .set_shared_setting(SharedSetting::MeshQuotaBytes, 5, 1)
-        .unwrap();
     for (time, byte) in [(2, 1), (3, 2), (4, 3)] {
         origin.copy(payload(byte, 4), time).unwrap();
     }
@@ -59,8 +59,8 @@ fn independent_quota_authors_select_same_ids_and_converge() {
 
     let mut left = Replica::restore(node(2), 0, timestamp, projection.clone());
     let mut right = Replica::restore(node(3), 0, timestamp, projection);
-    let left_deletes = left.enforce_quota(10).unwrap();
-    let right_deletes = right.enforce_quota(10).unwrap();
+    let left_deletes = left.enforce_quota(quota, 10).unwrap();
+    let right_deletes = right.enforce_quota(quota, 10).unwrap();
 
     let left_ids = left_deletes
         .iter()
@@ -132,10 +132,7 @@ fn far_future_peer_timestamp_does_not_poison_local_clock() {
             clip_sync_core::replica::MAX_REMOTE_CLOCK_SKEW_MILLIS + 101,
             0,
         ),
-        Operation::SetSetting {
-            key: "future-setting".to_owned(),
-            value: clip_sync_core::model::SettingValue::Bool(true),
-        },
+        Operation::Retired,
     );
 
     assert!(matches!(
@@ -143,7 +140,7 @@ fn far_future_peer_timestamp_does_not_poison_local_clock() {
         Err(ReplicaError::RemoteClockTooFarAhead { .. })
     ));
     assert_eq!(replica.last_timestamp(), HlcTimestamp::default());
-    assert!(replica.projection().setting("future-setting").is_none());
+    assert!(!replica.projection().seen_ops().contains(remote.id()));
 }
 
 #[test]
@@ -165,12 +162,12 @@ fn copy_succeeds_while_a_synced_touch_is_still_waiting_for_its_add() {
     );
     history.ingest(&touch, 20).unwrap();
     assert!(history.projection().is_visible(early_id));
-    assert!(history.projection().payload_descriptor(early_id).is_none());
+    assert!(history.projection().item(early_id).is_none());
 
     // A local copy in that window must still be recorded.
     let copied = payload(10, 4);
     let copied_id = content_id(&copied);
-    history.copy_and_enforce(copied.clone(), 30).unwrap();
+    history.copy_and_enforce(copied.clone(), 1024, 30).unwrap();
     assert_eq!(history.load_payload(copied_id).unwrap(), Some(copied));
 }
 
@@ -186,9 +183,9 @@ fn payload_bytes_are_loaded_from_storage_after_restart() {
     }
 
     let history = HistoryStore::open(&path, &storage_key()).unwrap();
-    assert_eq!(
-        history.projection().payload_descriptor(id),
-        Some(value.descriptor())
-    );
+    assert!(matches!(
+        history.projection().item(id),
+        Some(ItemKind::Inline { descriptor, .. }) if descriptor == value.descriptor()
+    ));
     assert_eq!(history.load_payload(id).unwrap(), Some(value));
 }

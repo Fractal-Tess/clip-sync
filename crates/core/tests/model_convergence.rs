@@ -1,6 +1,6 @@
 use clip_sync_core::model::{
-    ApplyOutcome, ContentId, HlcTimestamp, NodeId, OpId, Operation, Payload, Projection,
-    Representation, SettingValue, StampedOperation,
+    ApplyOutcome, ContentId, HlcTimestamp, ItemKind, NodeId, OpId, Operation, Payload, Projection,
+    Reference, Representation, RepresentationDescriptor, StampedOperation,
 };
 use proptest::prelude::*;
 use uuid::Uuid;
@@ -19,6 +19,18 @@ fn payload(mime: &str, bytes: &[u8]) -> Payload {
     .unwrap()
 }
 
+/// A large item of `size` bytes that stays on its origin.
+fn reference(content_id: ContentId, size: u64) -> Operation {
+    Operation::AddReference {
+        content_id,
+        reference: Reference::Data(vec![RepresentationDescriptor::new("video/mp4", size)]),
+    }
+}
+
+fn item_size(projection: &Projection, content_id: ContentId) -> Option<u64> {
+    projection.item(content_id).map(ItemKind::logical_size)
+}
+
 fn stamp(
     node_id: NodeId,
     counter: u64,
@@ -34,7 +46,7 @@ fn stamp(
 }
 
 #[allow(clippy::too_many_lines)]
-fn convergence_fixture() -> (Vec<StampedOperation>, ContentId, ContentId) {
+fn convergence_fixture() -> (Vec<StampedOperation>, ContentId, ContentId, ContentId) {
     let first_node = node(1);
     let second_node = node(2);
     let third_node = node(3);
@@ -42,6 +54,7 @@ fn convergence_fixture() -> (Vec<StampedOperation>, ContentId, ContentId) {
     let beta = payload("image/png", &[0x89, b'P', b'N', b'G']);
     let alpha_id = alpha.descriptor().content_id();
     let beta_id = beta.descriptor().content_id();
+    let gamma_id = payload("video/mp4", b"gamma").descriptor().content_id();
 
     let operations = vec![
         stamp(
@@ -112,26 +125,8 @@ fn convergence_fixture() -> (Vec<StampedOperation>, ContentId, ContentId) {
                 payload: beta,
             },
         ),
-        stamp(
-            first_node,
-            4,
-            16,
-            0,
-            Operation::SetSetting {
-                key: "mesh_quota_bytes".into(),
-                value: SettingValue::Unsigned(512),
-            },
-        ),
-        stamp(
-            second_node,
-            3,
-            16,
-            0,
-            Operation::SetSetting {
-                key: "mesh_quota_bytes".into(),
-                value: SettingValue::Unsigned(1_024),
-            },
-        ),
+        stamp(first_node, 4, 16, 0, reference(gamma_id, 512)),
+        stamp(second_node, 3, 16, 0, reference(gamma_id, 1_024)),
         stamp(
             third_node,
             3,
@@ -141,12 +136,12 @@ fn convergence_fixture() -> (Vec<StampedOperation>, ContentId, ContentId) {
         ),
     ];
 
-    (operations, alpha_id, beta_id)
+    (operations, alpha_id, beta_id, gamma_id)
 }
 
 #[test]
 fn replayed_operations_are_idempotent() {
-    let (operations, _, _) = convergence_fixture();
+    let (operations, _, _, _) = convergence_fixture();
     let mut projection = Projection::default();
     projection.apply_all(&operations).unwrap();
     let once = projection.clone();
@@ -201,15 +196,9 @@ fn content_origin_remains_the_add_author_after_remote_activation() {
         .apply(&stamp(activator, 1, 20, 0, Operation::Touch { content_id }))
         .unwrap();
 
-    assert_eq!(projection.origin_node_for_content(content_id), Some(origin));
-    assert_eq!(
-        projection
-            .origin_event_for_content(content_id)
-            .expect("origin event")
-            .timestamp()
-            .physical_millis(),
-        10
-    );
+    let origin_event = projection.item_event(content_id).expect("origin event");
+    assert_eq!(origin_event.operation_id().node(), origin);
+    assert_eq!(origin_event.timestamp().physical_millis(), 10);
     assert_eq!(
         projection.visible_items()[0]
             .last_activity()
@@ -248,43 +237,22 @@ fn old_add_cannot_resurrect_but_new_activity_can() {
 }
 
 #[test]
-fn equal_hlc_settings_use_node_and_counter_tie_break() {
-    let low_node = node(1);
-    let high_node = node(2);
-    let low = stamp(
-        low_node,
-        1,
-        100,
-        0,
-        Operation::SetSetting {
-            key: "capture_threshold".into(),
-            value: SettingValue::Unsigned(10),
-        },
-    );
-    let high = stamp(
-        high_node,
-        1,
-        100,
-        0,
-        Operation::SetSetting {
-            key: "capture_threshold".into(),
-            value: SettingValue::Unsigned(20),
-        },
-    );
+fn equal_hlc_references_use_node_and_counter_tie_break() {
+    let content_id = payload("video/mp4", b"clip").descriptor().content_id();
+    let low = stamp(node(1), 1, 100, 0, reference(content_id, 10));
+    let high = stamp(node(2), 1, 100, 0, reference(content_id, 20));
 
     for order in [[&low, &high], [&high, &low]] {
         let mut projection = Projection::default();
         projection.apply_all(order).unwrap();
-        assert_eq!(
-            projection.setting("capture_threshold"),
-            Some(&SettingValue::Unsigned(20))
-        );
+        assert_eq!(item_size(&projection, content_id), Some(20));
+        assert_eq!(projection.item_operation(content_id), Some(high.id()));
     }
 }
 
 #[test]
 fn fixture_has_expected_merged_timeline_and_registers() {
-    let (operations, alpha_id, beta_id) = convergence_fixture();
+    let (operations, alpha_id, beta_id, gamma_id) = convergence_fixture();
     let mut projection = Projection::default();
     projection.apply_all(operations.iter().rev()).unwrap();
 
@@ -294,52 +262,23 @@ fn fixture_has_expected_merged_timeline_and_registers() {
             .iter()
             .map(|item| item.content_id())
             .collect::<Vec<_>>(),
-        vec![beta_id, alpha_id]
+        vec![gamma_id, beta_id, alpha_id]
     );
     assert!(projection.is_pinned(alpha_id));
-    assert_eq!(
-        projection.setting("mesh_quota_bytes"),
-        Some(&SettingValue::Unsigned(1_024))
-    );
+    assert_eq!(item_size(&projection, gamma_id), Some(1_024));
     assert!(projection.is_device_forgotten(node(99)));
 }
 
 #[test]
-fn partitioned_shared_settings_and_membership_converge_after_heal() {
+fn partitioned_references_and_membership_converge_after_heal() {
     let a = node(10);
     let b = node(20);
     let retired = node(30);
+    let content_id = payload("video/mp4", b"shared").descriptor().content_id();
     let operations = [
-        stamp(
-            a,
-            1,
-            100,
-            0,
-            Operation::SetSetting {
-                key: "mesh_quota_bytes".to_owned(),
-                value: SettingValue::Unsigned(100),
-            },
-        ),
-        stamp(
-            b,
-            1,
-            101,
-            0,
-            Operation::SetSetting {
-                key: "capture_threshold_bytes".to_owned(),
-                value: SettingValue::Unsigned(50),
-            },
-        ),
-        stamp(
-            retired,
-            1,
-            102,
-            0,
-            Operation::SetSetting {
-                key: "mesh_quota_bytes".to_owned(),
-                value: SettingValue::Unsigned(200),
-            },
-        ),
+        stamp(a, 1, 100, 0, reference(content_id, 100)),
+        stamp(b, 1, 101, 0, Operation::Retired),
+        stamp(retired, 1, 102, 0, reference(content_id, 200)),
         stamp(a, 2, 103, 0, Operation::ForgetDevice { node_id: retired }),
     ];
 
@@ -354,10 +293,7 @@ fn partitioned_shared_settings_and_membership_converge_after_heal() {
 
     assert_eq!(projections[0], projections[1]);
     assert_eq!(projections[1], projections[2]);
-    assert_eq!(
-        projections[0].effective_shared_settings().mesh_quota_bytes,
-        200
-    );
+    assert_eq!(item_size(&projections[0], content_id), Some(200));
     assert!(projections[0].is_device_forgotten(retired));
 }
 
@@ -367,7 +303,7 @@ proptest! {
         left_delivery in prop::collection::vec(0_usize..10, 0..100),
         right_delivery in prop::collection::vec(0_usize..10, 0..100),
     ) {
-        let (operations, _, _) = convergence_fixture();
+        let (operations, _, _, _) = convergence_fixture();
         let mut left = Projection::default();
         let mut right = Projection::default();
 

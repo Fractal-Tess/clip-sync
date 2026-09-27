@@ -4,15 +4,13 @@ use thiserror::Error;
 
 use crate::{
     model::{
-        ContentId, NodeId, Operation, Payload, Projection, SeenOps, SharedSetting, StampedOperation,
+        ContentId, NodeId, Operation, Payload, Projection, Reference, SeenOps, StampedOperation,
     },
-    payload::{ManifestId, StoredManifest},
     replica::{Replica, ReplicaError},
     replication::BatchLimits,
-    transfer::TransferId,
 };
 
-use super::{EncryptedStorage, OperationBatch, Result, StorageError, StorageKey};
+use super::{EncryptedStorage, LocalSource, OperationBatch, Result, StorageError, StorageKey};
 
 /// Crash-consistent owner of encrypted storage and its in-memory replica.
 ///
@@ -94,69 +92,22 @@ impl HistoryStore {
         self.commit_one(|replica| replica.copy(payload, now_millis))
     }
 
-    /// Explicitly shares payload, applying replicated oversized exemption.
+    /// Publishes a large item whose bytes stay on this device. Where they
+    /// live is recorded before the operation, so a crash between the two
+    /// never leaves peers told about an item this device cannot serve.
     ///
     /// # Errors
     ///
     /// Returns authoring or durable-storage errors without changing live state.
-    pub fn share_explicit(
+    pub fn add_reference(
         &mut self,
-        payload: Payload,
-        now_millis: u64,
-    ) -> std::result::Result<StampedOperation, HistoryError> {
-        self.commit_one(|replica| replica.share_explicit(payload, now_millis))
-    }
-
-    /// Persists a replicated pending manifest-backed share.
-    ///
-    /// # Errors
-    ///
-    /// Returns authoring or durable-storage errors without changing live state.
-    pub fn begin_manifest_share(
-        &mut self,
-        transfer_id: TransferId,
         content_id: ContentId,
-        manifest_id: ManifestId,
-        manifest: StoredManifest,
-        quota_exempt: bool,
+        reference: Reference,
+        source: &LocalSource,
         now_millis: u64,
     ) -> std::result::Result<StampedOperation, HistoryError> {
-        self.commit_one(|replica| {
-            replica.begin_manifest_share(
-                transfer_id,
-                content_id,
-                manifest_id,
-                manifest,
-                quota_exempt,
-                now_millis,
-            )
-        })
-    }
-
-    /// Persists successful local completion of a manifest-backed share.
-    ///
-    /// # Errors
-    ///
-    /// Returns transfer-state, authoring, or durable-storage errors.
-    pub fn complete_manifest_share(
-        &mut self,
-        transfer_id: TransferId,
-        now_millis: u64,
-    ) -> std::result::Result<StampedOperation, HistoryError> {
-        self.commit_one(|replica| replica.complete_manifest_share(transfer_id, now_millis))
-    }
-
-    /// Persists a dominating replicated transfer cancellation.
-    ///
-    /// # Errors
-    ///
-    /// Returns transfer-state, authoring, or durable-storage errors.
-    pub fn cancel_manifest_share(
-        &mut self,
-        transfer_id: TransferId,
-        now_millis: u64,
-    ) -> std::result::Result<StampedOperation, HistoryError> {
-        self.commit_one(|replica| replica.cancel_manifest_share(transfer_id, now_millis))
+        self.storage.put_local_source(content_id, source)?;
+        self.commit_one(|replica| replica.add_reference(content_id, reference, now_millis))
     }
 
     /// Captures payload and atomically persists its deterministic quota
@@ -164,29 +115,14 @@ impl HistoryStore {
     ///
     /// # Errors
     ///
-    /// Returns authoring, incomplete quota-state, or storage errors without
-    /// changing live state.
+    /// Returns authoring or storage errors without changing live state.
     pub fn copy_and_enforce(
         &mut self,
         payload: Payload,
+        quota_bytes: u64,
         now_millis: u64,
     ) -> std::result::Result<Vec<StampedOperation>, HistoryError> {
-        self.commit_many(|replica| replica.copy_and_enforce(payload, now_millis))
-    }
-
-    /// Explicitly shares payload and atomically persists quota evictions for
-    /// all other chargeable entries.
-    ///
-    /// # Errors
-    ///
-    /// Returns authoring, incomplete quota-state, or storage errors without
-    /// changing live state.
-    pub fn share_explicit_and_enforce(
-        &mut self,
-        payload: Payload,
-        now_millis: u64,
-    ) -> std::result::Result<Vec<StampedOperation>, HistoryError> {
-        self.commit_many(|replica| replica.share_explicit_and_enforce(payload, now_millis))
+        self.commit_many(|replica| replica.copy_and_enforce(payload, quota_bytes, now_millis))
     }
 
     /// Touches a visible history entry after activation.
@@ -293,20 +229,6 @@ impl HistoryStore {
         self.delete(parse_history_content_id(content_id)?, now_millis)
     }
 
-    /// Updates a replicated shared setting.
-    ///
-    /// # Errors
-    ///
-    /// Returns setting validation, authoring, or durable-storage errors.
-    pub fn set_shared_setting(
-        &mut self,
-        setting: SharedSetting,
-        value: u64,
-        now_millis: u64,
-    ) -> std::result::Result<StampedOperation, HistoryError> {
-        self.commit_one(|replica| replica.set_shared_setting(setting, value, now_millis))
-    }
-
     /// Replicates and persists a device-forget decision.
     ///
     /// # Errors
@@ -324,25 +246,13 @@ impl HistoryStore {
     ///
     /// # Errors
     ///
-    /// Returns incomplete-state, authoring, or durable-storage errors.
+    /// Returns authoring or durable-storage errors.
     pub fn enforce_quota(
-        &mut self,
-        now_millis: u64,
-    ) -> std::result::Result<Vec<StampedOperation>, HistoryError> {
-        self.commit_many(|replica| replica.enforce_quota(now_millis))
-    }
-
-    /// Changes the mesh quota and atomically persists its resulting evictions.
-    ///
-    /// # Errors
-    ///
-    /// Returns setting, incomplete-state, authoring, or storage errors.
-    pub fn set_mesh_quota_and_enforce(
         &mut self,
         quota_bytes: u64,
         now_millis: u64,
     ) -> std::result::Result<Vec<StampedOperation>, HistoryError> {
-        self.commit_many(|replica| replica.set_mesh_quota_and_enforce(quota_bytes, now_millis))
+        self.commit_many(|replica| replica.enforce_quota(quota_bytes, now_millis))
     }
 
     fn commit_one(
@@ -378,9 +288,9 @@ impl HistoryStore {
         Ok(())
     }
 
-    /// Loads the bytes of a retained item from the operation that carried
-    /// them. Returns `None` for items whose payload never arrived or that
-    /// travel as a manifest instead.
+    /// Loads the bytes of a retained inline item from the operation that
+    /// carried them. Returns `None` for items whose add has not arrived and
+    /// for references.
     ///
     /// # Errors
     ///
@@ -390,7 +300,7 @@ impl HistoryStore {
         &self,
         content_id: ContentId,
     ) -> std::result::Result<Option<Payload>, HistoryError> {
-        let Some(operation_id) = self.projection().payload_operation(content_id) else {
+        let Some(operation_id) = self.projection().item_operation(content_id) else {
             return Ok(None);
         };
         let operation = self.storage.load_operation(operation_id)?.ok_or_else(|| {
@@ -398,20 +308,32 @@ impl HistoryStore {
                 "payload operation {operation_id} is missing from the log"
             ))
         })?;
-        match operation.operation() {
+        match operation.into_operation() {
             Operation::Add {
                 content_id: carried,
                 payload,
-            }
-            | Operation::AddQuotaExempt {
+            } if carried == content_id => Ok(Some(payload)),
+            Operation::AddReference {
                 content_id: carried,
-                payload,
-            } if *carried == content_id => Ok(Some(payload.clone())),
+                ..
+            } if carried == content_id => Ok(None),
             _ => Err(StorageError::CorruptOperation(format!(
                 "operation {operation_id} does not carry the payload of {content_id}"
             ))
             .into()),
         }
+    }
+
+    /// Where this device reads a reference's bytes from, if it authored it.
+    ///
+    /// # Errors
+    ///
+    /// Returns storage or decoding errors.
+    pub fn local_source(
+        &self,
+        content_id: ContentId,
+    ) -> std::result::Result<Option<LocalSource>, HistoryError> {
+        Ok(self.storage.local_source(content_id)?)
     }
 
     /// Operations the peer described by `remote` has not seen yet.

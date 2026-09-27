@@ -10,15 +10,12 @@ use std::{
     time::Duration,
 };
 
-use tokio::{
-    sync::{mpsc, oneshot},
-    task,
-};
+use tokio::{sync::mpsc, task};
 use tokio_util::sync::CancellationToken;
 
-use super::{protocol::DataControlOffer, runtime::ExplicitReadResult, state::WaylandState};
+use super::{protocol::DataControlOffer, state::WaylandState};
 use crate::clipboard::{
-    backend::{BackendError, ClipboardEvent},
+    backend::ClipboardEvent,
     types::{
         CaptureBudget, ClipboardContent, ClipboardRepresentation, Generation, MimeType,
         OfferMimeList, RejectReason, SelectionKind,
@@ -43,11 +40,10 @@ pub(super) struct CaptureMessage {
     pub(super) result: Result<Arc<[u8]>, RejectReason>,
 }
 
+/// The live regular-clipboard offer, kept so it is destroyed exactly once.
 #[derive(Clone)]
 pub(super) struct CurrentOffer {
-    pub(super) generation: Generation,
     pub(super) offer: DataControlOffer,
-    pub(super) mime_list: OfferMimeList,
 }
 
 impl WaylandState {
@@ -200,177 +196,6 @@ impl WaylandState {
                     current_generation,
                 },
             );
-        }
-    }
-    #[allow(clippy::too_many_lines)]
-    pub(super) fn start_explicit_read(
-        &self,
-        expected_generation: Option<Generation>,
-        maximum_bytes: u64,
-        retain_bytes: bool,
-        reply: oneshot::Sender<Result<ExplicitReadResult, BackendError>>,
-    ) {
-        if maximum_bytes == 0 {
-            let _ = reply.send(Err(BackendError::ClipboardCommand(
-                "explicit clipboard limit must be nonzero".to_owned(),
-            )));
-            return;
-        }
-        let Some(current) = self.current_offer.clone() else {
-            let _ = reply.send(Err(BackendError::CurrentOfferUnavailable));
-            return;
-        };
-        if expected_generation.is_some_and(|expected| expected != current.generation) {
-            let _ = reply.send(Err(BackendError::CurrentOfferChanged));
-            return;
-        }
-
-        let budget = Arc::new(StdMutex::new(CaptureBudget::with_max(maximum_bytes)));
-        let (result_tx, mut result_rx) = mpsc::unbounded_channel();
-        let expected = current.mime_list.len();
-        for (index, mime_type) in current.mime_list.types().iter().cloned().enumerate() {
-            let (read_end, write_end) = match UnixStream::pair() {
-                Ok(pair) => pair,
-                Err(error) => {
-                    let _ = reply.send(Err(BackendError::ClipboardCommand(error.to_string())));
-                    return;
-                }
-            };
-            current
-                .offer
-                .receive(mime_type.to_string(), write_end.as_fd());
-            drop(write_end);
-            let sender = result_tx.clone();
-            let budget = budget.clone();
-            let generation = current.generation;
-            let current_generation = self.current_generation.clone();
-            let shutdown = self.shutdown.clone();
-            task::spawn_blocking(move || {
-                let result = read_explicit_pipe(
-                    read_end,
-                    &mime_type,
-                    &budget,
-                    generation,
-                    &current_generation,
-                    &shutdown,
-                    retain_bytes,
-                );
-                let _ = sender.send((index, mime_type, result));
-            });
-        }
-        drop(result_tx);
-        let mime_list = current.mime_list;
-        let generation = current.generation;
-        task::spawn(async move {
-            let mut slots = vec![None; expected];
-            for _ in 0..expected {
-                let Some((index, mime_type, result)) = result_rx.recv().await else {
-                    let _ = reply.send(Err(BackendError::ClipboardCommand(
-                        "explicit clipboard read stopped unexpectedly".to_owned(),
-                    )));
-                    return;
-                };
-                match result {
-                    Ok(bytes) => {
-                        if retain_bytes {
-                            slots[index] =
-                                Some(ClipboardRepresentation::from_shared_bytes(mime_type, bytes));
-                        }
-                    }
-                    Err(reason) => {
-                        let error = match reason {
-                            RejectReason::StaleGeneration { .. } => {
-                                BackendError::CurrentOfferChanged
-                            }
-                            other => BackendError::ClipboardCommand(format!("{other:?}")),
-                        };
-                        let _ = reply.send(Err(error));
-                        return;
-                    }
-                }
-            }
-            let Ok(budget) = budget.lock() else {
-                let _ = reply.send(Err(BackendError::ClipboardCommand(
-                    "explicit clipboard budget lock poisoned".to_owned(),
-                )));
-                return;
-            };
-            let logical_size = budget.total_bytes();
-            drop(budget);
-            let representations = if retain_bytes {
-                let Some(representations) = slots.into_iter().collect() else {
-                    let _ = reply.send(Err(BackendError::ClipboardCommand(
-                        "explicit clipboard representation was lost".to_owned(),
-                    )));
-                    return;
-                };
-                representations
-            } else {
-                Vec::new()
-            };
-            let _ = reply.send(Ok(ExplicitReadResult {
-                generation,
-                mime_list,
-                logical_size,
-                representations,
-            }));
-        });
-    }
-}
-
-fn read_explicit_pipe(
-    mut read_end: UnixStream,
-    mime_type: &MimeType,
-    budget: &Arc<StdMutex<CaptureBudget>>,
-    generation: Generation,
-    current_generation: &Arc<AtomicU64>,
-    shutdown: &CancellationToken,
-    retain_bytes: bool,
-) -> Result<Arc<[u8]>, RejectReason> {
-    read_end
-        .set_read_timeout(Some(PIPE_READ_TIMEOUT))
-        .map_err(|error| RejectReason::ReadFailed {
-            mime_type: mime_type.to_string(),
-            message: error.to_string(),
-        })?;
-    let mut bytes = Vec::new();
-    let mut chunk = [0_u8; PIPE_CHUNK_BYTES];
-    loop {
-        if shutdown.is_cancelled() {
-            return Err(RejectReason::Cancelled);
-        }
-        let current_value = current_generation.load(Ordering::SeqCst);
-        if current_value != generation.value() {
-            return Err(RejectReason::StaleGeneration {
-                offer_generation: generation,
-                current_generation: Generation::from_value(current_value),
-            });
-        }
-        match read_end.read(&mut chunk) {
-            Ok(0) => return Ok(Arc::from(bytes.into_boxed_slice())),
-            Ok(count) => {
-                budget
-                    .lock()
-                    .map_err(|_| RejectReason::ReadFailed {
-                        mime_type: mime_type.to_string(),
-                        message: "capture budget lock poisoned".to_owned(),
-                    })?
-                    .reserve(count)?;
-                if retain_bytes {
-                    bytes.extend_from_slice(&chunk[..count]);
-                }
-            }
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted
-                ) => {}
-            Err(error) => {
-                return Err(RejectReason::ReadFailed {
-                    mime_type: mime_type.to_string(),
-                    message: error.to_string(),
-                });
-            }
         }
     }
 }

@@ -12,10 +12,7 @@ fn tombstones_require_all_active_member_acknowledgements_or_stable_forget() {
     let peer_setting = StampedOperation::new(
         OpId::new(peer, 1).unwrap(),
         HlcTimestamp::new(2, 0),
-        Operation::SetSetting {
-            key: "future_policy".to_owned(),
-            value: clip_sync_core::model::SettingValue::Bool(true),
-        },
+        Operation::Retired,
     );
     local_replica.ingest(&peer_setting, 2).unwrap();
     let deletion = local_replica.delete(id, 3).unwrap();
@@ -98,10 +95,7 @@ fn peer_frontier_with_not_yet_durable_operations_blocks_compaction() {
     let peer_first = StampedOperation::new(
         OpId::new(peer, 1).unwrap(),
         HlcTimestamp::new(1, 0),
-        Operation::SetSetting {
-            key: "future_policy".to_owned(),
-            value: clip_sync_core::model::SettingValue::Bool(true),
-        },
+        Operation::Retired,
     );
     history.ingest(&peer_first, 1).unwrap();
     let value = payload(9, 4);
@@ -194,10 +188,7 @@ fn stable_forget_removes_old_ack_but_persists_rejection_state() {
     let peer_operation = StampedOperation::new(
         OpId::new(peer, 1).unwrap(),
         HlcTimestamp::new(1, 0),
-        Operation::SetSetting {
-            key: "future_policy".to_owned(),
-            value: clip_sync_core::model::SettingValue::Bool(true),
-        },
+        Operation::Retired,
     );
     history.ingest(&peer_operation, 1).unwrap();
     let peer_frontier = history.projection().seen_ops().clone();

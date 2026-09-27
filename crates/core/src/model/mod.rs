@@ -8,6 +8,7 @@ mod content;
 mod identity;
 mod operation;
 mod projection;
+mod reference;
 mod retention;
 mod seen_ops;
 
@@ -17,12 +18,12 @@ pub use content::{
     RepresentationDescriptor,
 };
 pub use identity::{NodeId, OpId, OpIdError};
-pub use operation::{
-    DEFAULT_CAPTURE_THRESHOLD_BYTES, DEFAULT_MESH_QUOTA_BYTES, EffectiveSharedSettings, Operation,
-    SettingValue, SharedSetting, StampedOperation,
-};
+pub use operation::{Operation, StampedOperation};
 pub use projection::{
-    ApplyOutcome, ContentView, Projection, ProjectionError, QuotaPlan, TombstoneView, TransferView,
+    ApplyOutcome, ContentView, ItemKind, Projection, ProjectionError, QuotaPlan, TombstoneView,
+};
+pub use reference::{
+    FileEntry, MAX_REFERENCE_ENTRIES, Reference, ReferenceError, validate_relative_path,
 };
 pub use retention::Acknowledgements;
 pub use seen_ops::SeenOps;

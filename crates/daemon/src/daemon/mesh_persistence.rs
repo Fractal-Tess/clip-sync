@@ -1,18 +1,13 @@
 use anyhow::Context;
-use tokio_util::sync::CancellationToken;
 
 use clip_sync_core::{
-    clipboard::wayland::WaylandBackend,
-    config::{Config, SharedConfig},
-    model::Operation,
-    payload::ExplicitSharePolicy,
+    model::{ItemKind, Operation},
     storage::HistoryStore,
-    transfer::TransferCoordinator,
 };
 
 use crate::{
     ipc::DaemonState,
-    mesh::{BatchRequest, MeshChunkCommand, MeshHandle, MeshStoreRequest, PersistBatch},
+    mesh::{BatchRequest, MeshHandle, MeshStoreRequest, PersistBatch, SourceRequest},
 };
 
 use super::{
@@ -24,11 +19,7 @@ pub(super) struct MeshPersistenceContext<'a> {
     pub(super) history: &'a mut HistoryStore,
     pub(super) state: &'a DaemonState,
     pub(super) content_key: &'a [u8; 32],
-    pub(super) clipboard: &'a WaylandBackend,
     pub(super) mesh: &'a MeshHandle,
-    pub(super) config_path: &'a std::path::Path,
-    pub(super) config: &'a mut Config,
-    pub(super) transfers: &'a mut TransferCoordinator,
 }
 
 pub(super) async fn handle_mesh_store_request(
@@ -38,6 +29,7 @@ pub(super) async fn handle_mesh_store_request(
     match request {
         MeshStoreRequest::Persist(batch) => handle_mesh_batch(batch, context).await,
         MeshStoreRequest::Batch(request) => answer_batch_request(request, context.history),
+        MeshStoreRequest::Source(request) => answer_source_request(request, context.history),
     }
 }
 
@@ -48,14 +40,31 @@ fn answer_batch_request(request: BatchRequest, history: &HistoryStore) {
     request.complete(result);
 }
 
+/// Serves only references this device authored, and only the exact version
+/// the requesting peer holds.
+fn answer_source_request(request: SourceRequest, history: &HistoryStore) {
+    let content_id = request.content_id();
+    let projection = history.projection();
+    let current = projection.is_visible(content_id)
+        && matches!(projection.item(content_id), Some(ItemKind::Reference(_)))
+        && projection.item_operation(content_id) == Some(request.operation());
+    let result = if current {
+        match history.local_source(content_id) {
+            Ok(Some(source)) => Ok(source),
+            Ok(None) => Err("this device no longer has the copied item".to_owned()),
+            Err(error) => Err(error.to_string()),
+        }
+    } else {
+        Err("the item was deleted or copied again since this device last synced".to_owned())
+    };
+    request.complete(result);
+}
+
 async fn handle_mesh_batch(batch: PersistBatch, context: &mut MeshPersistenceContext<'_>) {
-    // An exchange that carried no operations leaves history, devices, and
-    // config exactly as they were, so there is nothing to republish. It also
-    // must not wake the mesh: notify_transfers bumps the revision that drives
-    // reconciliation, and doing that here made every batch schedule the next
-    // exchange, which kept the mesh reconciling at full speed while idle.
+    // An exchange that carried no operations leaves history and devices
+    // exactly as they were, so there is nothing to republish.
     let carried_operations = !batch.operations().is_empty();
-    let result = persist_mesh_batch(&batch, context).await;
+    let result = persist_mesh_batch(&batch, context);
     if result.is_ok() && carried_operations {
         context
             .state
@@ -77,79 +86,22 @@ async fn handle_mesh_batch(batch: PersistBatch, context: &mut MeshPersistenceCon
             .state
             .set_devices(device_items(context.history))
             .await;
-        context.state.set_config(context.config.clone()).await;
-        context.mesh.notify_transfers();
     }
-    batch.complete(result.map_err(|error| error.to_string()));
+    batch.complete(result.map_err(|error| format!("{error:#}")));
 }
 
-pub(super) fn handle_mesh_chunk_command(
-    command: MeshChunkCommand,
-    transfers: &mut TransferCoordinator,
-    mesh: &MeshHandle,
-) {
-    let cancellation = CancellationToken::new();
-    match command {
-        MeshChunkCommand::Missing { maximum, reply } => {
-            let result = transfers
-                .missing_chunks(maximum)
-                .map_err(|error| error.to_string());
-            let _ = reply.send(result);
-        }
-        MeshChunkCommand::Export { request, reply } => {
-            let result = transfers
-                .export_chunk(request, &cancellation)
-                .map_err(|error| error.to_string());
-            let _ = reply.send(result);
-        }
-        MeshChunkCommand::Import {
-            request,
-            encrypted,
-            reply,
-        } => {
-            let result = transfers
-                .import_chunk(request, &encrypted, &cancellation)
-                .map(|_| ())
-                .map_err(|error| error.to_string());
-            if result.is_ok() {
-                mesh.notify_transfers();
-            }
-            let _ = reply.send(result);
-        }
-    }
-}
-
-#[allow(
-    clippy::too_many_lines,
-    reason = "remote persistence, policy application, and config mirroring form one transaction boundary"
-)]
-async fn persist_mesh_batch(
+fn persist_mesh_batch(
     batch: &PersistBatch,
     context: &mut MeshPersistenceContext<'_>,
 ) -> anyhow::Result<()> {
     let operations = batch.operations();
     for operation in operations {
-        if let Operation::Add { payload, .. } | Operation::AddQuotaExempt { payload, .. } =
-            operation.operation()
-        {
+        if let Operation::Add { payload, .. } = operation.operation() {
             payload
                 .validate(context.content_key)
                 .context("validate remote clipboard payload identity")?;
         }
-        if let Operation::BeginShare {
-            manifest_id,
-            manifest,
-            ..
-        } = operation.operation()
-        {
-            context
-                .transfers
-                .validate_manifest(*manifest_id, manifest)
-                .context("validate remote transfer manifest")?;
-        }
     }
-
-    let before = context.history.projection().effective_shared_settings();
     context
         .history
         .ingest_authenticated_batch(
@@ -160,81 +112,6 @@ async fn persist_mesh_batch(
             unix_time_millis()?,
         )
         .context("persist authenticated remote operation batch and frontier")?;
-    context
-        .transfers
-        .reconcile_projection(context.history.projection())
-        .context("reconcile received transfer state")?;
-    let after = context.history.projection().effective_shared_settings();
-
-    if before != after {
-        if let Err(error) = context
-            .clipboard
-            .set_capture_threshold(after.capture_threshold_bytes)
-        {
-            tracing::warn!(
-                %error,
-                "durable shared setting could not be applied to clipboard capture"
-            );
-        }
-
-        if before.mesh_quota_bytes != after.mesh_quota_bytes {
-            match unix_time_millis()
-                .context("read wall clock for quota enforcement")
-                .and_then(|now| {
-                    context
-                        .history
-                        .enforce_quota(now)
-                        .context("persist deterministic quota evictions")
-                }) {
-                Ok(evictions) => {
-                    for operation in &evictions {
-                        if let Err(error) = context.mesh.record_local(operation).await {
-                            tracing::warn!(
-                                %error,
-                                operation_id = %operation.id(),
-                                "durable quota eviction could not be queued for replication"
-                            );
-                        }
-                    }
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        %error,
-                        "quota enforcement deferred until all visible payloads are available"
-                    );
-                }
-            }
-        }
-    }
-    let revision = context.history.projection().shared_settings_revision();
-    if !context.config.shared.matches(after, &revision) {
-        match Config::rewrite_shared(context.config_path, after, revision) {
-            Ok(config) => context.config.shared = config.shared,
-            Err(error) => {
-                context.config.shared = SharedConfig {
-                    mesh_quota_bytes: after.mesh_quota_bytes,
-                    capture_threshold_bytes: after.capture_threshold_bytes,
-                    revision: context.history.projection().shared_settings_revision(),
-                };
-                tracing::warn!(
-                    %error,
-                    "durable replicated settings could not be mirrored to config"
-                );
-            }
-        }
-    }
-    if let Err(error) = context.transfers.update_policy(ExplicitSharePolicy {
-        automatic_capture_threshold_bytes: after.capture_threshold_bytes,
-        mesh_quota_bytes: after.mesh_quota_bytes,
-        maximum_explicit_share_bytes: context.config.local.maximum_explicit_share_bytes,
-        free_space_reserve_bytes: context.config.local.transfer_free_space_reserve_bytes,
-    }) {
-        tracing::warn!(
-            %error,
-            "durable shared settings could not be applied to explicit-share policy"
-        );
-    }
-
     if let Err(error) = context.history.compact_acknowledged_tombstones() {
         tracing::warn!(
             %error,

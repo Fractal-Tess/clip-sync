@@ -19,7 +19,7 @@ use super::{
 };
 use crate::clipboard::{
     backend::{BackendError, ClipboardEvent},
-    types::{ClipboardContent, ClipboardRepresentation, FeedbackMarker, Generation, OfferMimeList},
+    types::{ClipboardContent, FeedbackMarker},
 };
 
 pub(super) enum ClipboardCommand {
@@ -27,19 +27,6 @@ pub(super) enum ClipboardCommand {
         content: ClipboardContent,
         reply: oneshot::Sender<Result<FeedbackMarker, BackendError>>,
     },
-    ReadCurrent {
-        expected_generation: Option<Generation>,
-        maximum_bytes: u64,
-        retain_bytes: bool,
-        reply: oneshot::Sender<Result<ExplicitReadResult, BackendError>>,
-    },
-}
-
-pub(super) struct ExplicitReadResult {
-    pub(super) generation: Generation,
-    pub(super) mime_list: OfferMimeList,
-    pub(super) logical_size: u64,
-    pub(super) representations: Vec<ClipboardRepresentation>,
 }
 
 pub(super) async fn run_wayland_watch(
@@ -151,11 +138,5 @@ fn handle_command(
         ClipboardCommand::SetContent { content, reply } => {
             let _ = reply.send(state.set_owned_content(content, qh));
         }
-        ClipboardCommand::ReadCurrent {
-            expected_generation,
-            maximum_bytes,
-            retain_bytes,
-            reply,
-        } => state.start_explicit_read(expected_generation, maximum_bytes, retain_bytes, reply),
     }
 }

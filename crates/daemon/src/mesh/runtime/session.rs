@@ -6,13 +6,13 @@ use tokio_util::sync::CancellationToken;
 
 use clip_sync_core::model::{NodeId, SeenOps};
 
-use super::super::protocol::{STREAM_KIND_CHUNK, STREAM_KIND_SYNC};
+use super::super::protocol::{STREAM_KIND_FETCH, STREAM_KIND_SYNC};
 use super::{
     ActiveConnection, CLOSE_DUPLICATE, CLOSE_FORGOTTEN, CLOSE_PROTOCOL, CLOSE_SHUTDOWN, Direction,
-    EXCHANGE_TIMEOUT, HANDSHAKE_TIMEOUT, MeshError, RuntimeContext,
+    EXCHANGE_TIMEOUT, HANDSHAKE_TIMEOUT, MAX_CONCURRENT_FETCHES, MeshError, RuntimeContext,
     control::{answer_sync, initiate_sync_streams, persist_and_record},
+    fetch::serve_fetch,
     handshake::exchange_identity,
-    transfer::{answer_chunk, initiate_chunk_streams},
 };
 
 pub(super) async fn run_connection(
@@ -153,7 +153,7 @@ fn preferred_direction(local: NodeId, peer: NodeId) -> Direction {
 
 async fn session_loop(
     connection: &Connection,
-    context: &RuntimeContext,
+    context: &Arc<RuntimeContext>,
     peer: NodeId,
     peer_frontier: Arc<Mutex<SeenOps>>,
     shutdown: CancellationToken,
@@ -167,52 +167,60 @@ async fn session_loop(
     );
     let outbound =
         initiate_sync_streams(connection, context, peer, &peer_frontier, shutdown.clone());
-    let transfers = initiate_chunk_streams(connection, context, shutdown.clone());
     tokio::pin!(inbound);
     tokio::pin!(outbound);
-    tokio::pin!(transfers);
 
     tokio::select! {
         result = &mut inbound => result,
         result = &mut outbound => result,
-        result = &mut transfers => result,
         error = connection.closed() => Err(MeshError::Connection(error)),
         () = shutdown.cancelled() => Ok(()),
     }
 }
 
+/// Sync exchanges are answered one at a time and bounded by the exchange
+/// timeout. Fetches can move gigabytes, so each runs on its own task without
+/// that timeout; QUIC's idle timeout still ends one whose peer vanished.
 async fn accept_session_streams(
     connection: &Connection,
-    context: &RuntimeContext,
+    context: &Arc<RuntimeContext>,
     peer: NodeId,
     peer_frontier: Arc<Mutex<SeenOps>>,
     shutdown: CancellationToken,
 ) -> Result<(), MeshError> {
+    let fetches = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_FETCHES));
+    let mut serving = tokio::task::JoinSet::new();
     loop {
-        let streams = tokio::select! {
+        let (mut send, mut recv) = tokio::select! {
             () = shutdown.cancelled() => return Ok(()),
+            Some(_) = serving.join_next(), if !serving.is_empty() => continue,
             streams = connection.accept_bi() => streams?,
         };
-        timeout(
-            EXCHANGE_TIMEOUT,
-            answer_session(streams, context, peer, &peer_frontier),
-        )
-        .await
-        .map_err(|_| MeshError::ExchangeTimeout)??;
-    }
-}
-
-async fn answer_session(
-    (mut send, mut recv): (quinn::SendStream, quinn::RecvStream),
-    context: &RuntimeContext,
-    peer: NodeId,
-    peer_frontier: &Mutex<SeenOps>,
-) -> Result<(), MeshError> {
-    let mut kind = [0_u8; 1];
-    recv.read_exact(&mut kind).await?;
-    match kind[0] {
-        STREAM_KIND_SYNC => answer_sync(&mut send, &mut recv, context, peer, peer_frontier).await,
-        STREAM_KIND_CHUNK => answer_chunk(&mut send, &mut recv, context).await,
-        kind => Err(MeshError::UnknownStreamKind(kind)),
+        let mut kind = [0_u8; 1];
+        timeout(EXCHANGE_TIMEOUT, recv.read_exact(&mut kind))
+            .await
+            .map_err(|_| MeshError::ExchangeTimeout)??;
+        match kind[0] {
+            STREAM_KIND_SYNC => timeout(
+                EXCHANGE_TIMEOUT,
+                answer_sync(&mut send, &mut recv, context, peer, &peer_frontier),
+            )
+            .await
+            .map_err(|_| MeshError::ExchangeTimeout)??,
+            STREAM_KIND_FETCH => {
+                let Ok(permit) = fetches.clone().try_acquire_owned() else {
+                    send.reset(0_u32.into()).ok();
+                    continue;
+                };
+                let context = context.clone();
+                serving.spawn(async move {
+                    let _permit = permit;
+                    if let Err(error) = serve_fetch(send, recv, &context).await {
+                        tracing::debug!(%error, "fetch was not served");
+                    }
+                });
+            }
+            kind => return Err(MeshError::UnknownStreamKind(kind)),
+        }
     }
 }

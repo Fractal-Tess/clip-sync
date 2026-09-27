@@ -189,9 +189,7 @@ impl WaylandState {
         });
 
         self.current_offer = Some(CurrentOffer {
-            generation,
             offer: offer.clone(),
-            mime_list: public_mime_list.clone(),
         });
         self.start_capture(generation, kind, &offer, &public_mime_list);
     }

@@ -34,20 +34,22 @@ pub enum MeshError {
     PersistenceUnavailable,
     #[error("daemon rejected a remote operation batch: {0}")]
     PersistenceRejected(String),
-    #[error("authenticated chunk broker timed out")]
-    ChunkBrokerTimeout,
-    #[error("authenticated chunk broker is unavailable")]
-    ChunkBrokerUnavailable,
-    #[error("daemon rejected chunk work: {0}")]
-    ChunkBrokerRejected(String),
     #[error("unknown authenticated stream kind {0}")]
     UnknownStreamKind(u8),
-    #[error("chunk stream frame is too large ({0} bytes)")]
-    ChunkFrameTooLarge(usize),
-    #[error("chunk request is invalid")]
-    InvalidChunkRequest,
-    #[error("chunk response is invalid")]
-    InvalidChunkResponse,
+    #[error("the device that copied this item is not connected")]
+    OriginOffline,
+    #[error("the device that copied this item cannot provide it: {0}")]
+    SourceUnavailable(String),
+    #[error("fetch request is invalid")]
+    InvalidFetchRequest,
+    #[error("the fetched item did not match its description")]
+    FetchMismatch,
+    #[error("could not write the fetched item: {0}")]
+    FetchIo(#[from] std::io::Error),
+    #[error("could not stop a QUIC stream: {0}")]
+    Stopped(#[from] quinn::StoppedError),
+    #[error("could not read a QUIC stream: {0}")]
+    StreamReadChunk(#[from] quinn::ReadError),
     #[error("frontier is malformed: {0}")]
     Frontier(serde_json::Error),
     #[error("frontier serialization failed: {0}")]

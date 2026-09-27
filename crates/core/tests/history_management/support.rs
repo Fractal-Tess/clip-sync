@@ -2,8 +2,8 @@ pub(super) use std::collections::BTreeSet;
 
 pub(super) use clip_sync_core::{
     model::{
-        Acknowledgements, ContentId, HlcTimestamp, NodeId, OpId, Operation, Payload, Projection,
-        Representation, SharedSetting, StampedOperation,
+        Acknowledgements, ContentId, FileEntry, HlcTimestamp, ItemKind, NodeId, OpId, Operation,
+        Payload, Projection, Reference, Representation, StampedOperation,
     },
     replica::{Replica, ReplicaError},
     storage::{HistoryError, HistoryStore, StorageKey},

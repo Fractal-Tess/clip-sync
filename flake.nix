@@ -68,7 +68,7 @@
           # on the runtime search path rather than in buildInputs.
           postFixup = ''
             wrapProgram "$out/bin/clip-sync" \
-              --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.iproute2 ]} \
+              --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.iproute2 pkgs.libnotify ]} \
               --prefix LD_LIBRARY_PATH : ${
                 pkgs.lib.makeLibraryPath [
                   pkgs.libxkbcommon

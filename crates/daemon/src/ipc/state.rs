@@ -6,10 +6,7 @@ use clip_sync_core::config::Config;
 
 use crate::{discovery::DiscoverySnapshot, history_search::HistorySearchIndex, mesh::MeshHandle};
 
-use super::protocol::{
-    DeviceItem, HistoryItem, ImagePreviewResponse, ShareClipboardResponse, SharedSettingKind,
-    TransferItem,
-};
+use super::protocol::{DeviceItem, HistoryItem, ImagePreviewResponse};
 
 #[derive(Clone)]
 pub struct DaemonState {
@@ -47,9 +44,10 @@ pub(super) struct DiagnosticStatus {
 }
 
 pub enum DaemonCommand {
+    /// Replies with what happened: activated now, or fetching from a peer.
     Activate {
         content_id: String,
-        reply: oneshot::Sender<Result<(), String>>,
+        reply: oneshot::Sender<Result<String, String>>,
     },
     SetPinned {
         content_id: String,
@@ -60,28 +58,8 @@ pub enum DaemonCommand {
         content_id: String,
         reply: oneshot::Sender<Result<(), String>>,
     },
-    ShareClipboard {
-        confirmed: bool,
-        reply: oneshot::Sender<Result<ShareClipboardResponse, String>>,
-    },
-    ListTransfers {
-        reply: oneshot::Sender<Result<Vec<TransferItem>, String>>,
-    },
-    CancelTransfer {
-        transfer_id: String,
-        reply: oneshot::Sender<Result<(), String>>,
-    },
     ForgetDevice {
         device_id: String,
-        reply: oneshot::Sender<Result<(), String>>,
-    },
-    UpdateSharedSetting {
-        setting: SharedSettingKind,
-        value: u64,
-        reply: oneshot::Sender<Result<(), String>>,
-    },
-    UpdatePeerInterfaces {
-        interfaces: Vec<String>,
         reply: oneshot::Sender<Result<(), String>>,
     },
     ImagePreview {
@@ -177,9 +155,5 @@ impl DaemonState {
 
     pub async fn config(&self) -> Config {
         self.inner.config.read().await.clone()
-    }
-
-    pub async fn set_config(&self, config: Config) {
-        *self.inner.config.write().await = config;
     }
 }

@@ -1,8 +1,6 @@
 use std::collections::BTreeMap;
 
-use serde::Serialize;
-
-use clip_sync_core::{config::Config, transfer::TRANSFER_PROTOCOL_VERSION};
+use clip_sync_core::config::Config;
 
 use crate::{
     history_search::HistoryQuery,
@@ -11,9 +9,9 @@ use crate::{
 
 use super::{
     protocol::{
-        ConfigResponse, DiagnosticCheck, DiagnosticsResponse, ErrorResponse, HistoryRequest,
-        HistoryResponse, IPC_PROTOCOL_VERSION, PeerItem, PeerStats, PeersResponse, Response,
-        StatusResponse, response,
+        DiagnosticCheck, DiagnosticsResponse, ErrorResponse, HistoryRequest, HistoryResponse,
+        IPC_PROTOCOL_VERSION, PeerItem, PeerStats, PeersResponse, Response, StatusResponse,
+        response,
     },
     state::{DaemonState, PeerHistoryStats},
 };
@@ -81,55 +79,6 @@ impl DaemonState {
             discovered_peers,
             connected_peers,
         })
-    }
-
-    pub(super) async fn config_response(
-        &self,
-        request_id: u64,
-    ) -> Result<response::Body, Response> {
-        #[derive(Serialize)]
-        struct RedactedLocal<'a> {
-            listen_port: u16,
-            discovery_interval_seconds: u64,
-            reconcile_interval_seconds: u64,
-            reconnect_min_seconds: u64,
-            reconnect_max_seconds: u64,
-            peer_interfaces: &'a [String],
-            peer_addresses: &'a [std::net::IpAddr],
-            mesh_key_file_configured: bool,
-            config_path: &'a str,
-        }
-
-        #[derive(Serialize)]
-        struct RedactedConfig<'a> {
-            shared: &'a clip_sync_core::config::SharedConfig,
-            local: RedactedLocal<'a>,
-        }
-
-        let config = self.inner.config.read().await;
-        let config_path = self.inner.config_path.to_string_lossy();
-        let redacted = RedactedConfig {
-            shared: &config.shared,
-            local: RedactedLocal {
-                listen_port: config.local.listen_port,
-                discovery_interval_seconds: config.local.discovery_interval_seconds,
-                reconcile_interval_seconds: config.local.reconcile_interval_seconds,
-                reconnect_min_seconds: config.local.reconnect_min_seconds,
-                reconnect_max_seconds: config.local.reconnect_max_seconds,
-                peer_interfaces: &config.local.peer_interfaces,
-                peer_addresses: &config.local.peer_addresses,
-                mesh_key_file_configured: !config.local.mesh_key_file.as_os_str().is_empty(),
-                config_path: &config_path,
-            },
-        };
-        match serde_json::to_vec(&redacted) {
-            Ok(redacted_json) => Ok(response::Body::Config(ConfigResponse { redacted_json })),
-            Err(error) => Err(error_response(
-                request_id,
-                "serialization_failed",
-                error.to_string(),
-            )),
-        }
     }
 
     pub(super) async fn history_response(
@@ -250,14 +199,14 @@ impl DaemonState {
                 } else if let Some(error) = mesh.last_listener_error {
                     format!("listener unavailable: {error}")
                 } else {
-                    "listener inactive while interface discovery is unavailable".to_owned()
+                    "listener inactive while the peer interfaces are unavailable".to_owned()
                 };
                 (
                     mesh.listener_address.is_some(),
                     listener_detail,
                     true,
                     format!(
-                        "{} active of {}/{} discovered addresses",
+                        "{} active of {}/{} configured peers",
                         mesh.active_connections,
                         mesh.discovered_addresses,
                         crate::discovery::MAX_DISCOVERED_PEERS
@@ -276,12 +225,12 @@ impl DaemonState {
             error.to_owned()
         } else if let Some(snapshot) = discovery.as_ref() {
             format!(
-                "{} peers visible on {} selected addresses",
+                "{} peers reachable from {} local addresses",
                 snapshot.peers.len(),
                 snapshot.local_addresses.len()
             )
         } else {
-            "waiting for the first interface discovery result".to_owned()
+            "reading the peer interfaces".to_owned()
         };
         response::Body::Diagnostics(DiagnosticsResponse {
             checks: vec![
@@ -306,7 +255,7 @@ impl DaemonState {
                 DiagnosticCheck {
                     name: "mesh_secret".to_owned(),
                     ok: true,
-                    detail: "owner-only key file and encrypted keyslot authenticated".to_owned(),
+                    detail: "owner-only key files loaded".to_owned(),
                 },
                 DiagnosticCheck {
                     name: "clipboard".to_owned(),
@@ -314,7 +263,7 @@ impl DaemonState {
                     detail: clipboard.detail,
                 },
                 DiagnosticCheck {
-                    name: "interface_discovery".to_owned(),
+                    name: "peer_interfaces".to_owned(),
                     ok: discovery_ok,
                     detail: discovery_detail,
                 },
@@ -331,9 +280,7 @@ impl DaemonState {
                 DiagnosticCheck {
                     name: "protocol_versions".to_owned(),
                     ok: true,
-                    detail: format!(
-                        "ipc={IPC_PROTOCOL_VERSION}, mesh={MESH_PROTOCOL_VERSION}, transfer={TRANSFER_PROTOCOL_VERSION}"
-                    ),
+                    detail: format!("ipc={IPC_PROTOCOL_VERSION}, mesh={MESH_PROTOCOL_VERSION}"),
                 },
             ],
         })

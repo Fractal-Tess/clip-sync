@@ -1,8 +1,4 @@
-use crate::model::{ContentId, Operation, Payload, SettingValue, SharedSetting, StampedOperation};
-use crate::{
-    payload::{ManifestId, StoredManifest},
-    transfer::{TransferId, TransferPhase},
-};
+use crate::model::{ContentId, Operation, Payload, Reference, StampedOperation};
 
 use super::{Replica, ReplicaError, parse_content_id};
 
@@ -30,128 +26,29 @@ impl Replica {
         self.author(operation, now_millis)
     }
 
-    /// Authors an explicit share. Payloads larger than the current mesh quota
-    /// carry replicated quota-exemption metadata; smaller shares behave like a
-    /// normal copy.
+    /// Authors a large copy whose bytes stay on this device. A repeated copy
+    /// of the same item re-publishes the description, which may have changed
+    /// (a file edited in place keeps its path, and so its content ID).
     ///
     /// # Errors
     ///
-    /// Returns an error if the operation counter/clock is exhausted or the
-    /// generated operation fails projection validation.
-    pub fn share_explicit(
+    /// Returns an error for an invalid reference or authoring failure.
+    pub fn add_reference(
         &mut self,
-        payload: Payload,
-        now_millis: u64,
-    ) -> Result<StampedOperation, ReplicaError> {
-        let content_id = payload.descriptor().content_id();
-        let quota = self.projection.effective_shared_settings().mesh_quota_bytes;
-        let oversized = payload.descriptor().logical_size() > quota;
-        let operation = if oversized {
-            Operation::AddQuotaExempt {
-                content_id,
-                payload,
-            }
-        } else if self.projection.is_visible(content_id) {
-            Operation::Touch { content_id }
-        } else {
-            Operation::Add {
-                content_id,
-                payload,
-            }
-        };
-        self.author(operation, now_millis)
-    }
-
-    /// Authors the pending replicated half of a manifest-backed share.
-    ///
-    /// # Errors
-    ///
-    /// Returns an authoring or projection validation error.
-    pub fn begin_manifest_share(
-        &mut self,
-        transfer_id: TransferId,
         content_id: ContentId,
-        manifest_id: ManifestId,
-        manifest: StoredManifest,
-        quota_exempt: bool,
+        reference: Reference,
         now_millis: u64,
     ) -> Result<StampedOperation, ReplicaError> {
         self.author(
-            Operation::BeginShare {
-                transfer_id,
+            Operation::AddReference {
                 content_id,
-                manifest_id,
-                manifest,
-                quota_exempt,
+                reference,
             },
             now_millis,
         )
     }
 
-    /// Authors completion after local encrypted chunks are durable.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error for an absent/cancelled transfer or authoring failure.
-    pub fn complete_manifest_share(
-        &mut self,
-        transfer_id: TransferId,
-        now_millis: u64,
-    ) -> Result<StampedOperation, ReplicaError> {
-        let transfer = self
-            .projection
-            .transfer(transfer_id)
-            .ok_or(ReplicaError::TransferNotFound(transfer_id))?;
-        if transfer.phase() == TransferPhase::Cancelled {
-            return Err(ReplicaError::TransferCancelled(transfer_id));
-        }
-        let content_id = transfer
-            .content_id()
-            .ok_or(ReplicaError::TransferNotFound(transfer_id))?;
-        let manifest_id = transfer
-            .manifest_id()
-            .ok_or(ReplicaError::TransferNotFound(transfer_id))?;
-        self.author(
-            Operation::CompleteShare {
-                transfer_id,
-                content_id,
-                manifest_id,
-            },
-            now_millis,
-        )
-    }
-
-    /// Authors a cancellation tombstone which dominates completion ordering.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error for an absent transfer or authoring failure.
-    pub fn cancel_manifest_share(
-        &mut self,
-        transfer_id: TransferId,
-        now_millis: u64,
-    ) -> Result<StampedOperation, ReplicaError> {
-        let transfer = self
-            .projection
-            .transfer(transfer_id)
-            .ok_or(ReplicaError::TransferNotFound(transfer_id))?;
-        let content_id = transfer
-            .content_id()
-            .ok_or(ReplicaError::TransferNotFound(transfer_id))?;
-        let manifest_id = transfer
-            .manifest_id()
-            .ok_or(ReplicaError::TransferNotFound(transfer_id))?;
-        self.author(
-            Operation::CancelShare {
-                transfer_id,
-                content_id,
-                manifest_id,
-            },
-            now_millis,
-        )
-    }
-
-    /// Captures payload and immediately applies the effective replicated quota.
+    /// Captures payload and immediately applies the history quota.
     ///
     /// The returned batch starts with the add/touch and is followed by any
     /// deterministic delete operations.
@@ -163,27 +60,11 @@ impl Replica {
     pub fn copy_and_enforce(
         &mut self,
         payload: Payload,
+        quota_bytes: u64,
         now_millis: u64,
     ) -> Result<Vec<StampedOperation>, ReplicaError> {
         let mut operations = vec![self.copy(payload, now_millis)?];
-        operations.extend(self.enforce_quota(now_millis)?);
-        Ok(operations)
-    }
-
-    /// Explicitly shares payload and immediately applies quota to all other
-    /// chargeable history.
-    ///
-    /// # Errors
-    ///
-    /// Returns an authoring error. Operations authored before the failure
-    /// stay applied; `HistoryStore` restores durable state.
-    pub fn share_explicit_and_enforce(
-        &mut self,
-        payload: Payload,
-        now_millis: u64,
-    ) -> Result<Vec<StampedOperation>, ReplicaError> {
-        let mut operations = vec![self.share_explicit(payload, now_millis)?];
-        operations.extend(self.enforce_quota(now_millis)?);
+        operations.extend(self.enforce_quota(quota_bytes, now_millis)?);
         Ok(operations)
     }
 
@@ -296,32 +177,7 @@ impl Replica {
         self.unpin(parse_content_id(content_id)?, now_millis)
     }
 
-    /// Updates one known shared setting through its replicated LWW register.
-    ///
-    /// # Errors
-    ///
-    /// Zero is rejected for byte limits. Clock/counter and projection errors
-    /// are propagated without mutating the replica.
-    pub fn set_shared_setting(
-        &mut self,
-        setting: SharedSetting,
-        value: u64,
-        now_millis: u64,
-    ) -> Result<StampedOperation, ReplicaError> {
-        if value == 0 {
-            return Err(ReplicaError::InvalidSharedSetting { setting, value });
-        }
-        self.author(
-            Operation::SetSetting {
-                key: setting.key().to_owned(),
-                value: SettingValue::Unsigned(value),
-            },
-            now_millis,
-        )
-    }
-
-    /// Authors deterministic oldest-first quota deletions using the effective
-    /// replicated quota.
+    /// Authors deterministic oldest-first quota deletions.
     ///
     /// Items whose payload has not arrived yet (a touch or pin that overtook
     /// its add during reconciliation) have no known size, so they are left out
@@ -334,32 +190,14 @@ impl Replica {
     /// before the failure stay applied; `HistoryStore` restores durable state.
     pub fn enforce_quota(
         &mut self,
+        quota_bytes: u64,
         now_millis: u64,
     ) -> Result<Vec<StampedOperation>, ReplicaError> {
-        let evictions = self.projection.effective_quota_plan().evictions().to_vec();
+        let evictions = self.projection.quota_plan(quota_bytes).evictions().to_vec();
         evictions
             .into_iter()
             .map(|content_id| self.author(Operation::Delete { content_id }, now_millis))
             .collect()
-    }
-
-    /// Changes the replicated quota and immediately authors the deterministic
-    /// evictions implied by the new value.
-    ///
-    /// # Errors
-    ///
-    /// Returns a validation, clock, counter, or projection error. A zero quota
-    /// is rejected before anything changes.
-    pub fn set_mesh_quota_and_enforce(
-        &mut self,
-        quota_bytes: u64,
-        now_millis: u64,
-    ) -> Result<Vec<StampedOperation>, ReplicaError> {
-        let setting =
-            self.set_shared_setting(SharedSetting::MeshQuotaBytes, quota_bytes, now_millis)?;
-        let mut operations = vec![setting];
-        operations.extend(self.enforce_quota(now_millis)?);
-        Ok(operations)
     }
 
     /// Replicates a device-forget decision.

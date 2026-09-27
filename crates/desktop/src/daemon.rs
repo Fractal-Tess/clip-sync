@@ -13,11 +13,9 @@ use clip_sync_core::config::AppPaths;
 use clip_sync_ipc::{
     self as ipc,
     protocol::{
-        ActivateRequest, ConfigRequest, DiagnosticCheck, DiagnosticsRequest, ForgetDeviceRequest,
-        HistoryRequest, HistoryUpdateAction, HistoryUpdateRequest, IPC_PROTOCOL_VERSION,
-        ImagePreviewRequest, PeerInterfacesUpdateRequest, PeersRequest, PeersResponse, Request,
-        SharedSettingKind, SharedSettingUpdateRequest, StatusRequest, StatusResponse,
-        TransferCancelRequest, TransferItem, TransfersRequest, request, response,
+        ActivateRequest, DiagnosticCheck, DiagnosticsRequest, ForgetDeviceRequest, HistoryRequest,
+        HistoryUpdateAction, HistoryUpdateRequest, IPC_PROTOCOL_VERSION, ImagePreviewRequest,
+        PeersRequest, PeersResponse, Request, StatusRequest, StatusResponse, request, response,
     },
 };
 
@@ -28,6 +26,8 @@ pub struct HistoryItem {
     pub source: String,
     pub pinned: bool,
     pub is_image: bool,
+    /// Stored on the device that copied it and fetched when activated.
+    pub remote: bool,
     pub size_bytes: u64,
     /// Unix milliseconds the entry was first copied.
     pub created_millis: u64,
@@ -38,32 +38,6 @@ pub struct ImagePreview {
     pub width: u32,
     pub height: u32,
     pub rgba: Vec<u8>,
-}
-
-/// The daemon's redacted view of its own configuration.
-#[derive(serde::Deserialize)]
-pub struct Settings {
-    pub shared: SharedSettings,
-    pub local: LocalSettings,
-}
-
-#[derive(serde::Deserialize)]
-pub struct SharedSettings {
-    pub mesh_quota_bytes: u64,
-    pub capture_threshold_bytes: u64,
-    pub revision: String,
-}
-
-#[derive(serde::Deserialize)]
-pub struct LocalSettings {
-    pub listen_port: u16,
-    pub discovery_interval_seconds: u64,
-    pub reconcile_interval_seconds: u64,
-    pub reconnect_min_seconds: u64,
-    pub reconnect_max_seconds: u64,
-    pub peer_interfaces: Vec<String>,
-    pub mesh_key_file_configured: bool,
-    pub config_path: String,
 }
 
 pub struct Daemon {
@@ -136,10 +110,13 @@ impl Daemon {
             .items
             .into_iter()
             .map(|item| HistoryItem {
-                is_image: item
-                    .mime_types
-                    .iter()
-                    .any(|mime| mime.starts_with("image/")),
+                // A remote image has no local bytes to thumbnail.
+                is_image: !item.remote
+                    && item
+                        .mime_types
+                        .iter()
+                        .any(|mime| mime.starts_with("image/")),
+                remote: item.remote,
                 content_id: item.content_id,
                 preview: item.preview,
                 source: if item.source_device.is_empty() {
@@ -183,19 +160,6 @@ impl Daemon {
         Ok(peers)
     }
 
-    /// Lists transfers the mesh is currently moving.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the daemon is unreachable or answers unexpectedly.
-    pub fn transfers(&self) -> Result<Vec<TransferItem>> {
-        let body = self.send(request::Body::Transfers(TransfersRequest {}))?;
-        let response::Body::Transfers(transfers) = body else {
-            bail!("ClipSync daemon returned the wrong response to transfers");
-        };
-        Ok(transfers.transfers)
-    }
-
     /// Runs the daemon's self-checks.
     ///
     /// # Errors
@@ -209,34 +173,6 @@ impl Daemon {
         Ok(diagnostics.checks)
     }
 
-    /// Reads back the daemon's configuration with secrets stripped out.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the daemon is unreachable, answers unexpectedly,
-    /// or sends a payload this build cannot parse.
-    pub fn settings(&self) -> Result<Settings> {
-        let body = self.send(request::Body::Config(ConfigRequest {}))?;
-        let response::Body::Config(config) = body else {
-            bail!("ClipSync daemon returned the wrong response to config");
-        };
-        serde_json::from_slice(&config.redacted_json)
-            .context("failed to parse the daemon's configuration")
-    }
-
-    /// Stops an in-flight transfer.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the daemon is unreachable, answers unexpectedly,
-    /// or refuses the cancellation.
-    pub fn cancel_transfer(&self, transfer_id: &str) -> Result<()> {
-        let body = self.send(request::Body::TransferCancel(TransferCancelRequest {
-            transfer_id: transfer_id.to_owned(),
-        }))?;
-        Self::mutation(body, "transfer cancellation failed").map(drop)
-    }
-
     /// Revokes a device's membership in the mesh.
     ///
     /// # Errors
@@ -248,35 +184,6 @@ impl Daemon {
             device_id: device_id.to_owned(),
         }))?;
         Self::mutation(body, "forgetting the device failed").map(drop)
-    }
-
-    /// Writes one mesh-wide setting, which the daemon replicates to peers.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the daemon is unreachable, answers unexpectedly,
-    /// or rejects the value.
-    pub fn set_shared_setting(&self, setting: SharedSettingKind, value: u64) -> Result<()> {
-        let body = self.send(request::Body::SharedSettingUpdate(
-            SharedSettingUpdateRequest {
-                setting: setting as i32,
-                value,
-            },
-        ))?;
-        Self::mutation(body, "the setting update failed").map(drop)
-    }
-
-    /// Replaces the interface allowlist this node discovers peers on.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the daemon is unreachable, answers unexpectedly,
-    /// or rejects the interface list.
-    pub fn set_peer_interfaces(&self, interfaces: Vec<String>) -> Result<()> {
-        let body = self.send(request::Body::PeerInterfacesUpdate(
-            PeerInterfacesUpdateRequest { interfaces },
-        ))?;
-        Self::mutation(body, "the interface update failed").map(drop)
     }
 
     /// Unwraps a mutation response, turning a refusal into an error.

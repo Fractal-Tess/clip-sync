@@ -121,8 +121,6 @@ pub(super) fn validate_local_config(config: &MeshRuntimeConfig) -> Result<(), Me
         || config.batch_limits.max_ops > MAX_BATCH_OPERATIONS
         || config.batch_limits.max_bytes == 0
         || config.batch_limits.max_bytes > super::super::protocol::MAX_CONTROL_FRAME_BYTES
-        || config.max_concurrent_chunk_streams == 0
-        || config.max_concurrent_chunk_streams > 32
     {
         return Err(MeshError::InvalidConfig);
     }

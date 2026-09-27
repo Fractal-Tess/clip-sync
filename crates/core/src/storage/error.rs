@@ -66,17 +66,17 @@ pub enum StorageError {
     #[error("persisted local operation log does not match replica metadata: {0}")]
     LocalOperationLogMismatch(String),
 
-    #[error("serialized operation is invalid: {0}")]
-    OperationDeserialization(#[source] serde_json::Error),
+    #[error("stored operation is invalid: {0}")]
+    OperationDecode(#[source] crate::replication::CodecError),
+
+    #[error("a 0.3 operation could not be converted: {0}")]
+    LegacyOperation(#[source] serde_json::Error),
 
     #[error("stored operation is inconsistent: {0}")]
     CorruptOperation(String),
 
     #[error("stored local replica metadata is invalid: {0}")]
     CorruptReplicaMetadata(String),
-
-    #[error("operation serialization failed: {0}")]
-    OperationSerialization(#[source] serde_json::Error),
 
     #[error("acknowledgement serialization failed: {0}")]
     AcknowledgementSerialization(#[source] serde_json::Error),

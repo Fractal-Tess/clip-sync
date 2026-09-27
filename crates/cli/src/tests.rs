@@ -4,7 +4,7 @@ use clap::{Parser, error::ErrorKind};
 
 use super::{
     Cli, LaunchKind, ParsedInvocation,
-    views::{StatusOutput, error_json, history_item_json, peer_json, share_json, transfer_json},
+    views::{StatusOutput, error_json, history_item_json, peer_json},
 };
 
 fn invocation(arguments: &[&str]) -> ParsedInvocation {
@@ -57,10 +57,6 @@ fn every_client_command_routes_to_client_mode() {
     let commands = [
         vec!["clip-sync", "status"],
         vec!["clip-sync", "peers"],
-        vec!["clip-sync", "config", "show"],
-        vec!["clip-sync", "config", "init"],
-        vec!["clip-sync", "config", "set", "mesh-quota", "4096"],
-        vec!["clip-sync", "config", "set-peer-interfaces", "wt0", "tun0"],
         vec!["clip-sync", "history", "list"],
         vec!["clip-sync", "history", "search", "needle"],
         vec!["clip-sync", "history", "activate", "content"],
@@ -68,9 +64,6 @@ fn every_client_command_routes_to_client_mode() {
         vec!["clip-sync", "history", "unpin", "content"],
         vec!["clip-sync", "history", "delete", "content"],
         vec!["clip-sync", "doctor"],
-        vec!["clip-sync", "share-clipboard"],
-        vec!["clip-sync", "transfer", "list"],
-        vec!["clip-sync", "transfer", "cancel", "transfer"],
         vec!["clip-sync", "device", "forget", "device"],
     ];
 
@@ -102,25 +95,7 @@ fn cli_exposes_history_search_and_mutations() {
         vec!["clip-sync", "history", "pin", "content", "--json"],
         vec!["clip-sync", "history", "unpin", "content"],
         vec!["clip-sync", "history", "delete", "content"],
-        vec!["clip-sync", "transfer", "cancel", "transfer-id", "--json"],
         vec!["clip-sync", "device", "forget", "device-id", "--json"],
-        vec![
-            "clip-sync",
-            "config",
-            "set",
-            "mesh-quota",
-            "1048576",
-            "--json",
-        ],
-        vec!["clip-sync", "share-clipboard", "--confirm", "--json"],
-        vec![
-            "clip-sync",
-            "config",
-            "set-peer-interfaces",
-            "wt0",
-            "tun0",
-            "--json",
-        ],
     ] {
         Cli::try_parse_from(arguments).expect("command should parse");
     }
@@ -153,6 +128,7 @@ fn history_json_fields_are_stable() {
             pinned: true,
             physical_millis: 1_704_067_200_000,
             origin_millis: Some(1_704_067_200_000),
+            remote: true,
         }),
         serde_json::json!({
             "content_id": "content",
@@ -164,6 +140,7 @@ fn history_json_fields_are_stable() {
             "pinned": true,
             "physical_millis": 1_704_067_200_000_u64,
             "origin_millis": 1_704_067_200_000_u64,
+            "remote": true,
         })
     );
 }
@@ -220,54 +197,4 @@ fn peer_json_stats_are_additive_and_explicitly_unavailable() {
     });
     assert_eq!(peer_json(&peer)["stats"]["shared_items"], 12);
     assert_eq!(peer_json(&peer)["stats"]["last_shared_millis"], 99);
-}
-
-#[test]
-fn share_json_fields_and_resource_ids_are_stable() {
-    let value = share_json(&clip_sync_ipc::protocol::ShareClipboardResponse {
-        shared: true,
-        confirmation_required: true,
-        logical_size: 42,
-        mime_types: vec!["text/plain".to_owned()],
-        quota_exempt: false,
-        transfer_id: Some("transfer-id".to_owned()),
-        content_id: Some("content-id".to_owned()),
-        message: "clipboard shared".to_owned(),
-    });
-    assert_eq!(
-        value,
-        serde_json::json!({
-            "ok": true,
-            "shared": true,
-            "confirmation_required": true,
-            "logical_size": 42,
-            "mime_types": ["text/plain"],
-            "quota_exempt": false,
-            "transfer_id": "transfer-id",
-            "content_id": "content-id",
-            "message": "clipboard shared",
-        })
-    );
-}
-
-#[test]
-fn transfer_progress_json_fields_are_stable() {
-    assert_eq!(
-        transfer_json(&clip_sync_ipc::protocol::TransferItem {
-            transfer_id: "transfer-id".to_owned(),
-            content_id: "content-id".to_owned(),
-            peer: "peer-id".to_owned(),
-            state: "replicating".to_owned(),
-            completed_bytes: 10,
-            total_bytes: 20,
-        }),
-        serde_json::json!({
-            "transfer_id": "transfer-id",
-            "content_id": "content-id",
-            "peer": "peer-id",
-            "state": "replicating",
-            "completed_bytes": 10,
-            "total_bytes": 20,
-        })
-    );
 }
