@@ -154,21 +154,19 @@ impl Replica {
     /// Captures payload and immediately applies the effective replicated quota.
     ///
     /// The returned batch starts with the add/touch and is followed by any
-    /// deterministic delete operations. The replica changes atomically.
+    /// deterministic delete operations.
     ///
     /// # Errors
     ///
-    /// Returns an authoring or quota-state error without changing the replica.
+    /// Returns an authoring error. Operations authored before the failure
+    /// stay applied; `HistoryStore` restores durable state.
     pub fn copy_and_enforce(
         &mut self,
         payload: Payload,
         now_millis: u64,
     ) -> Result<Vec<StampedOperation>, ReplicaError> {
-        let mut next = self.clone();
-        let copied = next.copy(payload, now_millis)?;
-        let mut operations = vec![copied];
-        operations.extend(next.enforce_quota(now_millis)?);
-        *self = next;
+        let mut operations = vec![self.copy(payload, now_millis)?];
+        operations.extend(self.enforce_quota(now_millis)?);
         Ok(operations)
     }
 
@@ -177,17 +175,15 @@ impl Replica {
     ///
     /// # Errors
     ///
-    /// Returns an authoring or quota-state error without changing the replica.
+    /// Returns an authoring error. Operations authored before the failure
+    /// stay applied; `HistoryStore` restores durable state.
     pub fn share_explicit_and_enforce(
         &mut self,
         payload: Payload,
         now_millis: u64,
     ) -> Result<Vec<StampedOperation>, ReplicaError> {
-        let mut next = self.clone();
-        let shared = next.share_explicit(payload, now_millis)?;
-        let mut operations = vec![shared];
-        operations.extend(next.enforce_quota(now_millis)?);
-        *self = next;
+        let mut operations = vec![self.share_explicit(payload, now_millis)?];
+        operations.extend(self.enforce_quota(now_millis)?);
         Ok(operations)
     }
 
@@ -327,33 +323,24 @@ impl Replica {
     /// Authors deterministic oldest-first quota deletions using the effective
     /// replicated quota.
     ///
+    /// Items whose payload has not arrived yet (a touch or pin that overtook
+    /// its add during reconciliation) have no known size, so they are left out
+    /// of this round. Failing instead would make a local copy fail whenever a
+    /// sync happened to be half-way through, losing that copy.
+    ///
     /// # Errors
     ///
-    /// Refuses to make a partial decision if a visible payload is unavailable,
-    /// and propagates clock/counter/projection failures atomically.
+    /// Propagates clock/counter/projection failures. Operations authored
+    /// before the failure stay applied; `HistoryStore` restores durable state.
     pub fn enforce_quota(
         &mut self,
         now_millis: u64,
     ) -> Result<Vec<StampedOperation>, ReplicaError> {
-        let plan = self.projection.effective_quota_plan();
-        if !plan.missing_payloads().is_empty() {
-            return Err(ReplicaError::QuotaStateIncomplete(
-                plan.missing_payloads().to_vec(),
-            ));
-        }
-
-        let mut next = self.clone();
-        let mut operations = Vec::with_capacity(plan.evictions().len());
-        for content_id in plan.evictions() {
-            operations.push(next.author(
-                Operation::Delete {
-                    content_id: *content_id,
-                },
-                now_millis,
-            )?);
-        }
-        *self = next;
-        Ok(operations)
+        let evictions = self.projection.effective_quota_plan().evictions().to_vec();
+        evictions
+            .into_iter()
+            .map(|content_id| self.author(Operation::Delete { content_id }, now_millis))
+            .collect()
     }
 
     /// Changes the replicated quota and immediately authors the deterministic
@@ -361,19 +348,17 @@ impl Replica {
     ///
     /// # Errors
     ///
-    /// Returns a validation, incomplete-state, clock, counter, or projection
-    /// error without changing the replica.
+    /// Returns a validation, clock, counter, or projection error. A zero quota
+    /// is rejected before anything changes.
     pub fn set_mesh_quota_and_enforce(
         &mut self,
         quota_bytes: u64,
         now_millis: u64,
     ) -> Result<Vec<StampedOperation>, ReplicaError> {
-        let mut next = self.clone();
         let setting =
-            next.set_shared_setting(SharedSetting::MeshQuotaBytes, quota_bytes, now_millis)?;
+            self.set_shared_setting(SharedSetting::MeshQuotaBytes, quota_bytes, now_millis)?;
         let mut operations = vec![setting];
-        operations.extend(next.enforce_quota(now_millis)?);
-        *self = next;
+        operations.extend(self.enforce_quota(now_millis)?);
         Ok(operations)
     }
 

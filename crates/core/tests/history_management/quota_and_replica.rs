@@ -145,3 +145,50 @@ fn far_future_peer_timestamp_does_not_poison_local_clock() {
     assert_eq!(replica.last_timestamp(), HlcTimestamp::default());
     assert!(replica.projection().setting("future-setting").is_none());
 }
+
+#[test]
+fn copy_succeeds_while_a_synced_touch_is_still_waiting_for_its_add() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut history =
+        HistoryStore::open(directory.path().join("history.db"), &storage_key()).unwrap();
+    let early = payload(9, 4);
+    let early_id = content_id(&early);
+
+    // A peer's touch arrived before the add it refers to, so the item is
+    // visible with no known size.
+    let touch = StampedOperation::new(
+        OpId::new(node(7), 1).unwrap(),
+        HlcTimestamp::new(10, 0),
+        Operation::Touch {
+            content_id: early_id,
+        },
+    );
+    history.ingest(&touch, 20).unwrap();
+    assert!(history.projection().is_visible(early_id));
+    assert!(history.projection().payload_descriptor(early_id).is_none());
+
+    // A local copy in that window must still be recorded.
+    let copied = payload(10, 4);
+    let copied_id = content_id(&copied);
+    history.copy_and_enforce(copied.clone(), 30).unwrap();
+    assert_eq!(history.load_payload(copied_id).unwrap(), Some(copied));
+}
+
+#[test]
+fn payload_bytes_are_loaded_from_storage_after_restart() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("history.db");
+    let value = payload(11, 64);
+    let id = content_id(&value);
+    {
+        let mut history = HistoryStore::open(&path, &storage_key()).unwrap();
+        history.copy(value.clone(), 5).unwrap();
+    }
+
+    let history = HistoryStore::open(&path, &storage_key()).unwrap();
+    assert_eq!(
+        history.projection().payload_descriptor(id),
+        Some(value.descriptor())
+    );
+    assert_eq!(history.load_payload(id).unwrap(), Some(value));
+}

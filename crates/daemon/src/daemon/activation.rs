@@ -36,35 +36,37 @@ pub(super) async fn activate_history_item(
         anyhow::bail!("history item is deleted");
     }
 
-    let (clipboard_content, materialized_manifest) =
-        if let Some(payload) = history.projection().payload(content_id) {
-            let representations = payload
-                .representations()
-                .iter()
-                .map(|representation| {
-                    let mime = MimeType::new(representation.mime())
-                        .context("stored MIME type cannot be served")?;
-                    Ok(ClipboardRepresentation::new(mime, representation.bytes()))
-                })
-                .collect::<anyhow::Result<Vec<_>>>()?;
-            (
-                ClipboardContent::new_with_max(representations, u64::MAX)
-                    .context("stored history item cannot be served")?,
-                None,
+    let payload = history
+        .load_payload(content_id)
+        .context("load history item payload")?;
+    let (clipboard_content, materialized_manifest) = if let Some(payload) = payload {
+        let representations = payload
+            .representations()
+            .iter()
+            .map(|representation| {
+                let mime = MimeType::new(representation.mime())
+                    .context("stored MIME type cannot be served")?;
+                Ok(ClipboardRepresentation::new(mime, representation.bytes()))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        (
+            ClipboardContent::new_with_max(representations, u64::MAX)
+                .context("stored history item cannot be served")?,
+            None,
+        )
+    } else {
+        let activated = transfers
+            .activate(
+                content_id,
+                history.projection(),
+                content_key,
+                maximum_explicit_share_bytes,
+                &CancellationToken::new(),
             )
-        } else {
-            let activated = transfers
-                .activate(
-                    content_id,
-                    history.projection(),
-                    content_key,
-                    maximum_explicit_share_bytes,
-                    &CancellationToken::new(),
-                )
-                .context("materialize transferred history item")?;
-            let materialized = activated.materialized_manifest();
-            (activated.into_content(), materialized)
-        };
+            .context("materialize transferred history item")?;
+        let materialized = activated.materialized_manifest();
+        (activated.into_content(), materialized)
+    };
     let clipboard_content = image_focused_activation_content(clipboard_content)
         .context("prepare history item for clipboard activation")?;
     clipboard

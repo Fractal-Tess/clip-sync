@@ -16,3 +16,4 @@ pub use history_sync::CompactionReport;
 pub use key::StorageKey;
 pub use metadata::ReplicaMetadata;
 pub use operations::AppendOutcome;
+pub use queries::OperationBatch;

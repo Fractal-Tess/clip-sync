@@ -6,6 +6,7 @@ use thiserror::Error;
 const CONTENT_DOMAIN: &[u8] = b"clip-sync/content-id/v1\0";
 pub const MAX_PAYLOAD_REPRESENTATIONS: usize = 128;
 pub const MAX_PAYLOAD_MIME_BYTES: usize = 256;
+const TEXT_PREVIEW_CHARACTERS: usize = 160;
 
 /// Keyed identity of an exact set of clipboard MIME representations.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -285,6 +286,34 @@ impl Payload {
             return Err(ContentError::DescriptorMismatch);
         }
         Ok(())
+    }
+
+    /// Single-line excerpt of the first `text/plain` representation, with
+    /// control characters blanked, for history listings that must not hold
+    /// the full payload in memory.
+    #[must_use]
+    pub fn text_preview(&self) -> Option<String> {
+        let text = self
+            .representations
+            .iter()
+            .find(|representation| representation.mime.starts_with("text/plain"))?;
+        let decoded = String::from_utf8_lossy(&text.bytes);
+        let mut characters = decoded.chars();
+        let mut preview = characters
+            .by_ref()
+            .take(TEXT_PREVIEW_CHARACTERS)
+            .map(|character| {
+                if character.is_control() {
+                    ' '
+                } else {
+                    character
+                }
+            })
+            .collect::<String>();
+        if characters.next().is_some() {
+            preview.push('…');
+        }
+        Some(preview)
     }
 }
 

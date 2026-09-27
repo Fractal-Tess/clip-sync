@@ -11,7 +11,9 @@ use crate::{
     transfer::{TransferId, TransferPhase},
 };
 
-use super::{ContentId, EventKey, NodeId, Payload, SeenOps, SettingValue, SharedSetting};
+use super::{
+    ContentId, EventKey, NodeId, Payload, PayloadDescriptor, SeenOps, SettingValue, SharedSetting,
+};
 
 mod apply;
 mod queries;
@@ -47,7 +49,25 @@ struct ContentState {
     deletion: Option<EventKey>,
     pin: Option<Register<bool>>,
     quota_exempt: Option<Register<bool>>,
-    payload: Option<Register<Payload>>,
+    payload: Option<Register<PayloadSummary>>,
+}
+
+/// What the projection retains of a payload. The bytes stay in the operation
+/// log that carried them and are loaded only when an item is activated or
+/// previewed, so memory does not grow with the size of retained history.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct PayloadSummary {
+    descriptor: PayloadDescriptor,
+    text_preview: Option<String>,
+}
+
+impl PayloadSummary {
+    fn of(payload: &Payload) -> Self {
+        Self {
+            descriptor: payload.descriptor().clone(),
+            text_preview: payload.text_preview(),
+        }
+    }
 }
 
 impl ContentState {
@@ -148,15 +168,28 @@ impl TransferProjectionState {
     }
 }
 
-/// Read-only visible history entry. Payload bytes are accessible explicitly,
-/// while its Debug representation remains redacted by `Payload`.
-#[derive(Clone, Copy, Debug)]
+/// Read-only visible history entry. Only the payload descriptor and a short
+/// text excerpt are held here; the bytes are loaded from storage on demand.
+#[derive(Clone, Copy)]
 pub struct ContentView<'a> {
     content_id: ContentId,
     last_activity: EventKey,
     pinned: bool,
     quota_exempt: bool,
-    payload: Option<&'a Payload>,
+    payload: Option<&'a PayloadSummary>,
+}
+
+impl fmt::Debug for ContentView<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ContentView")
+            .field("content_id", &self.content_id)
+            .field("last_activity", &self.last_activity)
+            .field("pinned", &self.pinned)
+            .field("quota_exempt", &self.quota_exempt)
+            .field("descriptor", &self.descriptor())
+            .finish_non_exhaustive()
+    }
 }
 
 impl<'a> ContentView<'a> {
@@ -181,8 +214,15 @@ impl<'a> ContentView<'a> {
     }
 
     #[must_use]
-    pub const fn payload(self) -> Option<&'a Payload> {
+    pub fn descriptor(self) -> Option<&'a PayloadDescriptor> {
+        self.payload.map(|payload| &payload.descriptor)
+    }
+
+    /// Clipboard text excerpt; it is content, so it must never be logged.
+    #[must_use]
+    pub fn text_preview(self) -> Option<&'a str> {
         self.payload
+            .and_then(|payload| payload.text_preview.as_deref())
     }
 }
 
@@ -192,7 +232,6 @@ pub struct QuotaPlan {
     quota_bytes: u64,
     chargeable_bytes: u128,
     excluded_bytes: u128,
-    missing_payloads: Vec<ContentId>,
     evictions: Vec<ContentId>,
 }
 
@@ -210,11 +249,6 @@ impl QuotaPlan {
     #[must_use]
     pub const fn excluded_bytes(&self) -> u128 {
         self.excluded_bytes
-    }
-
-    #[must_use]
-    pub fn missing_payloads(&self) -> &[ContentId] {
-        &self.missing_payloads
     }
 
     #[must_use]

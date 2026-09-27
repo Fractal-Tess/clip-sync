@@ -16,7 +16,7 @@ const JSON_V1: u32 = 1;
 /// Encode/decode boundary for replication messages.
 ///
 /// Implementors must produce deterministic output for the same input so that
-/// content-integrity checks in the [`super::OpLog`] work correctly.
+/// stored and relayed copies of an operation compare equal byte for byte.
 pub trait Codec: Send + Sync {
     /// Serialize a stamped operation into raw bytes.
     ///

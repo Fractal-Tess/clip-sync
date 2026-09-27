@@ -1,7 +1,7 @@
 use super::super::{Operation, StampedOperation};
 use super::{
-    ApplyOutcome, ContentState, Projection, ProjectionError, Register, TransferMetadata,
-    TransferProjectionState, TransferTerminal, validate_setting, write_register,
+    ApplyOutcome, ContentState, PayloadSummary, Projection, ProjectionError, Register,
+    TransferMetadata, TransferProjectionState, TransferTerminal, validate_setting, write_register,
 };
 
 impl Projection {
@@ -55,7 +55,7 @@ impl Projection {
                     .entry(*content_id)
                     .or_insert_with(ContentState::new);
                 state.activity = Some(state.activity.map_or(event, |current| current.max(event)));
-                write_register(&mut state.payload, event, payload.clone());
+                write_register(&mut state.payload, event, PayloadSummary::of(payload));
                 write_register(&mut state.quota_exempt, event, false);
             }
             Operation::AddQuotaExempt {
@@ -67,7 +67,7 @@ impl Projection {
                     .entry(*content_id)
                     .or_insert_with(ContentState::new);
                 state.activity = Some(state.activity.map_or(event, |current| current.max(event)));
-                write_register(&mut state.payload, event, payload.clone());
+                write_register(&mut state.payload, event, PayloadSummary::of(payload));
                 write_register(&mut state.quota_exempt, event, true);
             }
             Operation::BeginShare {

@@ -8,7 +8,7 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 use clip_sync_core::{
-    model::{NodeId, Operation, SeenOps},
+    model::{NodeId, OpId, Operation, SeenOps, StampedOperation},
     replication::{Codec, JsonV1Codec},
 };
 
@@ -17,8 +17,8 @@ use super::super::protocol::{
     SyncResponse, read_message, validate_batch, write_message,
 };
 use super::{
-    CLOSE_FORGOTTEN, EXCHANGE_TIMEOUT, MAX_RECONCILE_ROUNDS, MeshError, PERSIST_TIMEOUT,
-    PersistBatch, RuntimeContext, bump_revision,
+    BatchRequest, CLOSE_FORGOTTEN, EXCHANGE_TIMEOUT, MAX_RECONCILE_ROUNDS, MeshError,
+    MeshStoreRequest, PERSIST_TIMEOUT, PersistBatch, RuntimeContext, bump_revision,
 };
 
 pub(super) async fn answer_sync(
@@ -147,17 +147,29 @@ async fn batch_for_peer(
     context: &RuntimeContext,
     peer_frontier: &SeenOps,
 ) -> Result<(Vec<u8>, Vec<u8>, Vec<Vec<u8>>, bool), MeshError> {
-    let state = context.state.read().await;
-    let batch = state.compute_batch(peer_frontier, &context.config.batch_limits);
-    let frontier = encode_frontier(state.seen())?;
-    let members = context.known_members.read().await;
-    let known_members = encode_membership(&members)?;
-    Ok((
-        frontier,
-        known_members,
-        batch.entries().to_vec(),
-        batch.has_more(),
-    ))
+    let (reply, completed) = oneshot::channel();
+    context
+        .store_tx
+        .send(MeshStoreRequest::Batch(BatchRequest {
+            remote: peer_frontier.clone(),
+            limits: context.config.batch_limits,
+            reply,
+        }))
+        .await
+        .map_err(|_| MeshError::PersistenceUnavailable)?;
+    let batch = timeout(PERSIST_TIMEOUT, completed)
+        .await
+        .map_err(|_| MeshError::PersistenceTimeout)?
+        .map_err(|_| MeshError::PersistenceUnavailable)?
+        .map_err(MeshError::PersistenceRejected)?;
+    let operations = batch
+        .operations
+        .iter()
+        .map(|operation| JsonV1Codec.encode_op(operation))
+        .collect::<Result<Vec<_>, _>>()?;
+    let frontier = encode_frontier(&*context.seen.read().await)?;
+    let known_members = encode_membership(&*context.known_members.read().await)?;
+    Ok((frontier, known_members, operations, batch.has_more))
 }
 
 pub(super) async fn persist_and_record(
@@ -167,63 +179,64 @@ pub(super) async fn persist_and_record(
     known_members: BTreeSet<NodeId>,
     operations: Vec<Vec<u8>>,
 ) -> Result<(), MeshError> {
-    let codec = JsonV1Codec;
-    let decoded = operations
-        .into_iter()
-        .map(|operation| {
-            let decoded = codec.decode_op(&operation)?;
-            let canonical = codec.encode_op(&decoded)?;
-            Ok((canonical, decoded))
-        })
-        .collect::<Result<Vec<_>, MeshError>>()?;
-    let operations = decoded
+    let operations = operations
         .iter()
-        .map(|(operation, _)| operation.clone())
-        .collect::<Vec<_>>();
+        .map(|operation| JsonV1Codec.decode_op(operation))
+        .collect::<Result<Vec<_>, _>>()?;
+    // The batch itself moves to the store; only what the runtime needs
+    // afterwards is kept, so large payloads are never held twice.
+    let received = operations
+        .iter()
+        .map(StampedOperation::id)
+        .collect::<Vec<OpId>>();
+    let forgotten = operations
+        .iter()
+        .filter_map(|operation| match operation.operation() {
+            Operation::ForgetDevice { node_id } => Some(*node_id),
+            _ => None,
+        })
+        .collect::<Vec<NodeId>>();
 
     let (reply, completed) = oneshot::channel();
     context
-        .persist_tx
-        .send(PersistBatch {
+        .store_tx
+        .send(MeshStoreRequest::Persist(PersistBatch {
             peer,
             peer_frontier,
             known_members: known_members.clone(),
-            operations: operations.clone(),
+            operations,
             reply,
-        })
+        }))
         .await
         .map_err(|_| MeshError::PersistenceUnavailable)?;
-    let persisted = timeout(PERSIST_TIMEOUT, completed)
+    timeout(PERSIST_TIMEOUT, completed)
         .await
         .map_err(|_| MeshError::PersistenceTimeout)?
         .map_err(|_| MeshError::PersistenceUnavailable)?
         .map_err(MeshError::PersistenceRejected)?;
 
-    let mut state = context.state.write().await;
-    for operation in &operations {
-        state.ingest_raw(operation, &JsonV1Codec)?;
+    let mut seen = context.seen.write().await;
+    for id in &received {
+        seen.record(*id);
     }
-    state.compact_log(persisted.compacted_operations());
-    drop(state);
+    drop(seen);
 
     let mut members = context.known_members.write().await;
     let mut changed = members.insert(peer);
     for member in known_members {
         changed |= members.insert(member);
     }
-    for (_, operation) in &decoded {
-        changed |= members.insert(operation.id().node());
+    for id in &received {
+        changed |= members.insert(id.node());
     }
     drop(members);
 
-    for (_, operation) in decoded {
-        if let Operation::ForgetDevice { node_id } = operation.operation() {
-            changed |= context.forgotten_devices.write().await.insert(*node_id);
-            if let Some(active) = context.registry.lock().await.remove(node_id) {
-                active
-                    .connection
-                    .close(CLOSE_FORGOTTEN.into(), b"device identity forgotten");
-            }
+    for node_id in forgotten {
+        changed |= context.forgotten_devices.write().await.insert(node_id);
+        if let Some(active) = context.registry.lock().await.remove(&node_id) {
+            active
+                .connection
+                .close(CLOSE_FORGOTTEN.into(), b"device identity forgotten");
         }
     }
 
@@ -232,7 +245,7 @@ pub(super) async fn persist_and_record(
     // and the mesh spins at full speed while idle. Each peer's task also wakes
     // the others, so the cost scales with the mesh. Signalling only real change
     // leaves the periodic tick as the floor for convergence.
-    if !operations.is_empty() || changed {
+    if !received.is_empty() || changed {
         bump_revision(&context.revision);
     }
     Ok(())

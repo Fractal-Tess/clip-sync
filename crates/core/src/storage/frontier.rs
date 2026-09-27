@@ -4,9 +4,7 @@ use rusqlite::{OptionalExtension, Transaction, TransactionBehavior};
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
-use crate::model::{
-    Acknowledgements, ContentId, NodeId, OpId, Projection, SeenOps, StampedOperation,
-};
+use crate::model::{Acknowledgements, ContentId, NodeId, OpId, Projection, SeenOps};
 
 use super::{EncryptedStorage, Result, StorageError, error::sqlite_integer};
 
@@ -115,17 +113,19 @@ impl EncryptedStorage {
         }
         let snapshot = serde_json::to_vec(projection.seen_ops())
             .map_err(StorageError::CompactedSeenSerialization)?;
-        let operations = self.load_operations()?;
-        let compacted = operations
-            .iter()
-            .filter(|operation| {
-                operation
-                    .operation()
-                    .content_id()
-                    .is_some_and(|content_id| content_ids.contains(&content_id))
-            })
-            .map(StampedOperation::id)
-            .collect::<Vec<_>>();
+        let mut compacted = Vec::new();
+        {
+            let mut statement = self.connection.prepare_cached(
+                "SELECT origin_node, counter FROM operations WHERE content_id = ?1",
+            )?;
+            for content_id in content_ids {
+                let mut rows = statement.query([&content_id.as_bytes()[..]])?;
+                while let Some(row) = rows.next()? {
+                    compacted.push(operation_id(&row.get::<_, Vec<u8>>(0)?, row.get(1)?)?);
+                }
+            }
+        }
+        compacted.sort_unstable();
 
         let transaction = self
             .connection
@@ -156,6 +156,15 @@ impl EncryptedStorage {
         transaction.commit()?;
         Ok(compacted)
     }
+}
+
+fn operation_id(node: &[u8], counter: i64) -> Result<OpId> {
+    let node = Uuid::from_slice(node)
+        .map(NodeId::from_uuid)
+        .map_err(|_| StorageError::CorruptOperation("origin node is not a UUID".to_owned()))?;
+    let counter = u64::try_from(counter)
+        .map_err(|_| StorageError::CorruptOperation("negative operation counter".to_owned()))?;
+    OpId::new(node, counter).map_err(|error| StorageError::CorruptOperation(error.to_string()))
 }
 
 pub(super) fn record_acknowledgement(

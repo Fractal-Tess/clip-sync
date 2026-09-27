@@ -326,6 +326,10 @@ fn serialize_operation(operation: &StampedOperation) -> Result<Zeroizing<Vec<u8>
         .map_err(StorageError::OperationSerialization)
 }
 
+pub(super) fn decode_stored_operation(encoded: &[u8]) -> Result<StampedOperation> {
+    serde_json::from_slice(encoded).map_err(StorageError::OperationDeserialization)
+}
+
 fn insert_serialized_operation(
     transaction: &Transaction<'_>,
     operation: &StampedOperation,
@@ -338,11 +342,15 @@ fn insert_serialized_operation(
         operation.timestamp().physical_millis(),
     )?;
     let logical = i64::from(operation.timestamp().logical());
+    let content_id = operation
+        .operation()
+        .content_id()
+        .map(|content_id| *content_id.as_bytes());
     let changed = transaction.execute(
         "INSERT INTO operations (
              origin_node, counter, hlc_physical_millis, hlc_logical,
-             encoding_version, payload
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             encoding_version, payload, content_id
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
          ON CONFLICT(origin_node, counter) DO NOTHING",
         (
             &node_bytes[..],
@@ -351,6 +359,7 @@ fn insert_serialized_operation(
             logical,
             OPERATION_ENCODING_VERSION,
             serialized,
+            content_id.as_ref().map(|bytes| &bytes[..]),
         ),
     )?;
 

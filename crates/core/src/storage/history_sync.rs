@@ -1,11 +1,17 @@
 use std::collections::BTreeSet;
 
 use crate::{
-    model::{Acknowledgements, ApplyOutcome, ContentId, NodeId, OpId, SeenOps, StampedOperation},
+    model::{
+        Acknowledgements, ApplyOutcome, ContentId, HlcTimestamp, NodeId, OpId, SeenOps,
+        StampedOperation,
+    },
     replica::Replica,
 };
 
-use super::history::{HistoryError, HistoryStore};
+use super::{
+    EncryptedStorage, Result as StorageResult,
+    history::{HistoryError, HistoryStore},
+};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CompactionReport {
@@ -50,14 +56,17 @@ impl HistoryStore {
         operation: &StampedOperation,
         now_millis: u64,
     ) -> std::result::Result<ApplyOutcome, HistoryError> {
-        let mut next = self.replica.clone();
-        let outcome = next.ingest(operation, now_millis)?;
+        let outcome = self.replica.ingest(operation, now_millis)?;
         if outcome == ApplyOutcome::Duplicate {
             return Ok(outcome);
         }
-        self.storage
-            .append_ingested_operation(operation, next.last_timestamp())?;
-        self.replica = next;
+        let persisted = self
+            .storage
+            .append_ingested_operation(operation, self.replica.last_timestamp());
+        if let Err(error) = persisted {
+            self.restore_from_storage()?;
+            return Err(error.into());
+        }
         Ok(outcome)
     }
 
@@ -73,15 +82,9 @@ impl HistoryStore {
         operations: &[StampedOperation],
         now_millis: u64,
     ) -> std::result::Result<Vec<ApplyOutcome>, HistoryError> {
-        let mut next = self.replica.clone();
-        let outcomes = operations
-            .iter()
-            .map(|operation| next.ingest(operation, now_millis))
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        self.storage
-            .append_remote_operations(operations, next.last_timestamp())?;
-        self.replica = next;
-        Ok(outcomes)
+        self.ingest_then_persist(operations, now_millis, |storage, observed| {
+            storage.append_remote_operations(operations, observed)
+        })
     }
 
     /// Ingests operations and the frontier/membership advertisement from the
@@ -119,20 +122,42 @@ impl HistoryStore {
             }
         }
 
-        let mut next = self.replica.clone();
+        self.ingest_then_persist(operations, now_millis, |storage, observed| {
+            storage.append_authenticated_peer_batch(
+                peer,
+                peer_frontier,
+                known_members,
+                operations,
+                observed,
+            )
+        })
+    }
+
+    /// Applies a batch to the live replica, then persists it. Every operation
+    /// is vetted before the first is applied, so a malformed or clock-skewed
+    /// peer cannot force a rebuild; only a failed write or an exhausted clock
+    /// falls back to reloading the replica from storage.
+    fn ingest_then_persist<T>(
+        &mut self,
+        operations: &[StampedOperation],
+        now_millis: u64,
+        persist: impl FnOnce(&mut EncryptedStorage, HlcTimestamp) -> StorageResult<T>,
+    ) -> std::result::Result<Vec<ApplyOutcome>, HistoryError> {
+        for operation in operations {
+            Replica::check_remote(operation, now_millis)?;
+        }
         let outcomes = operations
             .iter()
-            .map(|operation| next.ingest(operation, now_millis))
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        self.storage.append_authenticated_peer_batch(
-            peer,
-            peer_frontier,
-            known_members,
-            operations,
-            next.last_timestamp(),
-        )?;
-        self.replica = next;
-        Ok(outcomes)
+            .map(|operation| self.replica.ingest(operation, now_millis))
+            .collect::<std::result::Result<Vec<_>, _>>();
+        let result = outcomes.map_err(HistoryError::from).and_then(|outcomes| {
+            persist(&mut self.storage, self.replica.last_timestamp())?;
+            Ok(outcomes)
+        });
+        if result.is_err() {
+            self.restore_from_storage()?;
+        }
+        result
     }
 
     /// Monotonically persists a peer's anti-entropy acknowledgement.

@@ -3,19 +3,23 @@ use std::path::Path;
 use thiserror::Error;
 
 use crate::{
-    model::{ContentId, NodeId, Payload, Projection, SharedSetting, StampedOperation},
+    model::{
+        ContentId, NodeId, Operation, Payload, Projection, SeenOps, SharedSetting, StampedOperation,
+    },
     payload::{ManifestId, StoredManifest},
     replica::{Replica, ReplicaError},
+    replication::BatchLimits,
     transfer::TransferId,
 };
 
-use super::{EncryptedStorage, Result, StorageError, StorageKey};
+use super::{EncryptedStorage, OperationBatch, Result, StorageError, StorageKey};
 
 /// Crash-consistent owner of encrypted storage and its in-memory replica.
 ///
-/// Local mutations are authored against a clone, persisted transactionally,
-/// and only then published to the live in-memory state. Peer ingest similarly
-/// persists the HLC merge alongside the operation.
+/// Mutations are applied to the live replica and then persisted in one
+/// transaction. If authoring or persistence fails part-way, the replica is
+/// rebuilt from storage, so memory never disagrees with what survived on disk.
+/// Peer ingest persists the HLC merge alongside the operation.
 pub struct HistoryStore {
     pub(super) storage: EncryptedStorage,
     pub(super) replica: Replica,
@@ -345,22 +349,84 @@ impl HistoryStore {
         &mut self,
         author: impl FnOnce(&mut Replica) -> std::result::Result<StampedOperation, ReplicaError>,
     ) -> std::result::Result<StampedOperation, HistoryError> {
-        let mut next = self.replica.clone();
-        let operation = author(&mut next)?;
-        self.storage.append_local_operation(&operation)?;
-        self.replica = next;
-        Ok(operation)
+        self.commit_many(|replica| author(replica).map(|operation| vec![operation]))
+            .map(|mut operations| operations.remove(0))
     }
 
     fn commit_many(
         &mut self,
         author: impl FnOnce(&mut Replica) -> std::result::Result<Vec<StampedOperation>, ReplicaError>,
     ) -> std::result::Result<Vec<StampedOperation>, HistoryError> {
-        let mut next = self.replica.clone();
-        let operations = author(&mut next)?;
-        self.storage.append_local_operations(&operations)?;
-        self.replica = next;
-        Ok(operations)
+        let before = (self.replica.last_counter(), self.replica.last_timestamp());
+        let result = author(&mut self.replica)
+            .map_err(HistoryError::from)
+            .and_then(|operations| {
+                self.storage.append_local_operations(&operations)?;
+                Ok(operations)
+            });
+        if result.is_err() && (self.replica.last_counter(), self.replica.last_timestamp()) != before
+        {
+            self.restore_from_storage()?;
+        }
+        result
+    }
+
+    /// Replaces the live replica with the durable one after a mutation that
+    /// changed memory but did not commit.
+    pub(super) fn restore_from_storage(&mut self) -> std::result::Result<(), HistoryError> {
+        self.replica = self.storage.load_replica()?;
+        Ok(())
+    }
+
+    /// Loads the bytes of a retained item from the operation that carried
+    /// them. Returns `None` for items whose payload never arrived or that
+    /// travel as a manifest instead.
+    ///
+    /// # Errors
+    ///
+    /// Returns storage or decoding errors, or a corruption error when the
+    /// referenced operation no longer carries the expected payload.
+    pub fn load_payload(
+        &self,
+        content_id: ContentId,
+    ) -> std::result::Result<Option<Payload>, HistoryError> {
+        let Some(operation_id) = self.projection().payload_operation(content_id) else {
+            return Ok(None);
+        };
+        let operation = self.storage.load_operation(operation_id)?.ok_or_else(|| {
+            StorageError::CorruptOperation(format!(
+                "payload operation {operation_id} is missing from the log"
+            ))
+        })?;
+        match operation.operation() {
+            Operation::Add {
+                content_id: carried,
+                payload,
+            }
+            | Operation::AddQuotaExempt {
+                content_id: carried,
+                payload,
+            } if *carried == content_id => Ok(Some(payload.clone())),
+            _ => Err(StorageError::CorruptOperation(format!(
+                "operation {operation_id} does not carry the payload of {content_id}"
+            ))
+            .into()),
+        }
+    }
+
+    /// Operations the peer described by `remote` has not seen yet.
+    ///
+    /// # Errors
+    ///
+    /// Returns storage or decoding errors.
+    pub fn operation_batch(
+        &self,
+        remote: &SeenOps,
+        limits: &BatchLimits,
+    ) -> std::result::Result<OperationBatch, HistoryError> {
+        Ok(self
+            .storage
+            .operation_batch(self.projection().seen_ops(), remote, limits)?)
     }
 }
 

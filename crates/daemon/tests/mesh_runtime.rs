@@ -6,15 +6,13 @@ use std::{
 };
 
 use clip_sync_core::{
-    model::{NodeId, Operation, Payload, Representation, StampedOperation},
-    replica::Replica,
-    replication::{Codec, JsonV1Codec},
-    storage::{EncryptedStorage, HistoryStore, StorageKey},
+    model::{NodeId, Operation, Payload, Representation},
+    storage::{HistoryStore, StorageKey},
     transport::Psk,
 };
 use clip_sync_daemon::{
     discovery::{DiscoveredPeer, DiscoverySnapshot},
-    mesh::{MeshError, MeshHandle, MeshRuntime, MeshRuntimeConfig, PersistBatch, PersistResult},
+    mesh::{MeshError, MeshHandle, MeshRuntime, MeshRuntimeConfig, MeshStoreRequest, PersistBatch},
 };
 use tokio::{
     sync::{mpsc, oneshot},
@@ -57,43 +55,28 @@ impl TestNode {
         port: u16,
         forgotten_devices: std::collections::BTreeSet<NodeId>,
     ) -> Self {
-        let key = storage_key();
-        let storage = EncryptedStorage::open(path, &key).unwrap();
-        let metadata = storage.local_replica_metadata().unwrap();
-        let operations = storage.load_operations().unwrap();
-        let projection = storage.rebuild_projection().unwrap();
-        let replica = Replica::restore(
-            metadata.node_id(),
-            metadata.next_operation_counter() - 1,
-            metadata.last_hlc(),
-            projection,
-        );
+        let history = HistoryStore::open(path, &storage_key()).unwrap();
+        let node_id = history.replica().node_id();
         let shutdown = CancellationToken::new();
-        let mut config = MeshRuntimeConfig::new(metadata.node_id(), address.to_string(), port);
+        let mut config = MeshRuntimeConfig::new(node_id, address.to_string(), port);
         config.reconcile_interval = Duration::from_millis(75);
         config.reconnect_min = Duration::from_millis(25);
         config.reconnect_max = Duration::from_millis(200);
-        config.initial_seen = replica.projection().seen_ops().clone();
+        config.initial_seen = history.projection().seen_ops().clone();
         config.forgotten_devices = forgotten_devices;
-        let (runtime, persist) = MeshRuntime::spawn(
-            config,
-            Psk::new(&PSK).unwrap(),
-            &operations,
-            shutdown.clone(),
-        )
-        .unwrap();
+        let (runtime, store) =
+            MeshRuntime::spawn(config, Psk::new(&PSK).unwrap(), shutdown.clone()).unwrap();
         let handle = runtime.handle();
         let (commands, command_rx) = mpsc::channel(16);
         let worker = tokio::spawn(run_storage_worker(
-            storage,
-            replica,
+            history,
             handle.clone(),
-            persist,
+            store,
             command_rx,
             shutdown.clone(),
         ));
         Self {
-            node_id: metadata.node_id(),
+            node_id,
             address,
             port,
             handle,
@@ -142,33 +125,31 @@ impl TestNode {
 }
 
 async fn run_storage_worker(
-    mut storage: EncryptedStorage,
-    mut replica: Replica,
+    mut history: HistoryStore,
     mesh: MeshHandle,
-    mut persist: mpsc::Receiver<PersistBatch>,
+    mut store: mpsc::Receiver<MeshStoreRequest>,
     mut commands: mpsc::Receiver<NodeCommand>,
     shutdown: CancellationToken,
 ) {
     loop {
         tokio::select! {
             () = shutdown.cancelled() => break,
-            request = persist.recv() => {
+            request = store.recv() => {
                 let Some(request) = request else {
                     break;
                 };
-                let result = persist_remote(
-                    request.operations(),
-                    request.peer(),
-                    request.peer_frontier(),
-                    request.known_members(),
-                    &mut storage,
-                    &mut replica,
-                );
-                request.complete(
-                    result
-                        .map(|()| PersistResult::default())
-                        .map_err(|error| error.to_string()),
-                );
+                match request {
+                    MeshStoreRequest::Persist(batch) => {
+                        let result = persist_remote(&batch, &mut history);
+                        batch.complete(result.map_err(|error| error.to_string()));
+                    }
+                    MeshStoreRequest::Batch(request) => {
+                        let result = history
+                            .operation_batch(request.remote(), request.limits())
+                            .map_err(|error| error.to_string());
+                        request.complete(result);
+                    }
+                }
             }
             command = commands.recv() => {
                 let Some(command) = command else {
@@ -180,15 +161,12 @@ async fn run_storage_worker(
                             &CONTENT_KEY,
                             vec![Representation::new("text/plain", text.into_bytes())],
                         ).unwrap();
-                        let mut next = replica.clone();
-                        let operation = next.copy(payload, now_millis()).unwrap();
-                        storage.append_local_operation(&operation).unwrap();
-                        replica = next;
+                        let operation = history.copy(payload, now_millis()).unwrap();
                         mesh.record_local(&operation).await.unwrap();
                         let _ = reply.send(());
                     }
                     NodeCommand::VisibleCount { reply } => {
-                        let _ = reply.send(replica.projection().visible_items().len());
+                        let _ = reply.send(history.projection().visible_items().len());
                     }
                 }
             }
@@ -196,36 +174,19 @@ async fn run_storage_worker(
     }
 }
 
-fn persist_remote(
-    raw_operations: &[Vec<u8>],
-    peer: NodeId,
-    peer_frontier: &clip_sync_core::model::SeenOps,
-    known_members: &std::collections::BTreeSet<NodeId>,
-    storage: &mut EncryptedStorage,
-    replica: &mut Replica,
-) -> anyhow::Result<()> {
-    let codec = JsonV1Codec;
-    let operations = raw_operations
-        .iter()
-        .map(|raw| codec.decode_op(raw))
-        .collect::<Result<Vec<StampedOperation>, _>>()?;
-    for operation in &operations {
+fn persist_remote(batch: &PersistBatch, history: &mut HistoryStore) -> anyhow::Result<()> {
+    for operation in batch.operations() {
         if let Operation::Add { payload, .. } = operation.operation() {
             payload.validate(&CONTENT_KEY)?;
         }
     }
-    let mut next = replica.clone();
-    for operation in &operations {
-        next.ingest(operation, now_millis())?;
-    }
-    storage.append_authenticated_peer_batch(
-        peer,
-        peer_frontier,
-        known_members,
-        &operations,
-        next.last_timestamp(),
+    history.ingest_authenticated_batch(
+        batch.peer(),
+        batch.peer_frontier(),
+        batch.known_members(),
+        batch.operations(),
+        now_millis(),
     )?;
-    *replica = next;
     Ok(())
 }
 
@@ -380,12 +341,7 @@ async fn three_nodes_store_forward_with_origin_offline_and_later_converge() {
 async fn runtime_rejects_control_characters_in_logged_hostname() {
     let config = MeshRuntimeConfig::new(NodeId::new(), "peer\nforged-log-line", 24_892);
     assert!(matches!(
-        MeshRuntime::spawn(
-            config,
-            Psk::new(&PSK).unwrap(),
-            &[],
-            CancellationToken::new()
-        ),
+        MeshRuntime::spawn(config, Psk::new(&PSK).unwrap(), CancellationToken::new()),
         Err(MeshError::InvalidHostname)
     ));
 }

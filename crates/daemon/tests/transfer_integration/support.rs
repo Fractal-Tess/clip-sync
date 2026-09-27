@@ -115,13 +115,9 @@ pub(super) fn spawn_mesh(
     drop(socket);
     let shutdown = CancellationToken::new();
     let config = MeshRuntimeConfig::new(node_id, "automatic-capture-test".to_owned(), port);
-    let (runtime, _persist, _chunks) = MeshRuntime::spawn_with_transfers(
-        config,
-        Psk::new(&PSK).expect("PSK"),
-        &[],
-        shutdown.clone(),
-    )
-    .expect("mesh runtime");
+    let (runtime, _persist, _chunks) =
+        MeshRuntime::spawn_with_transfers(config, Psk::new(&PSK).expect("PSK"), shutdown.clone())
+            .expect("mesh runtime");
     let handle = runtime.handle();
     (runtime, handle, shutdown)
 }

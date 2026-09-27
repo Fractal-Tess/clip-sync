@@ -6,12 +6,11 @@ use std::{
 };
 
 use clip_sync_core::{
-    model::{ContentId, Operation, Payload, Representation, StampedOperation},
+    model::{ContentId, Operation, Payload, Representation},
     payload::{
         ChunkStore, ChunkStoreConfig, ChunkStoreKey, ExplicitSharePolicy, Materializer,
         MaterializerConfig,
     },
-    replication::{Codec, JsonV1Codec},
     storage::{HistoryStore, StorageKey},
     transfer::{TransferCoordinator, TransferPhase, TransferStateLimits},
     transport::Psk,
@@ -19,7 +18,8 @@ use clip_sync_core::{
 use clip_sync_daemon::{
     discovery::{DiscoveredPeer, DiscoverySnapshot},
     mesh::{
-        MeshChunkCommand, MeshHandle, MeshRuntime, MeshRuntimeConfig, PersistBatch, PersistResult,
+        MeshChunkCommand, MeshHandle, MeshRuntime, MeshRuntimeConfig, MeshStoreRequest,
+        PersistBatch,
     },
 };
 use tokio::{
@@ -63,7 +63,6 @@ impl RuntimeNode {
             &StorageKey::from_bytes(STORAGE_KEY),
         )
         .expect("history");
-        let operations = history.storage().load_operations().expect("operations");
         let store = ChunkStore::open(
             root.join("chunks"),
             &ChunkStoreKey::from_bytes(CHUNK_KEY),
@@ -104,10 +103,10 @@ impl RuntimeNode {
         config.reconnect_min = Duration::from_millis(20);
         config.reconnect_max = Duration::from_millis(100);
         config.max_concurrent_chunk_streams = 2;
+        config.initial_seen = history.projection().seen_ops().clone();
         let (runtime, persist, chunks) = MeshRuntime::spawn_with_transfers(
             config,
             Psk::new(&PSK).expect("PSK"),
-            &operations,
             shutdown.clone(),
         )
         .expect("mesh runtime");
@@ -179,7 +178,7 @@ async fn run_worker(
     mut history: HistoryStore,
     mut transfers: TransferCoordinator,
     mesh: MeshHandle,
-    mut persist: mpsc::Receiver<PersistBatch>,
+    mut persist: mpsc::Receiver<MeshStoreRequest>,
     mut chunks: mpsc::Receiver<MeshChunkCommand>,
     mut commands: mpsc::Receiver<Command>,
     shutdown: CancellationToken,
@@ -187,13 +186,23 @@ async fn run_worker(
     loop {
         tokio::select! {
             () = shutdown.cancelled() => break,
-            batch = persist.recv() => {
-                let Some(batch) = batch else { break };
-                let result = persist_batch(&batch, &mut history, &mut transfers);
-                if result.is_ok() {
-                    mesh.notify_transfers();
+            request = persist.recv() => {
+                let Some(request) = request else { break };
+                match request {
+                    MeshStoreRequest::Persist(batch) => {
+                        let result = persist_batch(&batch, &mut history, &mut transfers);
+                        if result.is_ok() {
+                            mesh.notify_transfers();
+                        }
+                        batch.complete(result.map_err(|error| error.to_string()));
+                    }
+                    MeshStoreRequest::Batch(request) => {
+                        let result = history
+                            .operation_batch(request.remote(), request.limits())
+                            .map_err(|error| error.to_string());
+                        request.complete(result);
+                    }
                 }
-                batch.complete(result.map_err(|error| error.to_string()));
             }
             command = chunks.recv() => {
                 let Some(command) = command else { break };
@@ -249,14 +258,9 @@ fn persist_batch(
     batch: &PersistBatch,
     history: &mut HistoryStore,
     transfers: &mut TransferCoordinator,
-) -> anyhow::Result<PersistResult> {
-    let codec = JsonV1Codec;
-    let operations = batch
-        .operations()
-        .iter()
-        .map(|operation| codec.decode_op(operation))
-        .collect::<Result<Vec<StampedOperation>, _>>()?;
-    for operation in &operations {
+) -> anyhow::Result<()> {
+    let operations = batch.operations();
+    for operation in operations {
         if let Operation::Add { payload, .. } | Operation::AddQuotaExempt { payload, .. } =
             operation.operation()
         {
@@ -267,11 +271,11 @@ fn persist_batch(
         batch.peer(),
         batch.peer_frontier(),
         batch.known_members(),
-        &operations,
+        operations,
         10_000,
     )?;
     transfers.reconcile_projection(history.projection())?;
-    Ok(PersistResult::default())
+    Ok(())
 }
 
 fn handle_chunk_command(

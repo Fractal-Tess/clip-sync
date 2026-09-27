@@ -4,140 +4,121 @@ use super::support::*;
 
 #[test]
 fn batch_never_exceeds_max_ops() {
-    let codec = JsonV1Codec;
     let n = node(1);
-
-    let mut state = AntiEntropyState::new();
-    for i in 1..=50 {
-        let op = make_add(n, i, format!("op{i}").as_bytes());
-        state.record_local(&op, &codec).unwrap();
-    }
+    let mut peer = Peer::new();
+    let operations = (1..=50)
+        .map(|i| make_add(n, i, format!("op{i}").as_bytes()))
+        .collect::<Vec<_>>();
+    peer.receive(&operations);
 
     for max_ops in [1, 5, 10, 25, 50] {
         let limits = BatchLimits {
             max_ops,
             max_bytes: usize::MAX,
         };
-        let batch = state.compute_batch(&SeenOps::default(), &limits);
-        assert!(batch.len() <= max_ops);
-        if max_ops < 50 {
-            assert!(batch.has_more());
-        }
+        let batch = peer.batch_for(&SeenOps::default(), &limits);
+        assert!(batch.operations.len() <= max_ops);
+        assert_eq!(batch.has_more, max_ops < 50);
     }
 }
 
 #[test]
 fn batch_respects_byte_budget() {
-    let codec = JsonV1Codec;
     let n = node(1);
+    let mut peer = Peer::new();
+    let operations = (1..=20)
+        .map(|i| make_add(n, i, format!("{i:0>200}").as_bytes()))
+        .collect::<Vec<_>>();
+    peer.receive(&operations);
 
-    let mut state = AntiEntropyState::new();
-    for i in 1..=20 {
-        let op = make_add(n, i, &[b'a'; 200]);
-        state.record_local(&op, &codec).unwrap();
-    }
+    let one = peer.batch_for(
+        &SeenOps::default(),
+        &BatchLimits {
+            max_ops: usize::MAX,
+            max_bytes: 1,
+        },
+    );
+    assert_eq!(
+        one.operations.len(),
+        1,
+        "the first operation is always sent, even over budget"
+    );
+    assert!(one.has_more);
 
-    let per_op_size = state.log().get(OpId::new(n, 1).unwrap()).unwrap().len();
-
-    let limits = BatchLimits {
-        max_ops: usize::MAX,
-        max_bytes: per_op_size * 5 + 1,
-    };
-    let batch = state.compute_batch(&SeenOps::default(), &limits);
-    assert_eq!(batch.len(), 5);
-    assert!(batch.has_more());
-    assert!(batch.total_bytes() <= limits.max_bytes);
+    let all = peer.batch_for(&SeenOps::default(), &BatchLimits::default());
+    assert_eq!(all.operations.len(), 20);
+    assert!(!all.has_more);
 }
 
 #[test]
 fn pagination_delivers_all_ops_across_batches() {
-    let codec = JsonV1Codec;
     let n = node(1);
     let total_ops = 25;
+    let mut sender = Peer::new();
+    let operations = (1..=total_ops)
+        .map(|i| make_add(n, i, format!("op{i}").as_bytes()))
+        .collect::<Vec<_>>();
+    sender.receive(&operations);
 
-    let mut sender = AntiEntropyState::new();
-    for i in 1..=total_ops {
-        let op = make_add(n, i, format!("op{i}").as_bytes());
-        sender.record_local(&op, &codec).unwrap();
-    }
-
-    let mut receiver = AntiEntropyState::new();
-    let mut p_receiver = Projection::default();
+    let mut receiver = Peer::new();
     let limits = BatchLimits {
         max_ops: 7,
         max_bytes: usize::MAX,
     };
-
     let mut rounds = 0;
-    loop {
-        let batch = sender.compute_batch(receiver.seen(), &limits);
-        if batch.is_empty() {
-            break;
-        }
-        for entry in batch.entries() {
-            ingest_and_apply(&mut receiver, &mut p_receiver, entry, &codec);
-        }
+    while sync_batch(&sender, &mut receiver, &limits) > 0 {
         rounds += 1;
         assert!(rounds <= 10, "should converge within bounded rounds");
     }
 
-    assert_eq!(receiver.log().len(), total_ops as usize);
-    assert!(rounds >= 4); // ceil(25/7) = 4
+    assert_eq!(receiver.operations().len(), total_ops as usize);
+    assert_eq!(rounds, 4); // ceil(25/7)
+    assert_eq!(receiver.projection(), sender.projection());
+}
+
+#[test]
+fn batch_skips_operations_the_peer_holds_above_a_gap() {
+    let n = node(1);
+    let mut sender = Peer::new();
+    let operations = (1..=5)
+        .map(|i| make_add(n, i, format!("op{i}").as_bytes()))
+        .collect::<Vec<_>>();
+    sender.receive(&operations);
+
+    let mut receiver = Peer::new();
+    receiver.receive(&[operations[0].clone(), operations[3].clone()]);
+
+    let batch = sender.batch_for(receiver.seen(), &BatchLimits::default());
+    let counters = batch
+        .operations
+        .iter()
+        .map(|operation| operation.id().counter())
+        .collect::<Vec<_>>();
+    assert_eq!(counters, vec![2, 3, 5]);
 }
 
 // ── No false gap acknowledgment ────────────────────────────────────────
 
 #[test]
 fn does_not_falsely_acknowledge_gaps() {
-    let codec = JsonV1Codec;
     let n = node(1);
-
-    let mut sender = AntiEntropyState::new();
+    let mut sender = Peer::new();
     // Sender has ops 1, 2, 4, 5 (missing 3)
-    for i in [1, 2, 4, 5] {
-        let op = make_add(n, i, format!("op{i}").as_bytes());
-        sender.record_local(&op, &codec).unwrap();
-    }
+    let operations = [1, 2, 4, 5]
+        .into_iter()
+        .map(|i| make_add(n, i, format!("op{i}").as_bytes()))
+        .collect::<Vec<_>>();
+    sender.receive(&operations);
 
-    let batch = sender.compute_batch(&SeenOps::default(), &BatchLimits::default());
-    assert_eq!(batch.len(), 4);
+    let batch = sender.batch_for(&SeenOps::default(), &BatchLimits::default());
+    assert_eq!(batch.operations.len(), 4);
 
-    // Receiver ingests the batch
-    let mut receiver = AntiEntropyState::new();
-    let mut p_receiver = Projection::default();
-    for entry in batch.entries() {
-        ingest_and_apply(&mut receiver, &mut p_receiver, entry, &codec);
-    }
+    let mut receiver = Peer::new();
+    receiver.receive(&batch.operations);
 
-    // Receiver's frontier for this node should be 2 (not 5), because op 3 is missing
+    // The frontier stops at 2 because op 3 is missing; 4 and 5 are sparse.
     assert_eq!(receiver.seen().frontier(n), 2);
-    // Ops 4 and 5 are in the sparse gap set
     assert!(receiver.seen().contains(OpId::new(n, 4).unwrap()));
     assert!(receiver.seen().contains(OpId::new(n, 5).unwrap()));
     assert!(!receiver.seen().contains(OpId::new(n, 3).unwrap()));
-}
-
-// ── Missing-locally detection ──────────────────────────────────────────
-
-#[test]
-fn missing_locally_identifies_needed_ops() {
-    let codec = JsonV1Codec;
-    let n = node(1);
-
-    let mut remote = AntiEntropyState::new();
-    for i in 1..=10 {
-        let op = make_add(n, i, format!("op{i}").as_bytes());
-        remote.record_local(&op, &codec).unwrap();
-    }
-
-    let mut local = AntiEntropyState::new();
-    // Local only has 1-5
-    for i in 1..=5 {
-        let op = make_add(n, i, format!("op{i}").as_bytes());
-        local.record_local(&op, &codec).unwrap();
-    }
-
-    let missing = local.missing_locally(remote.seen());
-    let counters: Vec<u64> = missing.iter().map(|id| id.counter()).collect();
-    assert_eq!(counters, vec![6, 7, 8, 9, 10]);
 }

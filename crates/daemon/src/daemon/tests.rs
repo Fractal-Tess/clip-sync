@@ -274,7 +274,7 @@ fn spawn_mesh(node_id: NodeId) -> (MeshRuntime, MeshHandle, CancellationToken) {
     let shutdown = CancellationToken::new();
     let config = MeshRuntimeConfig::new(node_id, "test-node".to_owned(), port);
     let (runtime, _persist, _chunks) =
-        MeshRuntime::spawn_with_transfers(config, Psk::new(&PSK).unwrap(), &[], shutdown.clone())
+        MeshRuntime::spawn_with_transfers(config, Psk::new(&PSK).unwrap(), shutdown.clone())
             .unwrap();
     let mesh = runtime.handle();
     (runtime, mesh, shutdown)

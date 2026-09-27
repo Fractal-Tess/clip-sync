@@ -58,8 +58,6 @@ pub enum MeshError {
     Protocol(#[from] ProtocolError),
     #[error(transparent)]
     Codec(#[from] clip_sync_core::replication::CodecError),
-    #[error(transparent)]
-    Replication(#[from] clip_sync_core::replication::AntiEntropyError),
     #[error("QUIC connection failed: {0}")]
     Connection(#[from] quinn::ConnectionError),
     #[error("could not finish a QUIC stream: {0}")]

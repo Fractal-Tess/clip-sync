@@ -56,7 +56,7 @@ fn version_one_database_migrates_and_keeps_its_new_replica_identity() {
         let storage = EncryptedStorage::open(&path, &key).unwrap();
         assert_eq!(
             storage.meta_value("schema_version").unwrap().as_deref(),
-            Some("4")
+            Some("5")
         );
         assert!(storage.load_operations().unwrap().is_empty());
         storage.replica_metadata().unwrap()
@@ -64,6 +64,66 @@ fn version_one_database_migrates_and_keeps_its_new_replica_identity() {
 
     let storage = EncryptedStorage::open(&path, &key).unwrap();
     assert_eq!(storage.replica_metadata().unwrap(), metadata);
+}
+
+#[test]
+fn version_four_database_backfills_operation_content_ids() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let path = temp_dir.path().join("content-index.db");
+    let key_bytes = [29_u8; 32];
+    let key = StorageKey::from_bytes(key_bytes);
+    let payload = Payload::new(
+        &[3; 32],
+        vec![Representation::new("text/plain", b"indexed".to_vec())],
+    )
+    .unwrap();
+    let content_id = payload.descriptor().content_id();
+    let add = {
+        let mut storage = EncryptedStorage::open(&path, &key).unwrap();
+        let metadata = storage.replica_metadata().unwrap();
+        let add = StampedOperation::new(
+            OpId::new(metadata.node_id(), metadata.next_operation_counter()).unwrap(),
+            HlcTimestamp::new(1_000, 0),
+            Operation::Add {
+                content_id,
+                payload,
+            },
+        );
+        storage.append_local_operation(&add).unwrap();
+        storage.close().unwrap();
+        add
+    };
+
+    // Rewind the database to schema 4, before operations carried the column.
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute_batch(&format!(
+            "PRAGMA key = \"x'{}'\";
+             DROP INDEX operations_content;
+             ALTER TABLE operations DROP COLUMN content_id;
+             UPDATE storage_meta SET value = '4' WHERE key = 'schema_version';
+             PRAGMA user_version = 4;",
+            hex::encode(key_bytes)
+        ))
+        .unwrap();
+    connection.close().unwrap();
+
+    let storage = EncryptedStorage::open(&path, &key).unwrap();
+    assert_eq!(
+        storage.meta_value("schema_version").unwrap().as_deref(),
+        Some("5")
+    );
+    assert_eq!(storage.load_operations().unwrap(), vec![add]);
+    storage.close().unwrap();
+
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute_batch(&format!("PRAGMA key = \"x'{}'\";", hex::encode(key_bytes)))
+        .unwrap();
+    let indexed: Vec<u8> = connection
+        .query_row("SELECT content_id FROM operations", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(indexed, content_id.as_bytes());
 }
 
 #[test]

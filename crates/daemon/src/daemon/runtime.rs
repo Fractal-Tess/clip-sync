@@ -28,7 +28,9 @@ use super::{
     clipboard::{handle_clipboard_event, spawn_clipboard_watch},
     commands::handle_daemon_command,
     config_supervision::{apply_config_reload, initialize_shared_settings, spawn_config_watch},
-    mesh_persistence::{MeshPersistenceContext, handle_mesh_batch, handle_mesh_chunk_command},
+    mesh_persistence::{
+        MeshPersistenceContext, handle_mesh_chunk_command, handle_mesh_store_request,
+    },
     views::{device_items, history_items},
 };
 
@@ -62,10 +64,6 @@ pub async fn run(paths: AppPaths, mut config: Config) -> anyhow::Result<()> {
         .with_context(|| format!("open encrypted history at {}", storage_path.display()))?;
     initialize_shared_settings(&mut history, &paths.config, &mut config)
         .context("reconcile shared mesh settings with config")?;
-    let persisted_operations = history
-        .storage()
-        .load_operations()
-        .context("load mesh operation log")?;
 
     let content_key = state_keys.content_identity_key();
     let transport_psk = mesh_secret
@@ -155,13 +153,9 @@ pub async fn run(paths: AppPaths, mut config: Config) -> anyhow::Result<()> {
         .chain(std::iter::once(history.replica().node_id()))
         .collect();
     mesh_config.forgotten_devices = history.projection().forgotten_devices().collect();
-    let (mesh, mut mesh_rx, mut mesh_chunk_rx) = MeshRuntime::spawn_with_transfers(
-        mesh_config,
-        transport_psk,
-        &persisted_operations,
-        shutdown.clone(),
-    )
-    .context("start mesh runtime")?;
+    let (mesh, mut mesh_rx, mut mesh_chunk_rx) =
+        MeshRuntime::spawn_with_transfers(mesh_config, transport_psk, shutdown.clone())
+            .context("start mesh runtime")?;
     let mesh_handle = mesh.handle();
     state.set_mesh(mesh_handle.clone()).await;
     let discovery = spawn_discovery(
@@ -280,8 +274,8 @@ pub async fn run(paths: AppPaths, mut config: Config) -> anyhow::Result<()> {
                     ).await?;
                 }
             }
-            batch = mesh_rx.recv() => {
-                if let Some(batch) = batch {
+            request = mesh_rx.recv() => {
+                if let Some(request) = request {
                     let mut context = MeshPersistenceContext {
                         history: &mut history,
                         state: &state,
@@ -292,7 +286,7 @@ pub async fn run(paths: AppPaths, mut config: Config) -> anyhow::Result<()> {
                         config: &mut config,
                         transfers: &mut transfers,
                     };
-                    handle_mesh_batch(batch, &mut context).await;
+                    handle_mesh_store_request(request, &mut context).await;
                 }
             }
             changed = config_rx.recv() => {

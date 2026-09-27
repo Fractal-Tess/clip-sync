@@ -24,7 +24,10 @@ pub(super) fn image_preview(
         anyhow::bail!("history item is deleted");
     }
 
-    let (mime_type, bytes) = if let Some(payload) = history.projection().payload(content_id) {
+    let payload = history
+        .load_payload(content_id)
+        .context("load image payload")?;
+    let (mime_type, bytes) = if let Some(payload) = payload {
         let representation = payload
             .representations()
             .iter()

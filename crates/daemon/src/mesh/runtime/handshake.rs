@@ -60,7 +60,7 @@ pub(super) async fn exchange_identity(
 }
 
 async fn local_identity(context: &RuntimeContext) -> Result<IdentityHello, MeshError> {
-    let frontier = encode_frontier(context.state.read().await.seen())?;
+    let frontier = encode_frontier(&*context.seen.read().await)?;
     let members = context.known_members.read().await;
     let known_members = encode_membership(&members)?;
     Ok(IdentityHello {

@@ -6,6 +6,6 @@ mod runtime;
 pub const MESH_PROTOCOL_VERSION: u32 = protocol::PROTOCOL_VERSION;
 
 pub use runtime::{
-    MeshChunkCommand, MeshError, MeshHandle, MeshRuntime, MeshRuntimeConfig, MeshRuntimeStatus,
-    PersistBatch, PersistResult,
+    BatchRequest, MeshChunkCommand, MeshError, MeshHandle, MeshRuntime, MeshRuntimeConfig,
+    MeshRuntimeStatus, MeshStoreRequest, PersistBatch,
 };

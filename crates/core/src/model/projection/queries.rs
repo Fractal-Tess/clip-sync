@@ -4,8 +4,8 @@ use crate::{
 };
 
 use super::super::{
-    ContentId, EffectiveSharedSettings, EventKey, NodeId, Payload, SeenOps, SettingValue,
-    SharedSetting,
+    ContentId, EffectiveSharedSettings, EventKey, NodeId, OpId, PayloadDescriptor, SeenOps,
+    SettingValue, SharedSetting,
 };
 use super::{ContentState, ContentView, Projection, QuotaPlan, TransferView, transfer_view};
 
@@ -37,11 +37,21 @@ impl Projection {
     }
 
     #[must_use]
-    pub fn payload(&self, content_id: ContentId) -> Option<&Payload> {
+    pub fn payload_descriptor(&self, content_id: ContentId) -> Option<&PayloadDescriptor> {
         self.content
             .get(&content_id)
             .and_then(|state| state.payload.as_ref())
-            .map(|payload| &payload.value)
+            .map(|payload| &payload.value.descriptor)
+    }
+
+    /// The operation whose payload won the content's register. Storage reads
+    /// the bytes from that operation when the item is activated or previewed.
+    #[must_use]
+    pub fn payload_operation(&self, content_id: ContentId) -> Option<OpId> {
+        self.content
+            .get(&content_id)
+            .and_then(|state| state.payload.as_ref())
+            .map(|payload| payload.event.operation_id())
     }
 
     #[must_use]
@@ -198,19 +208,19 @@ impl Projection {
     pub fn quota_plan(&self, quota_bytes: u64) -> QuotaPlan {
         let mut chargeable_bytes = 0_u128;
         let mut excluded_bytes = 0_u128;
-        let mut missing_payloads = Vec::new();
         let mut candidates = Vec::new();
 
         for (content_id, state) in &self.content {
             if !self.content_is_visible(*content_id, state) {
                 continue;
             }
-            let size = if let Some(payload) = state.payload.as_ref().map(|payload| &payload.value) {
-                u128::from(payload.descriptor().logical_size())
+            let size = if let Some(payload) = state.payload.as_ref() {
+                u128::from(payload.value.descriptor.logical_size())
             } else if let Some((_, _, manifest)) = self.manifest_for_content(*content_id) {
                 u128::from(manifest.logical_size())
             } else {
-                missing_payloads.push(*content_id);
+                // A touch or pin overtook its add; the size is unknown
+                // until the add arrives, so the item is not charged yet.
                 continue;
             };
             if state.is_pinned() || state.is_quota_exempt() {
@@ -240,7 +250,6 @@ impl Projection {
             quota_bytes,
             chargeable_bytes,
             excluded_bytes,
-            missing_payloads,
             evictions,
         }
     }

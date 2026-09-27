@@ -1,4 +1,4 @@
-use clip_sync_core::{model::Payload, replica::Replica, storage::HistoryStore};
+use clip_sync_core::{model::PayloadDescriptor, replica::Replica, storage::HistoryStore};
 use clip_sync_ipc::protocol::{DeviceItem, HistoryItem};
 
 pub(super) fn history_items(replica: &Replica) -> Vec<HistoryItem> {
@@ -7,9 +7,9 @@ pub(super) fn history_items(replica: &Replica) -> Vec<HistoryItem> {
         .visible_items()
         .into_iter()
         .map(|view| {
-            let payload = view.payload();
-            let mime_types = payload.map_or_else(Vec::new, |payload| {
-                payload
+            let descriptor = view.descriptor();
+            let mime_types = descriptor.map_or_else(Vec::new, |descriptor| {
+                descriptor
                     .representations()
                     .iter()
                     .map(|representation| representation.mime().to_owned())
@@ -33,9 +33,9 @@ pub(super) fn history_items(replica: &Replica) -> Vec<HistoryItem> {
             } else {
                 mime_types
             };
-            let logical_size = payload.map_or_else(
+            let logical_size = descriptor.map_or_else(
                 || transfer.map_or(0, |(_, _, manifest)| manifest.logical_size()),
-                |payload| payload.descriptor().logical_size(),
+                PayloadDescriptor::logical_size,
             );
             let origin = replica
                 .projection()
@@ -43,7 +43,7 @@ pub(super) fn history_items(replica: &Replica) -> Vec<HistoryItem> {
                 .unwrap_or_else(|| view.last_activity());
             HistoryItem {
                 content_id: view.content_id().to_string(),
-                preview: payload.map_or_else(
+                preview: descriptor.map_or_else(
                     || {
                         transfer.map_or_else(
                             || "Unavailable payload".to_owned(),
@@ -56,7 +56,10 @@ pub(super) fn history_items(replica: &Replica) -> Vec<HistoryItem> {
                             },
                         )
                     },
-                    history_preview,
+                    |descriptor| {
+                        view.text_preview()
+                            .map_or_else(|| binary_preview(descriptor), str::to_owned)
+                    },
                 ),
                 mime_types,
                 logical_size,
@@ -91,33 +94,10 @@ pub(super) fn device_items(history: &HistoryStore) -> Vec<DeviceItem> {
         .collect()
 }
 
-fn history_preview(payload: &Payload) -> String {
-    if let Some(text) = payload
-        .representations()
-        .iter()
-        .find(|representation| representation.mime().starts_with("text/plain"))
-    {
-        let decoded = String::from_utf8_lossy(text.bytes());
-        let mut preview = decoded
-            .chars()
-            .map(|character| {
-                if character.is_control() {
-                    ' '
-                } else {
-                    character
-                }
-            })
-            .take(160)
-            .collect::<String>();
-        if decoded.chars().count() > 160 {
-            preview.push('…');
-        }
-        return preview;
-    }
-
-    let mime = payload
+fn binary_preview(descriptor: &PayloadDescriptor) -> String {
+    let mime = descriptor
         .representations()
         .first()
         .map_or("unknown", |representation| representation.mime());
-    format!("{mime} · {} bytes", payload.descriptor().logical_size())
+    format!("{mime} · {} bytes", descriptor.logical_size())
 }

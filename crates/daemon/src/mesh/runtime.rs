@@ -13,8 +13,9 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 use clip_sync_core::{
-    model::{NodeId, OpId, Operation, SeenOps, StampedOperation},
-    replication::{AntiEntropyState, BatchLimits, JsonV1Codec, OpLog},
+    model::{NodeId, Operation, SeenOps, StampedOperation},
+    replication::BatchLimits,
+    storage::OperationBatch,
     transfer::TransferChunk,
     transport::Psk,
 };
@@ -61,7 +62,7 @@ pub struct MeshRuntimeConfig {
     pub batch_limits: BatchLimits,
     pub max_concurrent_chunk_streams: usize,
     /// Durable seen summary, including operation IDs whose payload rows were
-    /// safely compacted.
+    /// safely compacted. The runtime advertises it and keeps it current.
     pub initial_seen: SeenOps,
     pub known_members: BTreeSet<NodeId>,
     pub forgotten_devices: BTreeSet<NodeId>,
@@ -89,14 +90,23 @@ impl MeshRuntimeConfig {
     }
 }
 
+/// Work the mesh needs from the daemon-owned history store. The runtime keeps
+/// no copy of the operation log; it asks the store for what a peer is missing
+/// and hands received operations back to be made durable.
+#[derive(Debug)]
+pub enum MeshStoreRequest {
+    Persist(PersistBatch),
+    Batch(BatchRequest),
+}
+
 /// A batch which must become durable before the network peer is acknowledged.
 #[derive(Debug)]
 pub struct PersistBatch {
     peer: NodeId,
     peer_frontier: SeenOps,
     known_members: BTreeSet<NodeId>,
-    operations: Vec<Vec<u8>>,
-    reply: oneshot::Sender<Result<PersistResult, String>>,
+    operations: Vec<StampedOperation>,
+    reply: oneshot::Sender<Result<(), String>>,
 }
 
 impl PersistBatch {
@@ -115,32 +125,38 @@ impl PersistBatch {
         &self.known_members
     }
 
+    /// Operations decoded and validated from the peer's batch.
     #[must_use]
-    pub fn operations(&self) -> &[Vec<u8>] {
+    pub fn operations(&self) -> &[StampedOperation] {
         &self.operations
     }
 
-    pub fn complete(self, result: Result<PersistResult, String>) {
+    pub fn complete(self, result: Result<(), String>) {
         let _ = self.reply.send(result);
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct PersistResult {
-    compacted_operations: Vec<OpId>,
+/// Asks the store for the operations a peer has not seen.
+#[derive(Debug)]
+pub struct BatchRequest {
+    remote: SeenOps,
+    limits: BatchLimits,
+    reply: oneshot::Sender<Result<OperationBatch, String>>,
 }
 
-impl PersistResult {
+impl BatchRequest {
     #[must_use]
-    pub fn new(compacted_operations: Vec<OpId>) -> Self {
-        Self {
-            compacted_operations,
-        }
+    pub const fn remote(&self) -> &SeenOps {
+        &self.remote
     }
 
     #[must_use]
-    pub fn compacted_operations(&self) -> &[OpId] {
-        &self.compacted_operations
+    pub const fn limits(&self) -> &BatchLimits {
+        &self.limits
+    }
+
+    pub fn complete(self, result: Result<OperationBatch, String>) {
+        let _ = self.reply.send(result);
     }
 }
 
@@ -168,7 +184,7 @@ pub struct MeshHandle {
     discovery: watch::Sender<Option<DiscoverySnapshot>>,
     revision: watch::Sender<u64>,
     status: watch::Sender<MeshRuntimeStatus>,
-    state: Arc<RwLock<AntiEntropyState>>,
+    seen: Arc<RwLock<SeenOps>>,
     known_members: Arc<RwLock<BTreeSet<NodeId>>>,
     forgotten_devices: Arc<RwLock<BTreeSet<NodeId>>>,
     device_hostnames: Arc<RwLock<BTreeMap<NodeId, String>>>,
@@ -196,13 +212,9 @@ impl MeshHandle {
     ///
     /// # Errors
     ///
-    /// Returns an error if deterministic operation encoding or log insertion
-    /// fails.
+    /// Currently infallible; the signature leaves room for runtime shutdown.
     pub async fn record_local(&self, operation: &StampedOperation) -> Result<(), MeshError> {
-        self.state
-            .write()
-            .await
-            .record_local(operation, &JsonV1Codec)?;
+        self.seen.write().await.record(operation.id());
         self.known_members
             .write()
             .await
@@ -216,7 +228,7 @@ impl MeshHandle {
 
     #[must_use]
     pub async fn frontier(&self) -> SeenOps {
-        self.state.read().await.seen().clone()
+        self.seen.read().await.clone()
     }
 
     /// Returns remote addresses with a live authenticated mesh session.
@@ -292,7 +304,7 @@ pub struct MeshRuntime {
 
 type RuntimeSpawn = (
     MeshRuntime,
-    mpsc::Receiver<PersistBatch>,
+    mpsc::Receiver<MeshStoreRequest>,
     Option<mpsc::Receiver<MeshChunkCommand>>,
 );
 
@@ -302,17 +314,14 @@ impl MeshRuntime {
     ///
     /// # Errors
     ///
-    /// Returns an error if the hostname is invalid or persisted operations
-    /// cannot initialize the forwarding log.
+    /// Returns an error if the local configuration is invalid.
     pub fn spawn(
         config: MeshRuntimeConfig,
         psk: Psk,
-        persisted_operations: &[StampedOperation],
         shutdown: CancellationToken,
-    ) -> Result<(Self, mpsc::Receiver<PersistBatch>), MeshError> {
-        let (runtime, persist_rx, _) =
-            Self::spawn_inner(config, psk, persisted_operations, shutdown, false)?;
-        Ok((runtime, persist_rx))
+    ) -> Result<(Self, mpsc::Receiver<MeshStoreRequest>), MeshError> {
+        let (runtime, store_rx, _) = Self::spawn_inner(config, psk, shutdown, false)?;
+        Ok((runtime, store_rx))
     }
 
     /// Creates a runtime with a daemon-owned encrypted chunk broker.
@@ -324,41 +333,30 @@ impl MeshRuntime {
     pub fn spawn_with_transfers(
         config: MeshRuntimeConfig,
         psk: Psk,
-        persisted_operations: &[StampedOperation],
         shutdown: CancellationToken,
     ) -> Result<
         (
             Self,
-            mpsc::Receiver<PersistBatch>,
+            mpsc::Receiver<MeshStoreRequest>,
             mpsc::Receiver<MeshChunkCommand>,
         ),
         MeshError,
     > {
-        let (runtime, persist_rx, chunk_rx) =
-            Self::spawn_inner(config, psk, persisted_operations, shutdown, true)?;
+        let (runtime, store_rx, chunk_rx) = Self::spawn_inner(config, psk, shutdown, true)?;
         let chunk_rx = chunk_rx.ok_or(MeshError::ChunkBrokerUnavailable)?;
-        Ok((runtime, persist_rx, chunk_rx))
+        Ok((runtime, store_rx, chunk_rx))
     }
 
     fn spawn_inner(
         config: MeshRuntimeConfig,
         psk: Psk,
-        persisted_operations: &[StampedOperation],
         shutdown: CancellationToken,
         transfers: bool,
     ) -> Result<RuntimeSpawn, MeshError> {
         handshake::validate_local_config(&config)?;
-        let mut state = AntiEntropyState::restore(config.initial_seen.clone(), OpLog::default());
-        for operation in persisted_operations {
-            state.record_local(operation, &JsonV1Codec)?;
-        }
-
-        let state = Arc::new(RwLock::new(state));
+        let seen = Arc::new(RwLock::new(config.initial_seen.clone()));
         let mut initial_members = config.known_members.clone();
         initial_members.insert(config.node_id);
-        for operation in persisted_operations {
-            initial_members.insert(operation.id().node());
-        }
         let known_members = Arc::new(RwLock::new(initial_members));
         let forgotten_devices = Arc::new(RwLock::new(config.forgotten_devices.clone()));
         let device_hostnames = Arc::new(RwLock::new(BTreeMap::from([(
@@ -369,7 +367,7 @@ impl MeshRuntime {
         let (discovery, discovery_rx) = watch::channel(None);
         let (revision, _) = watch::channel(0_u64);
         let (status, _) = watch::channel(MeshRuntimeStatus::default());
-        let (persist_tx, persist_rx) = mpsc::channel(32);
+        let (store_tx, store_rx) = mpsc::channel(32);
         let (chunk_tx, chunk_rx) = if transfers {
             let (tx, rx) = mpsc::channel(32);
             (Some(tx), Some(rx))
@@ -380,7 +378,7 @@ impl MeshRuntime {
             discovery,
             revision: revision.clone(),
             status: status.clone(),
-            state: state.clone(),
+            seen: seen.clone(),
             known_members: known_members.clone(),
             forgotten_devices: forgotten_devices.clone(),
             device_hostnames: device_hostnames.clone(),
@@ -389,10 +387,10 @@ impl MeshRuntime {
         let context = Arc::new(RuntimeContext {
             config,
             psk: Arc::new(psk),
-            state,
+            seen,
             revision,
             status,
-            persist_tx,
+            store_tx,
             chunk_tx,
             registry,
             known_members,
@@ -405,7 +403,7 @@ impl MeshRuntime {
                 handle: handle.clone(),
                 task,
             },
-            persist_rx,
+            store_rx,
             chunk_rx,
         ))
     }
@@ -426,10 +424,10 @@ impl MeshRuntime {
 struct RuntimeContext {
     config: MeshRuntimeConfig,
     psk: Arc<Psk>,
-    state: Arc<RwLock<AntiEntropyState>>,
+    seen: Arc<RwLock<SeenOps>>,
     revision: watch::Sender<u64>,
     status: watch::Sender<MeshRuntimeStatus>,
-    persist_tx: mpsc::Sender<PersistBatch>,
+    store_tx: mpsc::Sender<MeshStoreRequest>,
     chunk_tx: Option<mpsc::Sender<MeshChunkCommand>>,
     registry: Arc<Mutex<BTreeMap<NodeId, ActiveConnection>>>,
     known_members: Arc<RwLock<BTreeSet<NodeId>>>,

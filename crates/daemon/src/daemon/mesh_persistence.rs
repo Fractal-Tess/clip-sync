@@ -4,16 +4,15 @@ use tokio_util::sync::CancellationToken;
 use clip_sync_core::{
     clipboard::wayland::WaylandBackend,
     config::{Config, SharedConfig},
-    model::{Operation, StampedOperation},
+    model::Operation,
     payload::ExplicitSharePolicy,
-    replication::{Codec, JsonV1Codec},
-    storage::{CompactionReport, HistoryStore},
+    storage::HistoryStore,
     transfer::TransferCoordinator,
 };
 
 use crate::{
     ipc::DaemonState,
-    mesh::{MeshChunkCommand, MeshHandle, PersistBatch, PersistResult},
+    mesh::{BatchRequest, MeshChunkCommand, MeshHandle, MeshStoreRequest, PersistBatch},
 };
 
 use super::{
@@ -32,10 +31,24 @@ pub(super) struct MeshPersistenceContext<'a> {
     pub(super) transfers: &'a mut TransferCoordinator,
 }
 
-pub(super) async fn handle_mesh_batch(
-    batch: PersistBatch,
+pub(super) async fn handle_mesh_store_request(
+    request: MeshStoreRequest,
     context: &mut MeshPersistenceContext<'_>,
 ) {
+    match request {
+        MeshStoreRequest::Persist(batch) => handle_mesh_batch(batch, context).await,
+        MeshStoreRequest::Batch(request) => answer_batch_request(request, context.history),
+    }
+}
+
+fn answer_batch_request(request: BatchRequest, history: &HistoryStore) {
+    let result = history
+        .operation_batch(request.remote(), request.limits())
+        .map_err(|error| error.to_string());
+    request.complete(result);
+}
+
+async fn handle_mesh_batch(batch: PersistBatch, context: &mut MeshPersistenceContext<'_>) {
     // An exchange that carried no operations leaves history, devices, and
     // config exactly as they were, so there is nothing to republish. It also
     // must not wake the mesh: notify_transfers bumps the revision that drives
@@ -113,14 +126,9 @@ pub(super) fn handle_mesh_chunk_command(
 async fn persist_mesh_batch(
     batch: &PersistBatch,
     context: &mut MeshPersistenceContext<'_>,
-) -> anyhow::Result<PersistResult> {
-    let codec = JsonV1Codec;
-    let operations = batch
-        .operations()
-        .iter()
-        .map(|raw| codec.decode_op(raw).context("decode remote operation"))
-        .collect::<anyhow::Result<Vec<StampedOperation>>>()?;
-    for operation in &operations {
+) -> anyhow::Result<()> {
+    let operations = batch.operations();
+    for operation in operations {
         if let Operation::Add { payload, .. } | Operation::AddQuotaExempt { payload, .. } =
             operation.operation()
         {
@@ -148,7 +156,7 @@ async fn persist_mesh_batch(
             batch.peer(),
             batch.peer_frontier(),
             batch.known_members(),
-            &operations,
+            operations,
             unix_time_millis()?,
         )
         .context("persist authenticated remote operation batch and frontier")?;
@@ -227,15 +235,11 @@ async fn persist_mesh_batch(
         );
     }
 
-    let compacted = match context.history.compact_acknowledged_tombstones() {
-        Ok(compacted) => compacted,
-        Err(error) => {
-            tracing::warn!(
-                %error,
-                "acknowledged tombstone compaction will be retried later"
-            );
-            CompactionReport::default()
-        }
-    };
-    Ok(PersistResult::new(compacted.operations().to_vec()))
+    if let Err(error) = context.history.compact_acknowledged_tombstones() {
+        tracing::warn!(
+            %error,
+            "acknowledged tombstone compaction will be retried later"
+        );
+    }
+    Ok(())
 }

@@ -48,7 +48,11 @@ async fn automatic_file_and_directory_capture_is_private_durable_and_remotely_ma
         TransferPhase::Complete
     );
     assert!(
-        origin.history.projection().payload(content_id).is_none(),
+        origin
+            .history
+            .projection()
+            .payload_descriptor(content_id)
+            .is_none(),
         "origin URI bytes must not be retained as inline history"
     );
     let operations = origin
@@ -190,8 +194,8 @@ async fn automatic_non_file_capture_preserves_all_mime_representations() {
     };
     let retained = node
         .history
-        .projection()
-        .payload(content_id)
+        .load_payload(content_id)
+        .expect("load payload")
         .expect("retained payload");
     assert_eq!(retained.representations().len(), 3);
     for representation in content.representations() {

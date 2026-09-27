@@ -5,9 +5,12 @@ use std::path::Path;
 use rusqlite::{Connection, OptionalExtension};
 use zeroize::Zeroizing;
 
-use super::{Result, StorageError, StorageKey, key::SQLCIPHER_KEY_HEX_CHARS};
+use super::{
+    Result, StorageError, StorageKey, key::SQLCIPHER_KEY_HEX_CHARS,
+    operations::decode_stored_operation,
+};
 
-const SCHEMA_VERSION: u32 = 4;
+const SCHEMA_VERSION: u32 = 5;
 
 const MIGRATION_1: &str = "
     BEGIN IMMEDIATE;
@@ -72,6 +75,16 @@ const MIGRATION_4: &str = "
     UPDATE storage_meta SET value = '4' WHERE key = 'schema_version';
     PRAGMA user_version = 4;
     COMMIT;
+";
+
+/// Indexes operations by the history item they touch, so compaction and
+/// payload loads are lookups instead of decoding the whole log. Existing rows
+/// are backfilled from their own serialized operation.
+const MIGRATION_5: &str = "
+    ALTER TABLE operations ADD COLUMN content_id BLOB
+        CHECK (content_id IS NULL OR length(content_id) = 32);
+    CREATE INDEX operations_content ON operations (content_id)
+        WHERE content_id IS NOT NULL;
 ";
 
 pub(super) fn should_initialize(path: &Path) -> Result<bool> {
@@ -248,7 +261,53 @@ pub(super) fn apply_migrations(connection: &Connection, current_version: u32) ->
     if current_version < 4 {
         connection.execute_batch(MIGRATION_4)?;
     }
+    if current_version < 5 {
+        migrate_to_5(connection)?;
+    }
     Ok(())
+}
+
+fn migrate_to_5(connection: &Connection) -> Result<()> {
+    connection.execute_batch("BEGIN IMMEDIATE;")?;
+    let result = (|| {
+        connection.execute_batch(MIGRATION_5)?;
+        let mut rows = Vec::new();
+        {
+            let mut statement =
+                connection.prepare("SELECT origin_node, counter, payload FROM operations")?;
+            let mut query = statement.query([])?;
+            while let Some(row) = query.next()? {
+                let node: Vec<u8> = row.get(0)?;
+                let counter: i64 = row.get(1)?;
+                let encoded = Zeroizing::new(row.get::<_, Vec<u8>>(2)?);
+                let operation = decode_stored_operation(encoded.as_slice())?;
+                if let Some(content_id) = operation.operation().content_id() {
+                    rows.push((node, counter, *content_id.as_bytes()));
+                }
+            }
+        }
+        for (node, counter, content_id) in rows {
+            connection.execute(
+                "UPDATE operations SET content_id = ?1 WHERE origin_node = ?2 AND counter = ?3",
+                (&content_id[..], node, counter),
+            )?;
+        }
+        connection.execute_batch(
+            "UPDATE storage_meta SET value = '5' WHERE key = 'schema_version';
+             PRAGMA user_version = 5;",
+        )?;
+        Ok(())
+    })();
+    match result {
+        Ok(()) => {
+            connection.execute_batch("COMMIT;")?;
+            Ok(())
+        }
+        Err(error) => {
+            let _ = connection.execute_batch("ROLLBACK;");
+            Err(error)
+        }
+    }
 }
 
 pub(super) fn verify_current_schema(connection: &Connection) -> Result<()> {

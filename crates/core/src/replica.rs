@@ -75,6 +75,29 @@ impl Replica {
         operation: &StampedOperation,
         now_millis: u64,
     ) -> Result<ApplyOutcome, ReplicaError> {
+        Self::check_remote(operation, now_millis)?;
+        if self.projection.seen_ops().contains(operation.id()) {
+            return Ok(ApplyOutcome::Duplicate);
+        }
+
+        // Every fallible step runs before the first mutation. Projection
+        // application validates before it changes anything, so the replica
+        // never needs a scratch copy of its whole state.
+        let mut clock = self.clock;
+        clock.merge(operation.timestamp(), now_millis)?;
+        let outcome = self.projection.apply(operation)?;
+        self.clock = clock;
+        Ok(outcome)
+    }
+
+    /// Rejects a remote operation that [`Self::ingest`] would refuse, without
+    /// changing the replica. Callers use it to vet a whole batch before any of
+    /// it is applied.
+    ///
+    /// # Errors
+    ///
+    /// Returns the clock-skew or projection-validation error `ingest` would.
+    pub fn check_remote(operation: &StampedOperation, now_millis: u64) -> Result<(), ReplicaError> {
         let max_remote_millis = now_millis.saturating_add(MAX_REMOTE_CLOCK_SKEW_MILLIS);
         if operation.timestamp().physical_millis() > max_remote_millis {
             return Err(ReplicaError::RemoteClockTooFarAhead {
@@ -82,17 +105,8 @@ impl Replica {
                 local: now_millis,
             });
         }
-        let mut projection = self.projection.clone();
-        let outcome = projection.apply(operation)?;
-        if outcome == ApplyOutcome::Duplicate {
-            return Ok(outcome);
-        }
-
-        let mut clock = self.clock;
-        clock.merge(operation.timestamp(), now_millis)?;
-        self.projection = projection;
-        self.clock = clock;
-        Ok(outcome)
+        Projection::validate_operation(operation)?;
+        Ok(())
     }
 
     fn author(
@@ -108,12 +122,10 @@ impl Replica {
         let mut clock = self.clock;
         let timestamp = clock.tick(now_millis)?;
         let stamped = StampedOperation::new(id, timestamp, operation);
-        let mut projection = self.projection.clone();
-        projection.apply(&stamped)?;
+        self.projection.apply(&stamped)?;
 
         self.last_counter = counter;
         self.clock = clock;
-        self.projection = projection;
         Ok(stamped)
     }
 
@@ -140,8 +152,6 @@ pub enum ReplicaError {
     InvalidContentId(String),
     #[error("shared setting {setting:?} cannot be set to {value}")]
     InvalidSharedSetting { setting: SharedSetting, value: u64 },
-    #[error("quota cannot be evaluated while payloads are unavailable: {0:?}")]
-    QuotaStateIncomplete(Vec<ContentId>),
     #[error("the local device cannot forget itself")]
     CannotForgetLocalDevice,
     #[error("remote clock {remote}ms is too far ahead of local clock {local}ms")]
