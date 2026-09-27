@@ -39,6 +39,9 @@ use super::{
 /// so this stays well clear of the hot reconciliation path.
 const CHUNK_STORE_MAINTENANCE_INTERVAL: Duration = Duration::from_mins(5);
 
+pub(super) const CLIPBOARD_DISABLED_DETAIL: &str =
+    "disabled by configuration; this host only stores and relays history";
+
 /// Runs discovery and local IPC until a termination signal is received.
 ///
 /// # Errors
@@ -183,12 +186,21 @@ pub async fn run(paths: AppPaths, mut config: Config) -> anyhow::Result<()> {
         )
         .context("apply effective clipboard capture threshold")?;
     let (clipboard_tx, mut clipboard_rx) = tokio::sync::mpsc::channel(128);
-    let mut clipboard_watch = spawn_clipboard_watch(
-        clipboard.clone(),
-        state.clone(),
-        clipboard_tx,
-        shutdown.clone(),
-    );
+    let mut clipboard_finished = !config.local.clipboard;
+    let mut clipboard_watch = if config.local.clipboard {
+        spawn_clipboard_watch(
+            clipboard.clone(),
+            state.clone(),
+            clipboard_tx,
+            shutdown.clone(),
+        )
+    } else {
+        state
+            .set_clipboard_status(true, CLIPBOARD_DISABLED_DETAIL)
+            .await;
+        tracing::info!("clipboard disabled by configuration; storing and relaying history only");
+        tokio::spawn(async {})
+    };
 
     tracing::info!(socket = %paths.socket.display(), "clip-sync daemon started");
     let server = ipc::serve(&paths.socket, state.clone(), shutdown.clone());
@@ -196,7 +208,6 @@ pub async fn run(paths: AppPaths, mut config: Config) -> anyhow::Result<()> {
     tokio::pin!(server);
     tokio::pin!(termination);
     let mut server_finished = false;
-    let mut clipboard_finished = false;
     let mut active_materialization = None;
     let mut pending_materialization_cleanup = None;
     let materialization_root = paths.runtime_dir.join("materialized");

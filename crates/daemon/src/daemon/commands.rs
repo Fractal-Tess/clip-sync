@@ -20,7 +20,7 @@ use super::{
     capture::{inspect_live_current_clipboard, share_live_current_clipboard},
     config_supervision::update_shared_setting,
     preview::image_preview,
-    runtime::unix_time_millis,
+    runtime::{CLIPBOARD_DISABLED_DETAIL, unix_time_millis},
     views::{device_items, history_items},
 };
 
@@ -65,6 +65,11 @@ pub(super) async fn handle_daemon_command(
     materialization_root: &std::path::Path,
 ) {
     match command {
+        DaemonCommand::Activate { content_id, reply } if !config.local.clipboard => {
+            let _ = reply.send(Err(format!(
+                "cannot activate {content_id}: clipboard {CLIPBOARD_DISABLED_DETAIL}"
+            )));
+        }
         DaemonCommand::Activate { content_id, reply } => {
             let result = activate_history_item(
                 &content_id,

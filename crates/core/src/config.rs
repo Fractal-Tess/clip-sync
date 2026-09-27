@@ -282,6 +282,9 @@ pub struct LocalConfig {
     pub transfer_free_space_reserve_bytes: u64,
     pub materialization_free_space_reserve_bytes: u64,
     pub max_concurrent_chunk_streams: usize,
+    /// Set to `false` on headless hosts. The daemon then never connects to
+    /// Wayland and only stores and relays history for the other devices.
+    pub clipboard: bool,
 }
 
 impl Default for LocalConfig {
@@ -299,6 +302,7 @@ impl Default for LocalConfig {
             transfer_free_space_reserve_bytes: 64 * 1024 * 1024,
             materialization_free_space_reserve_bytes: 8 * 1024 * 1024,
             max_concurrent_chunk_streams: 4,
+            clipboard: true,
         }
     }
 }
