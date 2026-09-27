@@ -145,8 +145,12 @@ impl DaemonState {
         *self.inner.peer_history_stats.write().await = stats;
     }
 
-    pub async fn set_device_names(&self, device_names: BTreeMap<String, String>) {
-        *self.inner.device_names.write().await = device_names;
+    /// Replaces the known device names; returns whether they changed.
+    pub async fn set_device_names(&self, device_names: BTreeMap<String, String>) -> bool {
+        let mut current = self.inner.device_names.write().await;
+        let changed = *current != device_names;
+        *current = device_names;
+        changed
     }
 
     pub async fn set_devices(&self, devices: Vec<DeviceItem>) {

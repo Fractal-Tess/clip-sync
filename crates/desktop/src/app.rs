@@ -930,7 +930,14 @@ impl ApplicationHandler for Picker {
     }
 }
 
-/// Draws one history card at the size the grid allotted it.
+/// Draws one history card at exactly the size the grid allotted it.
+///
+/// Everything is painted into a rect claimed up front rather than laid out
+/// with widgets, because egui lets a widget grow to fit its content: a long
+/// device name or an unbroken URL used to widen its card, push the rest of
+/// the row off the grid, and shove the pinned column out of the window.
+/// Here every line is wrapped or elided to fit, and nothing can resize the
+/// card.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn card(
     ui: &mut egui::Ui,
@@ -942,20 +949,21 @@ fn card(
     local: &str,
     now: u64,
 ) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
     let pin_progress = ui.ctx().animate_bool_with_time(
         egui::Id::new(("pin", item.content_id.as_str())),
         item.pinned,
         PIN_ANIMATION_SECONDS,
     );
+    // Inside the pinned column every card is pinned, so marking each one
+    // would leave the focused card as the only one without a distinct look.
+    // The pin accent only animates the move between zones out in the grid.
+    let pin_emphasis = if number.is_some() { 0.0 } else { pin_progress };
     let base_background = if selected {
         CARD_SELECTED
     } else {
         CARD_BACKGROUND
     };
-    // Inside the pinned column every card is pinned, so marking each one
-    // would leave the focused card as the only one without a distinct look.
-    // The pin accent only animates the move between zones out in the grid.
-    let pin_emphasis = if number.is_some() { 0.0 } else { pin_progress };
     let background = base_background.lerp_to_gamma(CARD_SELECTED, 0.35 * pin_emphasis);
     let foreground = if selected { TEXT_SELECTED } else { TEXT };
     let stroke = if selected {
@@ -965,126 +973,125 @@ fn card(
     } else {
         egui::Stroke::NONE
     };
+    if !ui.is_rect_visible(rect) {
+        return response.on_hover_cursor(egui::CursorIcon::PointingHand);
+    }
+    let painter = ui.painter().with_clip_rect(rect);
+    painter.rect(rect, 6, background, stroke, egui::StrokeKind::Inside);
 
-    let response = ui.allocate_ui(size, |ui| {
-        egui::Frame::new()
-            .fill(background)
-            .stroke(stroke)
-            .corner_radius(6)
-            .inner_margin(CARD_PADDING)
-            .show(ui, |ui| {
-                let inner = size - egui::Vec2::splat(2.0 * CARD_PADDING);
-                ui.set_min_size(inner);
-                ui.set_max_size(inner);
-                ui.spacing_mut().item_spacing.y = 4.0;
-                ui.vertical(|ui| {
-                    // Reserve the metadata row plus the spacing above it, so a
-                    // long preview is clipped clear of the row rather than
-                    // running its last line into the size and age.
-                    let body_height = inner.y - META_SIZE - 9.0;
-                    ui.allocate_ui(egui::vec2(inner.x, body_height), |ui| {
-                        ui.set_clip_rect(ui.max_rect());
-                        match textures.get(&item.content_id) {
-                            Some(handle) => {
-                                // Thumbnails keep their aspect ratio and sit in
-                                // the middle of the card, so a very wide or very
-                                // tall capture still reads as a picture rather
-                                // than a stripe pinned to one edge.
-                                let (area, _) = ui.allocate_exact_size(
-                                    egui::vec2(inner.x, body_height),
-                                    egui::Sense::hover(),
-                                );
-                                let scaled = fit(handle.size_vec2(), area.size());
-                                let texture = egui::load::SizedTexture::new(handle.id(), scaled);
-                                egui::Image::new(texture).corner_radius(4).paint_at(
-                                    ui,
-                                    egui::Rect::from_center_size(area.center(), scaled),
-                                );
-                            }
-                            None => {
-                                ui.label(
-                                    egui::RichText::new(clamp_preview(&item.preview))
-                                        .color(foreground)
-                                        .size(PREVIEW_SIZE),
-                                );
-                            }
-                        }
-                    });
+    let inner = rect.shrink(CARD_PADDING);
+    let meta_height = META_SIZE + 3.0;
+    let body = egui::Rect::from_min_max(
+        inner.min,
+        egui::pos2(inner.max.x, inner.max.y - meta_height - 5.0),
+    );
+    let meta = egui::Rect::from_min_max(
+        egui::pos2(inner.min.x, inner.max.y - meta_height),
+        inner.max,
+    );
 
-                    ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
-                        ui.horizontal(|ui| {
-                            // In the pinned column the number is the badge:
-                            // it names the alt shortcut that pastes the pin.
-                            if let Some(number) = number {
-                                ui.label(
-                                    egui::RichText::new(format!("alt {number}"))
-                                        .monospace()
-                                        .size(META_SIZE)
-                                        .color(ACCENT.gamma_multiply(pin_progress.max(0.6))),
-                                );
-                            } else if pin_progress > 0.0 {
-                                ui.label(
-                                    egui::RichText::new("pin")
-                                        .monospace()
-                                        .size(META_SIZE)
-                                        .color(ACCENT.gamma_multiply(pin_progress)),
-                                );
-                            }
-                            if item.is_image {
-                                ui.label(
-                                    egui::RichText::new("img")
-                                        .monospace()
-                                        .size(META_SIZE)
-                                        .weak(),
-                                );
-                            }
-                            // Entries from this machine are the common case, so
-                            // only remote origins earn a label.
-                            if item.source != local && !item.source.is_empty() {
-                                ui.label(
-                                    egui::RichText::new(&item.source)
-                                        .monospace()
-                                        .size(META_SIZE)
-                                        .weak(),
-                                );
-                            }
-                            // Large items stay on the device that copied them
-                            // and are fetched on paste; say so before Enter.
-                            if item.remote {
-                                ui.label(
-                                    egui::RichText::new("fetch")
-                                        .monospace()
-                                        .size(META_SIZE)
-                                        .weak(),
-                                );
-                            }
-                            // Age and size sit on the right so they line up
-                            // down the column and stay readable as a pair,
-                            // rather than shifting with the badges beside them.
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    ui.label(
-                                        egui::RichText::new(format!(
-                                            "{}  ·  {}",
-                                            human_size(item.size_bytes),
-                                            human_age(now, item.created_millis),
-                                        ))
-                                        .monospace()
-                                        .size(META_SIZE)
-                                        .weak(),
-                                    );
-                                },
-                            );
-                        });
-                    });
-                });
-            });
-    });
-    response
-        .response
-        .interact(egui::Sense::click())
-        .on_hover_cursor(egui::CursorIcon::PointingHand)
+    // Thumbnails keep their aspect ratio and sit in the middle of the card,
+    // so a very wide or very tall capture still reads as a picture rather
+    // than a stripe pinned to one edge.
+    if let Some(handle) = textures.get(&item.content_id) {
+        let scaled = fit(handle.size_vec2(), body.size());
+        let texture = egui::load::SizedTexture::new(handle.id(), scaled);
+        egui::Image::new(texture)
+            .corner_radius(4)
+            .paint_at(ui, egui::Rect::from_center_size(body.center(), scaled));
+    } else {
+        let font = egui::FontId::proportional(PREVIEW_SIZE);
+        let row_height = ui.fonts_mut(|fonts| fonts.row_height(&font));
+        let mut job = egui::text::LayoutJob::simple(
+            clamp_preview(&item.preview),
+            font,
+            foreground,
+            body.width(),
+        );
+        // A count of whole rows: positive and far below usize::MAX.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let rows = (body.height() / row_height).floor().max(1.0) as usize;
+        job.wrap.max_rows = rows;
+        // Words wrap at spaces; egui still splits a token too long for a
+        // whole row (a URL, a hash), so nothing runs past the edge.
+        job.wrap.overflow_character = Some('…');
+        painter.galley(body.min, painter.layout_job(job), foreground);
+    }
+
+    // Size and age are drawn first and keep their full width on the right;
+    // the badges on the left get what remains and are elided, never allowed
+    // to run underneath.
+    let meta_font = egui::FontId::monospace(META_SIZE);
+    let weak = TEXT.gamma_multiply(0.7);
+    let stats = painter.layout_no_wrap(
+        format!(
+            "{}  ·  {}",
+            human_size(item.size_bytes),
+            human_age(now, item.created_millis)
+        ),
+        meta_font.clone(),
+        weak,
+    );
+    painter.galley(
+        egui::pos2(
+            meta.max.x - stats.size().x,
+            meta.center().y - stats.size().y / 2.0,
+        ),
+        stats.clone(),
+        weak,
+    );
+
+    let mut badges = egui::text::LayoutJob::default();
+    let mut badge = |text: &str, color: egui::Color32| {
+        let leading = if badges.text.is_empty() { 0.0 } else { 7.0 };
+        badges.append(
+            text,
+            leading,
+            egui::TextFormat::simple(meta_font.clone(), color),
+        );
+    };
+    if let Some(number) = number {
+        // In the pinned column the number is the badge: it names the alt
+        // shortcut that pastes the pin.
+        badge(&format!("alt {number}"), ACCENT);
+    } else if pin_progress > 0.0 {
+        badge("pin", ACCENT.gamma_multiply(pin_progress));
+    }
+    if item.is_image {
+        badge("img", weak);
+    }
+    // Entries from this machine are the common case, so only remote
+    // origins earn a label.
+    if item.source != local && !item.source.is_empty() {
+        badge(&short_source(&item.source), weak);
+    }
+    // Large items stay on the device that copied them and are fetched on
+    // paste; say so before Enter.
+    if item.remote {
+        badge("fetch", weak);
+    }
+    badges.wrap.max_width = (meta.width() - stats.size().x - 10.0).max(0.0);
+    badges.wrap.max_rows = 1;
+    badges.wrap.break_anywhere = true;
+    badges.wrap.overflow_character = Some('…');
+    let badges = painter.layout_job(badges);
+    painter.galley(
+        egui::pos2(meta.min.x, meta.center().y - badges.size().y / 2.0),
+        badges,
+        weak,
+    );
+
+    response.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// A device's name, or the start of its ID while the name is not yet known.
+fn short_source(source: &str) -> String {
+    let is_node_id = source.len() == 36 && source.chars().filter(|&c| c == '-').count() == 4;
+    if is_node_id {
+        source.chars().take(8).collect()
+    } else {
+        source.to_owned()
+    }
 }
 
 /// Wall-clock milliseconds since the Unix epoch.
@@ -1104,13 +1111,15 @@ fn human_size(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
     let mut value = bytes as f64;
     let mut unit = 0;
-    while value >= 1024.0 && unit + 1 < UNITS.len() {
+    // Compare against what will be printed, so 1023.9 MB reads "1.0 GB"
+    // rather than rounding up to "1024 MB".
+    while value.round() >= 1024.0 && unit + 1 < UNITS.len() {
         value /= 1024.0;
         unit += 1;
     }
     if unit == 0 {
         format!("{bytes} B")
-    } else if value < 10.0 {
+    } else if value < 9.95 {
         format!("{value:.1} {}", UNITS[unit])
     } else {
         format!("{value:.0} {}", UNITS[unit])
@@ -1156,12 +1165,14 @@ const PREVIEW_CHARS: usize = 180;
 /// Wrapping is left to egui, which knows the real glyph widths.
 fn clamp_preview(preview: &str) -> String {
     let mut out = String::new();
-    for (index, line) in preview.lines().enumerate() {
+    for line in preview.lines() {
+        // Blank lines carry nothing on a one-paragraph card, and keeping them
+        // would leave runs of spaces where they were.
         let trimmed = line.trim();
-        if trimmed.is_empty() && out.is_empty() {
+        if trimmed.is_empty() {
             continue;
         }
-        if index > 0 && !out.is_empty() {
+        if !out.is_empty() {
             out.push(' ');
         }
         out.push_str(trimmed);
@@ -1193,7 +1204,12 @@ mod snapshot {
         HistoryItem {
             content_id: format!("{number:064}"),
             preview: text.to_owned(),
-            source: if number % 3 == 0 { "kiwi" } else { "vd" }.to_owned(),
+            source: if number.is_multiple_of(3) {
+                "kiwi"
+            } else {
+                "vd"
+            }
+            .to_owned(),
             pinned: pinned_millis.is_some(),
             pinned_millis,
             is_image: false,
@@ -1207,6 +1223,15 @@ mod snapshot {
         let daemon = Daemon::discover(None).expect("resolve paths");
         let mut picker = Picker::new(daemon, Instant::now(), false);
         picker.local = "vd".to_owned();
+        let unknown = "719e5a5e-afb8-4916-9b20-4a0d6bf0b09a";
+        let previews = [
+            "Can we move the chat to the bottom",
+            "runtime-8hWf3OeI.js?v=a2b45c0b:3525 Uncaught TypeError: crypto.randomUUID is not a function in $effect in +page.svelte in +layout.svelte in +layout.svelte and more",
+            "http://vd.netbird.cloud:3773/pair#token=X7GFN2RPRR8TQ9WZ4LKJHGFDSAPOIUYTREWQMNBVCXZ",
+            "3773",
+            "first line\nsecond line\n\n\nfifth line after blank lines",
+            "aVeryLongIdentifierWithoutAnySpacesThatJustKeepsGoingAndGoingAndGoingPastTheEdgeOfTheCard",
+        ];
         picker.items = (0..40)
             .map(|number| {
                 let pinned = match number {
@@ -1215,13 +1240,33 @@ mod snapshot {
                     17 => Some(2_000),
                     _ => None,
                 };
-                item(
-                    number,
-                    &format!("history entry {number} with some preview text"),
-                    pinned,
-                )
+                let mut entry = item(number, previews[number % previews.len()], pinned);
+                if number % 4 == 1 {
+                    entry.source = unknown.to_owned();
+                }
+                if number % 7 == 3 {
+                    entry.is_image = true;
+                }
+                entry.size_bytes = [12, 338, 15_000, 83_000, 4_200_000, 1_073_741_823][number % 6];
+                entry
             })
             .collect();
+        for entry in picker.items.iter().filter(|entry| entry.is_image) {
+            let (width, height) = if entry.content_id.ends_with('3') {
+                (640, 120)
+            } else {
+                (180, 320)
+            };
+            let image = egui::ColorImage::new(
+                [width, height],
+                vec![egui::Color32::from_rgb(0x38, 0x4c, 0x55); width * height],
+            );
+            let handle =
+                picker
+                    .egui
+                    .load_texture(&entry.content_id, image, egui::TextureOptions::LINEAR);
+            picker.textures.insert(entry.content_id.clone(), handle);
+        }
         picker.refilter();
         picker
     }

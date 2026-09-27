@@ -61,31 +61,35 @@ fn answer_source_request(request: SourceRequest, history: &HistoryStore) {
 }
 
 async fn handle_mesh_batch(batch: PersistBatch, context: &mut MeshPersistenceContext<'_>) {
-    // An exchange that carried no operations leaves history and devices
-    // exactly as they were, so there is nothing to republish.
     let carried_operations = !batch.operations().is_empty();
     let result = persist_mesh_batch(&batch, context);
-    if result.is_ok() && carried_operations {
-        context
-            .state
-            .set_device_names(
-                context
-                    .mesh
-                    .device_hostnames()
-                    .await
-                    .into_iter()
-                    .map(|(node_id, hostname)| (node_id.to_string(), hostname))
-                    .collect(),
-            )
-            .await;
-        context
-            .state
-            .set_history(history_items(context.history.replica()))
-            .await;
-        context
-            .state
-            .set_devices(device_items(context.history))
-            .await;
+    if result.is_ok() {
+        // Every handshake ends in a batch, usually an empty one. Names are
+        // learned at the handshake, so they are refreshed here rather than
+        // only when operations arrive, or a quiet peer would stay a raw ID
+        // after a restart.
+        let names = context
+            .mesh
+            .device_hostnames()
+            .await
+            .into_iter()
+            .map(|(node_id, hostname)| (node_id.to_string(), hostname))
+            .collect();
+        let renamed = context.state.set_device_names(names).await;
+        // An exchange that carried no operations and taught no names leaves
+        // history exactly as it was, so there is nothing to republish.
+        if carried_operations || renamed {
+            context
+                .state
+                .set_history(history_items(context.history.replica()))
+                .await;
+        }
+        if carried_operations {
+            context
+                .state
+                .set_devices(device_items(context.history))
+                .await;
+        }
     }
     batch.complete(result.map_err(|error| format!("{error:#}")));
 }
