@@ -459,7 +459,7 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
 name = "clip-sync-cli"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -472,7 +472,7 @@ dependencies = [
 
 [[package]]
 name = "clip-sync-core"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "blake3",
@@ -511,7 +511,7 @@ dependencies = [
 
 [[package]]
 name = "clip-sync-daemon"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -542,7 +542,7 @@ dependencies = [
 
 [[package]]
 name = "clip-sync-desktop"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -563,7 +563,7 @@ dependencies = [
 
 [[package]]
 name = "clip-sync-ipc"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "bytes",
  "futures-util",
