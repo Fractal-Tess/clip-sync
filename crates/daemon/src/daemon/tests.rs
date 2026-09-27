@@ -293,3 +293,42 @@ async fn forget_device_persists_and_publishes_known_member_rejection() {
     shutdown.cancel();
     runtime.wait().await;
 }
+
+#[test]
+fn history_items_report_when_each_item_was_pinned() {
+    let mut replica = clip_sync_core::replica::Replica::new(NodeId::new());
+    let payload = clip_sync_core::model::Payload::new(
+        &CONTENT_KEY,
+        vec![clip_sync_core::model::Representation::new(
+            "text/plain",
+            b"pinned".to_vec(),
+        )],
+    )
+    .unwrap();
+    let content_id = payload.descriptor().content_id();
+    replica.copy(payload, 1_000).unwrap();
+    replica.pin(content_id, 5_000).unwrap();
+    replica
+        .copy(
+            clip_sync_core::model::Payload::new(
+                &CONTENT_KEY,
+                vec![clip_sync_core::model::Representation::new(
+                    "text/plain",
+                    b"loose".to_vec(),
+                )],
+            )
+            .unwrap(),
+            6_000,
+        )
+        .unwrap();
+
+    let items = super::views::history_items(&replica);
+    let pinned = items.iter().find(|item| item.pinned).unwrap();
+    assert_eq!(pinned.pinned_millis, Some(5_000));
+    assert!(
+        items
+            .iter()
+            .filter(|item| !item.pinned)
+            .all(|item| item.pinned_millis.is_none())
+    );
+}

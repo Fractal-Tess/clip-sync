@@ -142,6 +142,7 @@ fn history_json_fields_are_stable() {
             "physical_millis": 1_704_067_200_000_u64,
             "origin_millis": 1_704_067_200_000_u64,
             "remote": true,
+            "pinned_millis": null,
         })
     );
 }

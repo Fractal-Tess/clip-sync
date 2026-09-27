@@ -22,6 +22,7 @@ pub(super) fn history_item_json(item: &clip_sync_ipc::protocol::HistoryItem) -> 
         "physical_millis": item.physical_millis,
         "origin_millis": item.origin_millis,
         "remote": item.remote,
+        "pinned_millis": item.pinned_millis,
     })
 }
 
