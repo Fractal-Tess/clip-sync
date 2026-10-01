@@ -12,6 +12,10 @@
   <strong>Pre-release:</strong> the Linux daily-driver implementation is under real-device validation and has not received an independent security review.
 </p>
 
+<p align="center">
+  <img src="assets/screenshots/picker.webp" alt="The ClipSync picker: a grid of clipboard history cards with text and image previews, one selected, and a column of three pinned items on the right" width="100%" />
+</p>
+
 ## Overview
 
 clip-sync synchronizes retained clipboard history between trusted devices without a central service or immediately replacing every peer's active clipboard.
@@ -26,6 +30,10 @@ clip-sync synchronizes retained clipboard history between trusted devices withou
 - **Keyboard-first picker.** Search, navigation, activation, pinning, and deletion from one window, plus a control centre for peers and diagnostics.
 
 The initial target is NixOS on Hyprland/wlroots. Platform boundaries are kept narrow, but other operating systems are not currently supported.
+
+<p align="center">
+  <img src="assets/screenshots/search.webp" alt="Typing in the picker filters the history; here the word cargo leaves a single matching card" width="100%" />
+</p>
 
 ## Architecture
 
